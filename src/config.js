@@ -32,9 +32,13 @@ export class ConfigError extends Error {
   }
 }
 
+export function defaultDataDir(env = process.env) {
+  return path.join(env.HOME || os.homedir(), 'zylos', 'components', COMPONENT_NAME);
+}
+
 export function resolveDataDir(env = process.env) {
   if (env.OM_MARKETPLACE_CLIENT_HOME) return path.resolve(env.OM_MARKETPLACE_CLIENT_HOME);
-  return path.join(env.HOME || os.homedir(), 'zylos', 'components', COMPONENT_NAME);
+  return defaultDataDir(env);
 }
 
 export function configPath(dataDir) {
@@ -90,7 +94,10 @@ export function serializeConfig(config) {
   return JSON.stringify(config, null, 2) + '\n';
 }
 
-function prepareDataDir(dataDir) {
+// tightenExisting: an existing directory owned by this user is narrowed to 0700 instead of refused. Only for the
+// component's own data directory, which zylos add creates with the default umask before post-install runs; a directory
+// chosen through OM_MARKETPLACE_CLIENT_HOME is never changed.
+function prepareDataDir(dataDir, tightenExisting) {
   let st;
   try {
     st = fs.lstatSync(dataDir);
@@ -101,16 +108,23 @@ function prepareDataDir(dataDir) {
     return;
   }
   if (!st.isDirectory()) throw new ConfigError(`${dataDir} exists and is not a directory`);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+    throw new ConfigError(`${dataDir} is not owned by the current user`);
+  }
   if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) {
+    if (tightenExisting) {
+      fs.chmodSync(dataDir, 0o700);
+      return;
+    }
     throw new ConfigError(`${dataDir} is accessible by group/other (mode ${(st.mode & 0o777).toString(8)}); run chmod 700`);
   }
 }
 
 // Single write path for every install route (env, interactive, configure hook).
 // Always rewrites the whole file, so a complete value set also rotates the key.
-export function writeConfig(values, dataDir) {
+export function writeConfig(values, dataDir, { tightenExisting = false } = {}) {
   const config = buildConfig(values);
-  prepareDataDir(dataDir);
+  prepareDataDir(dataDir, tightenExisting);
   const target = configPath(dataDir);
   const tmp = path.join(dataDir, `.config.json.${process.pid}.${Date.now()}.tmp`);
   try {

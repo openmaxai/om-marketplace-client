@@ -12,6 +12,7 @@ import {
   loadConfig,
   missingRequired,
   writeConfig,
+  defaultDataDir,
 } from '../../src/config.js';
 
 const PROMPTS = {
@@ -102,7 +103,7 @@ export async function runInstall({
   }
 
   try {
-    const { path: written, config } = writeConfig(values, dataDir);
+    const { path: written, config } = writeConfig(values, dataDir, { tightenExisting: path.resolve(dataDir) === defaultDataDir(env) });
     fs.mkdirSync(path.join(dataDir, 'logs'), { recursive: true, mode: 0o700 });
     log(`[om-marketplace-client] config written to ${written} (mode 0600)`);
     log(`[om-marketplace-client] bff_url=${config.bff_url} org_id=${config.org_id} member_id=${config.member_id} identity_id=${config.identity_id ?? '(unset)'}`);

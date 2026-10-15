@@ -24,7 +24,7 @@ test('post-install writes config.json from env with 0700 dir and 0600 file', () 
   assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.endsWith('.tmp')), []);
 });
 
-test('post-install refuses a pre-existing group/other-accessible data dir and writes nothing', () => {
+test('post-install refuses a pre-existing group/other-accessible OM_MARKETPLACE_CLIENT_HOME dir and writes nothing', () => {
   const dataDir = dataDirIn(tmpHome());
   fs.mkdirSync(dataDir, { recursive: true });
   fs.chmodSync(dataDir, 0o755);
@@ -152,4 +152,16 @@ test('configure hook (stdin JSON) writes the same file as the env path', () => {
 test('pre-uninstall stub exits 0', () => {
   const dataDir = dataDirIn(tmpHome());
   assert.equal(runHook('pre-uninstall.js', { env: baseEnv(dataDir) }).status, 0);
+});
+
+// zylos add creates the component data directory with the default umask before post-install runs.
+test('default data dir pre-created 0755 by zylos add is narrowed to 0700 and written', () => {
+  const home = tmpHome();
+  const dataDir = path.join(home, 'zylos', 'components', 'om-marketplace-client');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.chmodSync(dataDir, 0o755);
+  const r = runHook('post-install.js', { env: { PATH: process.env.PATH, HOME: home, ...VALID_ENV } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(mode(dataDir), 0o700);
+  assert.equal(mode(path.join(dataDir, 'config.json')), 0o600);
 });
