@@ -33,10 +33,10 @@ needed for them.
    The PM2 app filters them out and the service removes any it still inherits,
    logging only their names.
 5. Restart the Agent session once.
-6. Check the service: `pm2 logs om-marketplace-client --lines 20`.
+6. Check the service: `pm2 logs zylos-om-marketplace-client --lines 20`.
 
 Configuration errors exit with code 78; PM2 does not restart the service on
-that code. Fix the configuration, then `pm2 restart om-marketplace-client`.
+that code. Fix the configuration, then `pm2 restart zylos-om-marketplace-client`.
 
 ## Environment variables
 
@@ -57,7 +57,7 @@ valid `config.json`. A partial set fails and leaves the file unchanged.
 Rerun `node ~/zylos/.claude/skills/om-marketplace-client/hooks/post-install.js`
 with all required `COCO_*` variables set (including the new `COCO_API_KEY`); it
 rewrites the whole `config.json`. Then unset the variables and run
-`pm2 restart om-marketplace-client`.
+`pm2 restart zylos-om-marketplace-client`.
 
 If the data directory already exists it must be mode 0700; the hook refuses to
 write into a directory that is accessible by group or other.

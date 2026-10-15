@@ -7,14 +7,14 @@ description: >-
   sha256 verification, and reports results and reconciliation back to the market.
   The Agent never decides on its own what to install.
   Config at ~/zylos/components/om-marketplace-client/config.json.
-  Service: pm2 om-marketplace-client.
+  Service: pm2 zylos-om-marketplace-client.
 type: capability
 
 lifecycle:
   npm: false
   service:
     type: pm2
-    name: om-marketplace-client
+    name: zylos-om-marketplace-client
     entry: src/main.js
   data_dir: ~/zylos/components/om-marketplace-client
   hooks:

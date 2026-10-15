@@ -5,7 +5,7 @@ const dataDir = path.join(os.homedir(), 'zylos/components/om-marketplace-client'
 
 module.exports = {
   apps: [{
-    name: 'om-marketplace-client',
+    name: 'zylos-om-marketplace-client',
     script: 'src/main.js',
     interpreter: 'node',
     cwd: path.join(os.homedir(), 'zylos/.claude/skills/om-marketplace-client'),
