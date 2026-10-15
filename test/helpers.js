@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const FAKE_KEY = 'cwsk_TEST_SECRET_6f1c2a9e0b7d4e33';
+export const FAKE_KEY = 'cwsk_TEST_SECRET_6f1c2a9e0b7d4e33'; // gitleaks:allow (fake test fixture)
 
 export const VALID_ENV = Object.freeze({
   COCO_BFF_URL: 'https://bff.example.test/',
