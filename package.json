@@ -1,0 +1,25 @@
+{
+  "name": "om-marketplace-client",
+  "version": "0.1.0",
+  "description": "Agent Market client for zylos agents: applies install intents from the marketplace and reports results",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openmaxai/om-marketplace-client.git"
+  },
+  "keywords": [
+    "zylos",
+    "openmax",
+    "marketplace",
+    "agent"
+  ],
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
