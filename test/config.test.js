@@ -76,3 +76,19 @@ test('loadConfig rejects missing file, bad JSON, missing fields, bad URL', () =>
   put(JSON.stringify({ schema_version: 2, bff_url: 'https://bff.example.test', org_id: 'o', member_id: 'm', api_key: 'k' }));
   assert.throws(() => loadConfig(dataDir), /schema_version/);
 });
+
+test('loadConfig rejects a symlinked config.json', () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  const other = path.join(tmpHome(), 'o');
+  writeConfig({ ...VALID_ENV }, other);
+  fs.mkdirSync(dataDir, { mode: 0o700 });
+  fs.symlinkSync(path.join(other, 'config.json'), path.join(dataDir, 'config.json'));
+  assert.throws(() => loadConfig(dataDir), /symlink/);
+});
+
+test('loadConfig rejects a file owned by another uid', { skip: typeof process.getuid !== 'function' }, () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV }, dataDir);
+  assert.throws(() => loadConfig(dataDir, { uid: process.getuid() + 1 }), /not owned/);
+  assert.ok(loadConfig(dataDir));
+});

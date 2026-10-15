@@ -4,6 +4,8 @@ import path from 'node:path';
 
 export const COMPONENT_NAME = 'om-marketplace-client';
 export const CONFIG_SCHEMA_VERSION = 1;
+// sysexits EX_CONFIG; PM2 is told not to restart on it.
+export const EXIT_CONFIG = 78;
 
 // Env var -> config.json field. Order defines the key order in config.json.
 export const ENV_FIELDS = [
@@ -88,11 +90,27 @@ export function serializeConfig(config) {
   return JSON.stringify(config, null, 2) + '\n';
 }
 
+function prepareDataDir(dataDir) {
+  let st;
+  try {
+    st = fs.lstatSync(dataDir);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDir, 0o700);
+    return;
+  }
+  if (!st.isDirectory()) throw new ConfigError(`${dataDir} exists and is not a directory`);
+  if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) {
+    throw new ConfigError(`${dataDir} is accessible by group/other (mode ${(st.mode & 0o777).toString(8)}); run chmod 700`);
+  }
+}
+
 // Single write path for every install route (env, interactive, configure hook).
+// Always rewrites the whole file, so a complete value set also rotates the key.
 export function writeConfig(values, dataDir) {
   const config = buildConfig(values);
-  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dataDir, 0o700);
+  prepareDataDir(dataDir);
   const target = configPath(dataDir);
   const tmp = path.join(dataDir, `.config.json.${process.pid}.${Date.now()}.tmp`);
   try {
@@ -133,15 +151,17 @@ export function validateConfig(obj) {
 }
 
 // Runtime entry point: reads only config.json, never env credentials.
-export function loadConfig(dataDir) {
+export function loadConfig(dataDir, { uid = process.getuid?.() } = {}) {
   const file = configPath(dataDir);
   let st;
   try {
-    st = fs.statSync(file);
+    st = fs.lstatSync(file);
   } catch {
     throw new ConfigError(`config not found at ${file}; run the post-install hook`);
   }
+  if (st.isSymbolicLink()) throw new ConfigError(`${file} is a symlink`);
   if (!st.isFile()) throw new ConfigError(`${file} is not a regular file`);
+  if (uid !== undefined && st.uid !== uid) throw new ConfigError(`${file} is not owned by the current user`);
   if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) {
     throw new ConfigError(`${file} is accessible by group/other (mode ${(st.mode & 0o777).toString(8)}); run chmod 600`);
   }

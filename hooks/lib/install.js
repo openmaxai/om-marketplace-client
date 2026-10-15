@@ -7,6 +7,7 @@ import {
   REQUIRED_ENV,
   SECRET_ENV,
   ConfigError,
+  EXIT_CONFIG,
   configPath,
   loadConfig,
   missingRequired,
@@ -97,7 +98,7 @@ export async function runInstall({
   if (missing.length) {
     error(`[om-marketplace-client] missing required environment variables: ${missing.join(', ')}`);
     error('[om-marketplace-client] config.json was not written');
-    return 1;
+    return EXIT_CONFIG;
   }
 
   try {
@@ -107,8 +108,11 @@ export async function runInstall({
     log(`[om-marketplace-client] bff_url=${config.bff_url} org_id=${config.org_id} member_id=${config.member_id} identity_id=${config.identity_id ?? '(unset)'}`);
     return 0;
   } catch (err) {
-    if (err instanceof ConfigError) error(`[om-marketplace-client] invalid configuration: ${err.message}`);
-    else error(`[om-marketplace-client] failed to write config.json (${err.code || 'error'})`);
+    if (err instanceof ConfigError) {
+      error(`[om-marketplace-client] invalid configuration: ${err.message}`);
+      return EXIT_CONFIG;
+    }
+    error(`[om-marketplace-client] failed to write config.json (${err.code || 'error'})`);
     return 1;
   }
 }

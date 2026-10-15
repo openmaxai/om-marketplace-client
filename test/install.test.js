@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_KEY, VALID_ENV, baseEnv, mode, runHook, tmpHome } from './helpers.js';
-import { writeConfig, REQUIRED_ENV } from '../src/config.js';
+import { writeConfig, REQUIRED_ENV, EXIT_CONFIG } from '../src/config.js';
 import { runInstall } from '../hooks/lib/install.js';
 
 function dataDirIn(home) {
@@ -24,20 +24,46 @@ test('post-install writes config.json from env with 0700 dir and 0600 file', () 
   assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.endsWith('.tmp')), []);
 });
 
-test('post-install tightens a pre-existing permissive data dir', () => {
+test('post-install refuses a pre-existing group/other-accessible data dir and writes nothing', () => {
   const dataDir = dataDirIn(tmpHome());
-  fs.mkdirSync(dataDir, { recursive: true, mode: 0o755 });
+  fs.mkdirSync(dataDir, { recursive: true });
   fs.chmodSync(dataDir, 0o755);
   const r = runHook('post-install.js', { env: { ...baseEnv(dataDir), ...VALID_ENV } });
+  assert.equal(r.status, EXIT_CONFIG);
+  assert.ok(r.stderr.includes(dataDir));
+  assert.match(r.stderr, /group\/other/);
+  assert.equal(mode(dataDir), 0o755);
+  assert.deepEqual(fs.readdirSync(dataDir), []);
+});
+
+test('existing 0700 data dir from OM_MARKETPLACE_CLIENT_HOME is used without mode change', () => {
+  const dataDir = tmpHome();
+  fs.chmodSync(dataDir, 0o700);
+  const before = fs.statSync(dataDir).mode;
+  const r = runHook('post-install.js', { env: { ...baseEnv(dataDir), ...VALID_ENV } });
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(mode(dataDir), 0o700);
+  assert.equal(fs.statSync(dataDir).mode, before);
+  assert.equal(mode(path.join(dataDir, 'config.json')), 0o600);
+});
+
+test('complete variable set rotates the key; partial set fails and keeps the old file', () => {
+  const dataDir = dataDirIn(tmpHome());
+  assert.equal(runHook('post-install.js', { env: { ...baseEnv(dataDir), ...VALID_ENV } }).status, 0);
+  const rotated = { ...VALID_ENV, COCO_API_KEY: 'rotated-fake-value' };
+  assert.equal(runHook('post-install.js', { env: { ...baseEnv(dataDir), ...rotated } }).status, 0);
+  const file = path.join(dataDir, 'config.json');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).api_key, 'rotated-fake-value');
+  const before = fs.readFileSync(file);
+  const r = runHook('post-install.js', { env: { ...baseEnv(dataDir), COCO_API_KEY: 'another-fake-value' } });
+  assert.equal(r.status, EXIT_CONFIG);
+  assert.ok(fs.readFileSync(file).equals(before));
 });
 
 test('missing required vars: non-zero exit, lists every missing name, writes nothing', () => {
   const dataDir = dataDirIn(tmpHome());
   const env = { ...baseEnv(dataDir), COCO_BFF_URL: VALID_ENV.COCO_BFF_URL, COCO_API_KEY: FAKE_KEY };
   const r = runHook('post-install.js', { env });
-  assert.notEqual(r.status, 0);
+  assert.equal(r.status, EXIT_CONFIG);
   assert.match(r.stderr, /COCO_ORG_ID/);
   assert.match(r.stderr, /COCO_MEMBER_ID/);
   assert.doesNotMatch(r.stderr, /COCO_BFF_URL|COCO_API_KEY/);
@@ -47,7 +73,7 @@ test('missing required vars: non-zero exit, lists every missing name, writes not
 test('no env at all lists all required names', () => {
   const dataDir = dataDirIn(tmpHome());
   const r = runHook('post-install.js', { env: baseEnv(dataDir) });
-  assert.equal(r.status, 1);
+  assert.equal(r.status, EXIT_CONFIG);
   for (const name of REQUIRED_ENV) assert.match(r.stderr, new RegExp(name));
   assert.doesNotMatch(r.stderr, /COCO_IDENTITY_ID/);
 });
@@ -100,7 +126,7 @@ test('no TTY never prompts', async () => {
     ask: async () => { prompted = true; return 'x'; },
     log: () => {}, error: () => {},
   });
-  assert.equal(code, 1);
+  assert.equal(code, EXIT_CONFIG);
   assert.equal(prompted, false);
 });
 

@@ -69,8 +69,10 @@ Client side of Agent Market for zylos Agents.
 `hooks/post-install.js` reads `COCO_BFF_URL`, `COCO_API_KEY`, `COCO_ORG_ID`,
 `COCO_MEMBER_ID` (required) and `COCO_IDENTITY_ID` (optional) from the
 environment and writes `config.json` (mode 0600). Without a TTY it never
-prompts and exits non-zero naming any missing variable. At runtime the service
-reads only `config.json`.
+prompts and exits with code 78 naming any missing variable. Unset the `COCO_*`
+variables after install; the PM2 app filters them out and the service removes
+any it inherits, logging only their names. At runtime the service reads only
+`config.json`. Key rotation: rerun post-install with the complete variable set.
 
 ## Status
 
