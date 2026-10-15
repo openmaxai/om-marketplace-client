@@ -59,13 +59,13 @@ test('a failing task is logged and rescheduled', async () => {
   assert.equal(pending[0].ms, 800);
 });
 
-test('headers carry bearer key and client version from package.json', () => {
+test('headers carry the bearer token and client version from package.json', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(CLIENT_VERSION, pkg.version);
   assert.equal(CLIENT_VERSION_HEADER, 'X-Market-Client-Version');
-  const h = buildHeaders({ api_key: 'k1' }, { Accept: 'application/json' });
-  assert.equal(h.Authorization, 'Bearer k1');
+  const h = buildHeaders('t1', { Accept: 'application/json' });
+  assert.equal(h.Authorization, 'Bearer t1');
   assert.equal(h['X-Market-Client-Version'], pkg.version);
   assert.equal(h.Accept, 'application/json');
-  assert.throws(() => buildHeaders({}));
+  assert.throws(() => buildHeaders(''));
 });
