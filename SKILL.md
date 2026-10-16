@@ -19,6 +19,7 @@ lifecycle:
   data_dir: ~/zylos/components/om-marketplace-client
   hooks:
     post-install: hooks/post-install.js
+    post-upgrade: hooks/post-upgrade.js
     configure: hooks/configure.js
     pre-uninstall: hooks/pre-uninstall.js
   preserve:
