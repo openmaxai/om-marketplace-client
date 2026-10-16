@@ -41,7 +41,7 @@ export const isSkillMDPath = (p) => equalFoldAscii(baseName(p), 'SKILL.md');
 export const isMarkdownPath = (p) => equalFoldAscii(extName(p), '.md');
 
 // Reads the zip, checks hygiene and the skill policy, and returns the file manifest (sorted by path bytes), the root
-// SKILL.md, every .md file and the root frontmatter.
+// SKILL.md, every .md file, the root frontmatter and the content of every file.
 export function inspectPackage(buf) {
   const index = new PathIndex();
   const { files } = readZip(buf, {
@@ -58,9 +58,11 @@ export function inspectPackage(buf) {
   const manifest = [];
   const jsons = [];
   const markdown = [];
+  const contents = [];
   let skillMD = null;
   for (const [e, data] of readFiles(buf, files)) {
     manifest.push({ path: e.name, size: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') });
+    contents.push({ path: e.name, data });
     const base = baseName(e.name);
     if (e.name === 'SKILL.md') skillMD = data;
     if (equalFoldAscii(base, 'package.json')) jsons.push([e.name, data]);
@@ -75,7 +77,7 @@ export function inspectPackage(buf) {
   checkSkillPolicy(markdown);
   const meta = parseSkillMD(skillMD);
   manifest.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  return { manifest, skillMD, markdown, meta };
+  return { manifest, skillMD, markdown, meta, files: contents };
 }
 
 // Rejects npm install hooks and dependencies. Keys are read level by level with duplicates and case variants rejected,

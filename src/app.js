@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import { EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
@@ -10,11 +11,12 @@ import { openState } from './state.js';
 import { createOrgs } from './orgs.js';
 import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
+import { createInstaller } from './install.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
 
-// Revocations are pulled before intents in every round so that a later install sees the newest revoked set. A round
-// is skipped while the token's member id contradicts the configured one.
-export function buildTasks(logger, { revocations, intents, identity, now = Date.now } = {}) {
+// Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then at
+// most one install intent runs. A round is skipped while the token's member id contradicts the configured one.
+export function buildTasks(logger, { revocations, intents, installer, identity, now = Date.now } = {}) {
   return [
     {
       name: 'poll',
@@ -27,6 +29,7 @@ export function buildTasks(logger, { revocations, intents, identity, now = Date.
         } finally {
           await intents.pull();
         }
+        await installer?.runNext();
         return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
     },
@@ -72,10 +75,13 @@ function identityCheck({ config, auth, state, logger }) {
 }
 
 // Opens the state store (single-instance lock) and builds the pull loops; aborting `signal` cancels in-flight requests.
-export function createRuntime({ config, dataDir, logger, fetchImpl, signal = null }) {
+export function createRuntime({
+  config, dataDir, logger, fetchImpl, signal = null, skillsDir = path.join(process.env.HOME || os.homedir(), 'zylos', '.claude', 'skills'),
+}) {
   const state = openState(dataDir, { bffUrl: config.bff_url, orgId: config.org_id, memberId: config.member_id });
   try {
-    if (!vendoredPolicyMatchesPin()) {
+    const pinned = vendoredPolicyMatchesPin();
+    if (!pinned) {
       state.setAlert('policy_pin', 'vendored skill policy does not match its pin; installs are refused');
       logger.error('vendored skill policy does not match its pin; installs are refused');
     } else {
@@ -87,6 +93,9 @@ export function createRuntime({ config, dataDir, logger, fetchImpl, signal = nul
     return {
       state,
       orgs,
+      installer: pinned ? createInstaller({
+        api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
+      }) : null,
       identity: identityCheck({ config, auth, state, logger }),
       intents: createIntentPuller({ api, state, orgs, logger }),
       revocations: createRevocationPuller({ api, state, orgs, logger }),
