@@ -47,6 +47,8 @@ export async function skillHarness(t, { versions = { 1: skillPackage() }, slug =
   fs.mkdirSync(skillsDir);
   const reqs = new Map();
   const over = { c02: [], c03: [], c06: [], c07: [], manage: [] };
+  // patch.c02(rid) returns fields that replace those of the default C-02 201 answer.
+  const patch = { c02: null };
   let downloads = 0;
   let seq = 0;
   const forever = (method, p, fn) => {
@@ -81,7 +83,8 @@ export async function skillHarness(t, { versions = { 1: skillPackage() }, slug =
   forever('POST', C02, route('c02', (req) => {
     const b = req.json;
     const rid = b.request_id;
-    const n = Number(Object.keys(versions).find((k) => VID(Number(k)) === b.skill_version_id));
+    // Without a skill_version_id the market picks the highest version.
+    const n = Number(b.skill_version_id ? Object.keys(versions).find((k) => VID(Number(k)) === b.skill_version_id) : Object.keys(versions).at(-1));
     const known = reqs.get(rid);
     if (known && known.raw !== req.body) return problem(409, 'REQUEST_ID_CONFLICT');
     if (!known) {
@@ -92,7 +95,7 @@ export async function skillHarness(t, { versions = { 1: skillPackage() }, slug =
     return { status: 201, json: {
       request_id: rid, install_id: U(5), skill_id: SKILL, slug, skill_version_id: VID(n), version_no: n, source_market_id: MARKET,
       package_url: `${h.fake.url}${B}/agents/${AGENT}/packages/${rid}`, package_sha256: pkg.sha, size_bytes: pkg.size,
-      file_manifest: pkg.manifest, skill_md: { name: slug, description: 'A test skill' }, status: 'running',
+      file_manifest: pkg.manifest, skill_md: { name: slug, description: 'A test skill' }, status: 'running', ...patch.c02?.(rid),
     } };
   }));
   for (const verb of ['set-enabled', 'uninstall']) {
@@ -120,5 +123,5 @@ export async function skillHarness(t, { versions = { 1: skillPackage() }, slug =
   const sent = (suffix) => h.fake.requests.filter((r) => r.path.endsWith(suffix));
   const target = path.join(skillsDir, `market--${slug}`);
   const marker = (dir = target) => { try { return JSON.parse(fs.readFileSync(path.join(dir, '.market-managed'), 'utf8')); } catch { return null; } };
-  return { ...h, storage, skillsDir, reqs, over, make, queue, sent, target, marker, versions, results: () => sent('/result') };
+  return { ...h, storage, skillsDir, reqs, over, patch, make, queue, sent, target, marker, versions, results: () => sent('/result') };
 }

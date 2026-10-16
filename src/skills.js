@@ -8,6 +8,7 @@ import { revokedSet } from './revocations.js';
 import { checkPackageUrl, downloadPackage } from './download.js';
 import { inspectInWorker } from './inspect.js';
 import { MARKER, SKILL_DIR_PREFIX, failureFor, landSkill } from './land.js';
+import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
 
 export const MAX_INTENTS_PER_ROUND = 20;
 const SKILL_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall']);
@@ -214,6 +215,19 @@ export function createSkills({
     return null;
   }
 
+  // The market may pick the version, so what C-02 selected is checked against the revoked set and the package caps
+  // before any download. Returns [code, message] or null.
+  function refusedBeforeDownload(res) {
+    const revoked = revokedSet(state);
+    if (revoked.has('skill_version_id', res.skill_version_id)) return ['VERSION_REVOKED', 'version_revoked'];
+    if (revoked.blocksSha(res.package_sha256)) return ['VERSION_REVOKED', 'sha_blocked'];
+    if (res.size_bytes > MAX_PACKAGE_BYTES || res.file_manifest.reduce((n, e) => n + e.size, 0) > MAX_PACKAGE_BYTES) {
+      return ['PACKAGE_UNSAFE', 'too_large'];
+    }
+    if (res.file_manifest.length > MAX_PACKAGE_FILES) return ['PACKAGE_UNSAFE', 'too_many_files'];
+    return null;
+  }
+
   function upgradeRefused(op, res, prior) {
     if (op !== 'upgrade' || !prior) return false;
     return !(res.version_no > prior.version_no || (res.version_no < prior.version_no && (prior.state === 'revoked_disabled' || isRevoked(prior))));
@@ -250,7 +264,8 @@ export function createSkills({
     j = journal(rid, { phase: 'accepted', response: res });
     const prior = installs()[res.skill_id] ?? null;
     const fail = (code, msg) => report(rid, it, { status: 'failed', error_code: code, error_message: msg });
-    if (isRevoked(res)) return fail('VERSION_REVOKED', 'version_revoked');
+    const refused = refusedBeforeDownload(res);
+    if (refused) return fail(...refused);
     if (upgradeRefused(it.op, res, prior)) return fail('INSTALL_TARGET_CONFLICT', 'not_higher');
     const failure = (err) => {
       const f = failureFor(err);

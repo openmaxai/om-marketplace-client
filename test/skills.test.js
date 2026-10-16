@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ORG, ORG2 } from './fake/pull.js';
+import { AGENT, ORG, ORG2 } from './fake/pull.js';
 import { fakeCursor } from './fake/market.js';
 import { skillMd, skillPackage } from './fake/package.js';
 import { buildZip } from './fake/zip.js';
 import { B, C02, MARKET, SKILL, VID, problem, skillHarness } from './fake/skills.js';
 import { createRevocationPuller } from '../src/revocations.js';
+import { inspectInWorker } from '../src/inspect.js';
+import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from '../src/pkg/zip.js';
 
 const v2 = () => skillPackage('demo-skill', { 'docs/guide.md': 'guide v2\n' });
 const v3 = () => skillPackage('demo-skill', { 'docs/guide.md': 'guide v3\n' });
@@ -145,13 +147,77 @@ test('C-02 CLIENT_VERSION_TOO_OLD enters too-old mode and stops executing intent
   assert.deepEqual(await s.runRound(), []);
 });
 
-test('a revoked version in the 201 is reported VERSION_REVOKED without download', async (t) => {
+const downloads = (h) => h.fake.requests.filter((r) => r.path.includes('/packages/')).length + h.storage.requests.length;
+const failure = (code, message) => ({ status: 'failed', error_code: code, error_message: message });
+
+test('the version and package sha the market selected are checked against the revoked set before downloading', async (t) => {
+  for (const [revoked, message] of [
+    [{ skill_version_id: [VID(1)] }, 'version_revoked'],
+    [{ package_sha256: ['sha'] }, 'sha_blocked'],
+    [{ sha_block: ['sha'] }, 'sha_blocked'],
+  ]) {
+    const h = await skillHarness(t);
+    await h.queue(['install']);
+    const key = Object.keys(revoked)[0];
+    h.state.write('revoked', { [key]: revoked[key].map((v) => (v === 'sha' ? h.versions[1].sha : v)) });
+    assert.deepEqual(await h.make().runRound(), ['failed'], message);
+    assert.equal(c02s(h)[0].json.skill_version_id, undefined);
+    assert.deepEqual(h.results().map((r) => r.json), [failure('VERSION_REVOKED', message)]);
+    assert.equal(downloads(h), 0);
+    assert.deepEqual(fs.readdirSync(h.skillsDir), []);
+    assert.deepEqual(queueOf(h), []);
+  }
+});
+
+test('a package over the size or file caps is PACKAGE_UNSAFE before downloading', async (t) => {
+  const pkg = skillPackage();
+  const big = pkg.manifest.map((e, i) => (i === 0 ? { ...e, size: MAX_PACKAGE_BYTES } : e));
+  const many = Array.from({ length: MAX_PACKAGE_FILES + 1 }, (_, i) => ({ path: `f${i}`, size: 1, sha256: 'a'.repeat(64) }));
+  for (const [over, message] of [
+    [{ size_bytes: MAX_PACKAGE_BYTES + 1 }, 'too_large'],
+    [{ file_manifest: big }, 'too_large'],
+    [{ file_manifest: many }, 'too_many_files'],
+  ]) {
+    const h = await skillHarness(t, { versions: { 1: pkg } });
+    h.patch.c02 = () => over;
+    await h.queue(['install', 1]);
+    assert.deepEqual(await h.make().runRound(), ['failed'], message);
+    assert.deepEqual(h.results().map((r) => r.json), [failure('PACKAGE_UNSAFE', message)]);
+    assert.equal(downloads(h), 0);
+  }
+  const edge = await skillHarness(t, { versions: { 1: pkg } });
+  edge.patch.c02 = () => ({ size_bytes: MAX_PACKAGE_BYTES });
+  await edge.queue(['install', 1]);
+  assert.deepEqual(await edge.make().runRound(), ['failed']);
+  assert.deepEqual(edge.results().map((r) => r.json.error_message), ['download_metadata_mismatch']);
+});
+
+test('a package_url that is not this request\'s C-03 path fails CLIENT_INTERNAL without a download', async (t) => {
   const h = await skillHarness(t);
+  h.patch.c02 = (rid) => ({ package_url: `https://evil.example.test${B}/agents/${AGENT}/packages/${rid}` });
   await h.queue(['install', 1]);
-  h.state.write('revoked', { package_sha256: [h.versions[1].sha] });
   assert.deepEqual(await h.make().runRound(), ['failed']);
-  assert.deepEqual(h.results().map((r) => r.json.error_code), ['VERSION_REVOKED']);
-  assert.equal(h.storage.requests.length, 0);
+  assert.deepEqual(h.results().map((r) => r.json), [failure('CLIENT_INTERNAL', 'package_url_invalid')]);
+  assert.equal(downloads(h), 0);
+});
+
+test('C-03 SHELF_RESPONSE_INVALID is reported as is', async (t) => {
+  const h = await skillHarness(t);
+  h.over.c03.push(problem(409, 'SHELF_RESPONSE_INVALID'));
+  await h.queue(['install', 1]);
+  assert.deepEqual(await h.make().runRound(), ['failed']);
+  assert.deepEqual(h.results().map((r) => r.json), [failure('SHELF_RESPONSE_INVALID', 'shelf_response_invalid')]);
+});
+
+test('a worker out of memory is reported once as CLIENT_INTERNAL and the process keeps running', async (t) => {
+  const h = await skillHarness(t);
+  const workerUrl = new URL('./fake/oom-worker.js', import.meta.url);
+  await h.queue(['install', 1]);
+  const s = h.make(h.state, { inspect: (b, o) => inspectInWorker(b, { ...o, workerUrl, resourceLimits: { maxOldGenerationSizeMb: 16 } }) });
+  assert.deepEqual(await s.runRound(), ['failed']);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(h.results().map((r) => r.json), [failure('CLIENT_INTERNAL', 'inspect_out_of_memory')]);
+  assert.equal((await inspectInWorker(h.versions[1].zip)).meta.name, 'demo-skill');
 });
 
 test('C-03 200 with a different sha256 or size is CLIENT_INTERNAL', async (t) => {
@@ -273,6 +339,14 @@ test('an unsafe package is PACKAGE_UNSAFE and a wrong storage sha256 is PACKAGE_
   assert.deepEqual(await h.make().runRound(), ['failed']);
   assert.match(h.results()[0].json.error_message, /^SKILL_FRONTMATTER_KEY_NOT_ALLOWED at line \d+$/);
   assert.deepEqual(fs.readdirSync(h.skillsDir), []);
+  const pkg = skillPackage();
+  const altered = Buffer.from(pkg.zip);
+  altered[12] ^= 1;
+  const m = await skillHarness(t, { versions: { 1: { ...pkg, zip: altered } } });
+  await m.queue(['install', 1]);
+  assert.deepEqual(await m.make().runRound(), ['failed']);
+  assert.deepEqual(m.results().map((r) => r.json), [failure('PACKAGE_MISMATCH', 'sha256_mismatch')]);
+  assert.deepEqual(fs.readdirSync(m.skillsDir), []);
 });
 
 test('disable, enable and uninstall change the skill locally first, then report C-08 / C-09 with the intent', async (t) => {
