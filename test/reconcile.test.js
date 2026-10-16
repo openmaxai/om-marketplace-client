@@ -97,6 +97,9 @@ test('every discrepancy kind is detected and reported through its org; only the 
   f.skill(7, { v: 2, rollback: { version_no: 1, skill_version_id: VER(7, 1) } });
   fs.mkdirSync(path.join(f.dataDir, 'rollback', 's7', '1'), { recursive: true });
   fs.writeFileSync(path.join(f.dataDir, 'rollback', 's7', '1', 'SKILL.md'), 'old');
+  fs.writeFileSync(path.join(f.dataDir, 'rollback', 's7', '1', '.market-managed'), JSON.stringify({ skill_id: SK(7), version_no: 1 }));
+  fs.mkdirSync(path.join(f.dataDir, 'rollback', 's7', 'not-ours'));
+  fs.writeFileSync(path.join(f.dataDir, 'rollback', 's7', 'not-ours', 'keep'), 'x');
   f.skill(8);
   f.skill(9, { state: 'disabled' });
   f.skill(11, { org: ORG2 });
@@ -128,7 +131,7 @@ test('every discrepancy kind is detected and reported through its org; only the 
   assert.deepEqual(items[`template_locally_modified:${U(21)}`], { kind: 'template_locally_modified', adoption_id: U(21), rendered_sha256: sha('edited') });
 
   const after = [...files(f.dataDir).filter((p) => !p.startsWith('state')), ...files(f.skillsDir)];
-  assert.deepEqual(before.filter((p) => !after.includes(p)), ['rollback/s7/1/SKILL.md']);
+  assert.deepEqual(before.filter((p) => !after.includes(p)), ['rollback/s7/1/.market-managed', 'rollback/s7/1/SKILL.md']);
   assert.equal(fs.readFileSync(path.join(f.dataDir, 'templates', U(21), 'inject.md'), 'utf8'), 'edited');
   assert.equal(f.state.read('installs', {})[SK(7)].rollback, null);
   assert.deepEqual(f.state.read('intents', null).queue.map((q) => q.id), [U(901)], 'recorded org_not_configured intent is done');
@@ -291,4 +294,133 @@ test('items follow the market rules; malformed ones are never sent', async (t) =
   f.queue({});
   await f.reconciler.run();
   assert.deepEqual(f.reports(ORG).flat().map((i) => i.kind), ['org_not_configured']);
+});
+
+test('an unusable budget file pauses reporting for one hour with an alert and never stops reconcile', async (t) => {
+  for (const bad of ['{not json', 'null', '{"sent":"x"}', '{"sent":[1]}', '[]', '{"sent":[],"blocked_until":5}']) {
+    const f = await harness(t, { orgs: {} });
+    fs.writeFileSync(path.join(f.state.dir, 'reconcile.json'), bad);
+    f.queue({});
+    assert.equal((await f.reconciler.run()).outcome, 'rate_limited', bad);
+    assert.equal(f.reports().length, 0);
+    const st = f.state.read('status', null);
+    assert.ok(st.alerts['reconcile:budget'], bad);
+    assert.equal(st.runs.reconcile.outcome, 'rate_limited');
+    assert.equal(f.state.read('reconcile', null).sent.length, RATE_BUDGET);
+    f.clock.t += 60 * 60 * 1000 - 1;
+    assert.equal((await f.reconciler.run()).outcome, 'rate_limited');
+    f.clock.t += 1;
+    assert.equal((await f.reconciler.run()).outcome, 'ok', bad);
+    assert.equal(f.reports().length, 1);
+    assert.equal(f.state.read('status', null).alerts['reconcile:budget'], undefined);
+  }
+});
+
+test('a budget file that cannot be rewritten still does not throw', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  fs.mkdirSync(path.join(f.state.dir, 'reconcile.json'));
+  f.queue({});
+  assert.equal((await f.reconciler.run()).outcome, 'rate_limited');
+  assert.equal(f.reports().length, 0);
+  assert.ok(f.state.read('status', null).alerts['reconcile:budget']);
+});
+
+test('stamps ahead of a clock set back and an overlong stored block do not silence reporting', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  const ahead = new Date(f.clock.t + 24 * 60 * 60 * 1000).toISOString();
+  f.state.write('reconcile', { last_run_at: null, last: null, sent: Array(RATE_BUDGET).fill(ahead), blocked_until: null });
+  f.queue({});
+  assert.equal((await f.reconciler.run()).outcome, 'ok');
+  assert.equal(f.reports().length, 1);
+
+  f.state.write('reconcile', { last_run_at: null, last: null, sent: [], blocked_until: new Date(f.clock.t + 30 * 24 * 60 * 60 * 1000).toISOString() });
+  f.queue({});
+  assert.equal((await f.reconciler.run()).outcome, 'rate_limited');
+  f.clock.t += 60 * 60 * 1000 - 1;
+  assert.equal((await f.reconciler.run()).outcome, 'rate_limited');
+  f.clock.t += 1;
+  assert.equal((await f.reconciler.run()).outcome, 'ok');
+  assert.equal(f.reports().length, 2);
+});
+
+test('a batch refused with a 400 naming no item is skipped and the next batches are still sent', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.queue(...Array.from({ length: 401 }, () => ({})));
+  const answers = [problem(400, 'BODY_TOO_LARGE')];
+  f.answer.c10 = (req) => answers.shift() ?? recordAll(req);
+  const r = await f.reconciler.run();
+  assert.deepEqual(f.reports(ORG).map((b) => b.length), [200, 200, 1]);
+  assert.equal(r.outcome, 'partial');
+  assert.equal(r.recorded, 201);
+  assert.ok(f.state.read('status', null).alerts[`reconcile:${ORG}`]);
+
+  f.queue({}, {});
+  f.answer.c10 = () => problem(400, 'BODY_TOO_LARGE');
+  await f.reconciler.run();
+  assert.equal(f.state.read('reconcile', null).last.orgs[ORG].sent, 'rejected');
+});
+
+test('an indexed 400 is resent without the named items once, never twice', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.queue({}, {}, {});
+  f.answer.c10 = () => problem(400, 'VALIDATION_FAILED', { errors: [{ field: 'items[0].intent_id' }] });
+  await f.reconciler.run();
+  assert.deepEqual(f.reports(ORG).map((b) => b.length), [3, 2]);
+});
+
+test('an item too large for any report does not cut the current batch', () => {
+  const small = (i) => ({ item: { kind: 'local_extra', skill_id: U(i) } });
+  const big = { item: { kind: 'local_extra', skill_id: U(1), pad: 'x'.repeat(200) } };
+  assert.deepEqual(batches([small(1), big, small(2)], { maxBytes: 160 }).map((b) => b.length), [2]);
+});
+
+test('C-10 results out of index order are refused and nothing is marked done', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.queue({}, {});
+  f.answer.c10 = () => ({ status: 200, json: { results: [{ index: 1, outcome: 'recorded' }, { index: 0, outcome: 'recorded' }] } });
+  assert.equal((await f.reconciler.run()).outcome, 'partial');
+  assert.equal(f.state.read('intents', null).queue.length, 2);
+  assert.match(f.state.read('status', null).alerts[`reconcile:${ORG}`].message, /RESPONSE_INVALID/);
+});
+
+test('installing skills, skills with a report in flight and foreign markers are judged correctly', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.skill(2, { onDisk: false });
+  f.state.outbox.put(U(950), { kind: 'result', org_id: ORG, skill_id: SK(2), body: {} });
+  f.skill(3, { onDisk: false });
+  f.dir('enabled', 3, { skill_id: SK(4), version_no: 1, package_sha256: sha(3) });
+  f.answer.c12[ORG] = () => ({ status: 200, json: { items: [listed(1, { state: 'installing' }), listed(2), listed(3)] } });
+  await f.reconciler.run();
+  assert.deepEqual(f.reports(ORG).flat(), [
+    { kind: 'local_missing', skill_id: SK(3), skill_version_id: VER(3, 1) },
+    { kind: 'local_extra', skill_id: SK(4), installed_sha256: sha(3) },
+  ]);
+});
+
+test('a rollback is released only for the compared version and only its own marked directory', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.skill(7, { v: 2, rollback: { version_no: 1, skill_version_id: VER(7, 1) } });
+  const rb = path.join(f.dataDir, 'rollback', 's7', '1');
+  fs.mkdirSync(rb, { recursive: true });
+  fs.writeFileSync(path.join(rb, 'SKILL.md'), 'unmarked');
+  assert.equal(f.skills.releaseRollback(SK(7), VER(7, 1)), false, 'record moved on');
+  assert.ok(f.state.read('installs', {})[SK(7)].rollback);
+  assert.equal(f.skills.releaseRollback(SK(7), VER(7, 2)), true);
+  assert.equal(f.state.read('installs', {})[SK(7)].rollback, null);
+  assert.ok(fs.existsSync(path.join(rb, 'SKILL.md')), 'an unmarked directory is left alone');
+  assert.ok(!fs.existsSync(path.join(f.dataDir, 'trash')) || fs.readdirSync(path.join(f.dataDir, 'trash')).length === 0);
+});
+
+test('a release whose delete fails has already let go of the rollback and leaves the copy whole', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  f.skill(7, { v: 2, rollback: { version_no: 1, skill_version_id: VER(7, 1) } });
+  const rb = path.join(f.dataDir, 'rollback', 's7', '1');
+  fs.mkdirSync(rb, { recursive: true });
+  fs.writeFileSync(path.join(rb, 'SKILL.md'), 'old');
+  fs.writeFileSync(path.join(rb, '.market-managed'), JSON.stringify({ skill_id: SK(7), version_no: 1 }));
+  fs.writeFileSync(path.join(f.dataDir, 'trash'), 'not a directory');
+  f.answer.c12[ORG] = () => ({ status: 200, json: { items: [listed(7, { v: 2 })] } });
+  assert.equal((await f.reconciler.run()).outcome, 'ok');
+  assert.equal(f.state.read('installs', {})[SK(7)].rollback, null);
+  assert.deepEqual(fs.readdirSync(rb).sort(), ['.market-managed', 'SKILL.md']);
 });

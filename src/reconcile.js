@@ -1,6 +1,7 @@
-import { MarketError } from './http.js';
+import { MAX_RETRY_AFTER_MS, MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex } from './ids.js';
 import { EMPTY_INTENTS, enterTooOldMode, tooOld } from './intents.js';
+import { StateError } from './state.js';
 
 export const MAX_ITEMS = 200;
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -42,12 +43,12 @@ export function batches(entries, { maxItems = MAX_ITEMS, maxBytes = MAX_BODY_BYT
   let size = empty;
   for (const e of entries) {
     const n = Buffer.byteLength(JSON.stringify(e.item));
+    if (empty + n > maxBytes) continue;
     if (cur.length && (cur.length >= maxItems || size + 1 + n > maxBytes)) {
       out.push(cur);
       cur = [];
       size = empty;
     }
-    if (empty + n > maxBytes) continue;
     size += n + (cur.length ? 1 : 0);
     cur.push(e);
   }
@@ -72,7 +73,7 @@ export function compareSkills(listed, scan, orgId) {
     else if (!rec || !scan.present.has(skillId)) {
       items.push({ kind: 'local_missing', skill_id: skillId, ...(rec ? { skill_version_id: rec.skill_version_id } : {}) });
     } else if (rec.skill_version_id !== s.skill_version_id) items.push({ kind: 'local_rollback', skill_id: skillId, ...local(rec) });
-    else matching.push(skillId);
+    else matching.push([skillId, s.skill_version_id]);
   }
   for (const [skillId, rec] of Object.entries(scan.recs)) {
     if (rec.org_id !== orgId || server.has(skillId) || scan.busy.has(skillId) || rec.state === 'revoked_disabled' || !scan.present.has(skillId)) continue;
@@ -92,16 +93,54 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
     state.update('intents', EMPTY_INTENTS, (d) => { d.queue = d.queue.filter((q) => q.id !== id); });
   }
 
-  // Takes one report from the hourly budget, persisted before the request is sent.
+  const validDoc = (d) => d !== null && typeof d === 'object' && !Array.isArray(d) && Array.isArray(d.sent)
+    && d.sent.every((x) => typeof x === 'string' && Number.isFinite(Date.parse(x)))
+    && (d.blocked_until === null || d.blocked_until === undefined || (typeof d.blocked_until === 'string' && Number.isFinite(Date.parse(d.blocked_until))));
+
+  // The reconcile document, or null when it cannot be used. An unusable one is taken as this hour's budget spent: it is
+  // rewritten that way (reporting pauses for one hour) and an alert is raised, so reconcile neither stops for good nor
+  // exceeds the budget.
+  function readDoc() {
+    let d;
+    try {
+      d = state.read('reconcile', EMPTY_RECONCILE);
+    } catch (err) {
+      if (!(err instanceof StateError)) throw err;
+      d = undefined;
+    }
+    if (validDoc(d)) return d;
+    const msg = 'reconcile budget file was unreadable; it was reset as spent and reporting pauses for one hour';
+    state.setAlert('reconcile:budget', msg);
+    logger.error(msg);
+    try {
+      state.write('reconcile', { ...EMPTY_RECONCILE, sent: Array(RATE_BUDGET).fill(iso()) });
+    } catch (err) {
+      logger.error(`reconcile budget file cannot be rewritten: ${err.message}`);
+    }
+    return null;
+  }
+
+  function updateDoc(fn) {
+    const d = readDoc();
+    if (!d) return false;
+    fn(d);
+    state.write('reconcile', d);
+    return true;
+  }
+
+  // Takes one report from the hourly budget, persisted before the request is sent. Stamps ahead of the clock (it was set
+  // back) are dropped, and a stored block never lasts longer than the longest Retry-After honoured.
   function takeBudget() {
     const t = now();
     let ok = false;
-    state.update('reconcile', EMPTY_RECONCILE, (d) => {
-      d.sent = (d.sent ?? []).filter((s) => t - Date.parse(s) < RATE_WINDOW_MS);
+    updateDoc((d) => {
+      d.sent = d.sent.filter((s) => Date.parse(s) <= t && t - Date.parse(s) < RATE_WINDOW_MS);
+      if (Date.parse(d.blocked_until) > t + MAX_RETRY_AFTER_MS) d.blocked_until = new Date(t + MAX_RETRY_AFTER_MS).toISOString();
       if (t < Date.parse(d.blocked_until ?? '') || d.sent.length >= RATE_BUDGET) return;
       d.sent.push(iso());
       ok = true;
     });
+    if (ok) state.clearAlert('reconcile:budget');
     return ok;
   }
 
@@ -122,13 +161,14 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
     }
   }
 
-  // Sends entries in batches; returns 'ok', 'dropped' (sent without items the market refused), 'deferred',
-  // 'rate_limited' or 'rejected'.
+  // Sends entries in batches; returns 'ok', 'dropped' (sent without items or batches the market refused), 'deferred',
+  // 'rate_limited' or 'rejected'. A batch refused with 400 is resent once without the items it names, or skipped.
   async function send(orgId, agentId, entries, tally) {
-    const queue = batches(entries);
-    let retried = false;
+    const queue = batches(entries).map((b) => ({ batch: b, retried: false }));
+    let dropped = false;
+    let accepted = 0;
     while (queue.length) {
-      const batch = queue.shift();
+      const { batch, retried } = queue.shift();
       if (!takeBudget()) return 'rate_limited';
       let outcomes;
       try {
@@ -137,7 +177,7 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
         if (!(err instanceof MarketError)) throw err;
         const code = err.code || err.status;
         if (err.status === 429) {
-          if (err.retryAfterMs) state.update('reconcile', EMPTY_RECONCILE, (d) => { d.blocked_until = new Date(now() + err.retryAfterMs).toISOString(); });
+          if (err.retryAfterMs) updateDoc((d) => { d.blocked_until = new Date(now() + err.retryAfterMs).toISOString(); });
           logger.warn(`reconcile report rate limited (${code}); reporting resumes next cycle`);
           return 'rate_limited';
         }
@@ -150,18 +190,19 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
         state.setAlert(`reconcile:${orgId}`, what);
         logger.error(what);
         const bad = new Set((err.errors ?? []).map((e) => ITEM_INDEX_RE.exec(e?.field ?? '')?.[1]).filter(Boolean).map(Number));
+        if (err.status !== 400) return 'rejected';
+        dropped = true;
         const rest = batch.filter((_, i) => !bad.has(i));
-        if (err.status !== 400 || retried || !bad.size || !rest.length) return 'rejected';
-        retried = true;
-        queue.unshift(rest);
+        if (!retried && bad.size && rest.length) queue.unshift({ batch: rest, retried: true });
         continue;
       }
+      accepted += 1;
       batch.forEach((e, i) => {
         tally[outcomes[i]] += 1;
         e.after?.(outcomes[i]);
       });
     }
-    return retried ? 'dropped' : 'ok';
+    return !dropped ? 'ok' : accepted ? 'dropped' : 'rejected';
   }
 
   async function run() {
@@ -230,14 +271,20 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
       else if (r.sent !== 'ok') failed = true;
       if (r.sent === 'ok' && r.status === 'ok') {
         state.clearAlert(`reconcile:${orgId}`);
-        for (const id of consistent.get(orgId) ?? []) if (skills.releaseRollback(id)) logger.info(`reconcile: previous version of skill ${id} released`);
+        for (const [id, v] of consistent.get(orgId) ?? []) {
+          try {
+            if (skills.releaseRollback(id, v)) logger.info(`reconcile: previous version of skill ${id} released`);
+          } catch (err) {
+            logger.warn(`reconcile: previous version of skill ${id} not removed: ${err.message}`);
+          }
+        }
       }
       delete r.agentId;
     }
 
     const outcome = limited ? 'rate_limited' : failed || Object.values(report).some((r) => r.status !== 'ok') ? 'partial' : 'ok';
     const reported = Object.values(report).reduce((n, r) => n + (r.items ?? 0), 0);
-    state.update('reconcile', EMPTY_RECONCILE, (d) => {
+    updateDoc((d) => {
       d.last_run_at = new Date(lastRun).toISOString();
       d.last = { at: iso(), outcome, orgs: report, ...tally };
     });

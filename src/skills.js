@@ -576,20 +576,24 @@ export function createSkills({
       }
       const busy = new Set(state.read('intents', EMPTY_INTENTS).queue
         .filter((q) => q.skill_id && (q.status === 'queued' || q.status === 'running')).map((q) => q.skill_id));
+      const peek = (kind, id) => { try { return state[kind].get(id); } catch (err) { if (err instanceof StateError) return null; throw err; } };
       for (const id of state.outbox.list()) {
-        const o = state.outbox.get(id);
-        const sid = o?.skill_id ?? state.journal.get(id)?.response?.skill_id;
+        const sid = peek('outbox', id)?.skill_id ?? peek('journal', id)?.response?.skill_id;
         if (sid) busy.add(sid);
       }
       return { recs, present, orphans, busy };
     },
 
-    // Drops the kept previous version; reconcile calls it once the market matches the installed version.
-    releaseRollback(skillId) {
+    // Drops the kept previous version; reconcile calls it once the market matches the installed version skillVersionId.
+    // The record lets go of it first, so a crash never leaves it pointing at a partly removed copy; only that version's
+    // directory, and only when it carries this skill's marker, is discarded.
+    releaseRollback(skillId, skillVersionId) {
       const rec = installs()[skillId];
-      if (!rec?.rollback) return false;
-      fs.rmSync(path.join(dataDir, 'rollback', rec.slug), { recursive: true, force: true });
+      if (!rec?.rollback || rec.skill_version_id !== skillVersionId) return false;
+      const dir = rollbackDir(rec.slug, rec.rollback.version_no);
       putRec(skillId, { ...rec, rollback: null });
+      if (readMarker(dir)?.skill_id === skillId) drop(dir);
+      try { fs.rmdirSync(path.dirname(dir)); } catch { /* absent, or holds something else */ }
       return true;
     },
 
