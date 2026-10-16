@@ -10,6 +10,8 @@ import { createIntentPuller } from '../src/intents.js';
 import { EMPTY_REVOKED, createRevocationPuller } from '../src/revocations.js';
 import { createTemplates } from '../src/templates.js';
 import { ensureDeclarations, readSlots, shardsDir, writeSlots } from '../src/shards.js';
+import { HOOKS_PENDING_ALERT_MS } from '../src/templates.js';
+import { writeSlotHooks } from './fake/zylos.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
 import { C02, SKILL, VID, skillHarness } from './fake/skills.js';
@@ -49,7 +51,11 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const templates = make();
   setup?.(h.dataDir, h.state);
   const sent = () => h.fake.requests.filter((r) => r.path === C15).map((r) => r.json);
-  return { ...h, bundle, zylosDir, make, templates, sent, dir: path.join(h.dataDir, 'templates', ADOPTION) };
+  // Queues one more C-04 answer serving bundle b.
+  const serveAgain = (b = bundle, expiresAt = '2026-10-16T00:05:00Z') => h.fake.script('GET', C04, { status: 200, json: {
+    download_url: storage.serve(`/t${h.fake.requests.length}`, { status: 200, body: b.zip }), expires_at: expiresAt, sha256: b.sha, size: b.size,
+  } });
+  return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, dir: path.join(h.dataDir, 'templates', ADOPTION) };
 }
 
 test('a write intent lands the bundle, takes a slot, is emitted and reported with C-15', async (t) => {
@@ -312,4 +318,148 @@ test('a revocation whose quarantine fails has already stopped the injection', as
   assert.throws(() => f.templates.sweepRevoked());
   assert.equal(readSlots(f.dataDir)['1'], null);
   assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+});
+
+const alertsOf = (f) => f.state.read('status', null)?.alerts ?? {};
+const rewrite = (f, over = {}) => f.state.update('intents', null, (d) => {
+  d.queue.push({ ...intent({ id: U(15), seq: 2, bundle_sha256: f.bundle.sha, discard_local_changes: true, ...over }), status: 'queued' });
+});
+// Makes fs.renameSync throw EIO when fn(src, dst) is true, until restored.
+function failRename(t, fn) {
+  const orig = fs.renameSync;
+  fs.renameSync = (a, b) => { if (fn(String(a), String(b))) throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }); return orig(a, b); };
+  const restore = () => { fs.renameSync = orig; };
+  t.after(restore);
+  return restore;
+}
+
+test('a new epoch without slots.json raises an alert only when templates/ holds adoption dirs', async (t) => {
+  const fresh = await harness(t);
+  fresh.state.write('epoch', null);
+  fresh.make();
+  assert.equal(alertsOf(fresh).template_epoch, undefined);
+  fs.mkdirSync(path.join(fresh.dataDir, 'templates', 'not-an-adoption'), { recursive: true });
+  fresh.state.write('epoch', null);
+  fresh.make();
+  assert.equal(alertsOf(fresh).template_epoch, undefined);
+
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.rmSync(path.join(f.dataDir, 'slots.json'));
+  f.state.write('epoch', null);
+  f.make();
+  assert.match(alertsOf(f).template_epoch.message, /without slots\.json/);
+  assert.equal(fs.existsSync(path.join(f.dir, 'inject.md')), true);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'slots.json')), false);
+  assert.ok(f.state.read('epoch', null));
+});
+
+test('a rewrite leaves only templates/<id>: no staged or replaced copy stays behind', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'templates')), [ADOPTION]);
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\n');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'trash')), []);
+});
+
+test('a failed swap puts the replaced copy back', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  const restore = failRename(t, (a, b) => /\.new-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  assert.equal(await f.templates.runNext(), 'failed');
+  restore();
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\nedited\n');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'templates')), [ADOPTION]);
+});
+
+test('when putting the replaced copy back fails too, it is kept and restored at the next start', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  const restore = failRename(t, (a, b) => /\.(new|old)-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  assert.equal(await f.templates.runNext(), 'failed');
+  restore();
+  const root = path.join(f.dataDir, 'templates');
+  const names = fs.readdirSync(root);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(names.map((n) => n.replace(/[0-9a-f]{12}$/, '')), [`${ADOPTION}.old-`]);
+  f.make();
+  assert.deepEqual(fs.readdirSync(root), [ADOPTION]);
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\nedited\n');
+});
+
+test('a leftover .old that is not a directory is never put in place', async (t) => {
+  const f = await harness(t);
+  const root = path.join(f.dataDir, 'templates');
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, `${ADOPTION}.old-aaaaaaaaaaaa`), 'file');
+  fs.symlinkSync(path.dirname(f.dataDir), path.join(root, `${U(30)}.old-bbbbbbbbbbbb`));
+  f.make();
+  assert.deepEqual(fs.readdirSync(root), []);
+  assert.ok(fs.existsSync(path.dirname(f.dataDir)));
+});
+
+test('a template uninstall moves the content out whole even when it cannot be deleted', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  const locked = path.join(f.dir, 'sop');
+  fs.chmodSync(locked, 0o500);
+  t.after(() => {
+    for (const n of fs.readdirSync(path.join(f.dataDir, 'trash'))) fs.chmodSync(path.join(f.dataDir, 'trash', n, 'sop'), 0o700);
+  });
+  f.state.update('intents', null, (d) => { d.queue.push({ ...intent({ id: U(14), op: 'uninstall', seq: 2 }), status: 'queued' }); });
+  await f.templates.runNext();
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(fs.readdirSync(path.join(f.dataDir, 'trash')).length, 1);
+});
+
+const codex = (f) => {
+  fs.mkdirSync(path.join(f.zylosDir, '.zylos'), { recursive: true });
+  fs.writeFileSync(path.join(f.zylosDir, '.zylos', 'config.json'), '{"runtime":"codex"}');
+};
+
+test('on Codex a write waits for the slot hooks instead of failing, with an alert after 24 h; it lands once they appear', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-20T00:00:00Z' })] });
+  codex(f);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.deepEqual(f.sent(), []);
+  assert.equal(f.fake.requests.filter((r) => r.path === C04).length, 0);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(f.state.read('intents', null).queue.map((q) => q.status), ['running']);
+  assert.ok(f.lines.some((l) => /takes effect when the Codex session next starts/.test(l)));
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  f.clock.t += HOOKS_PENDING_ALERT_MS - 1;
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  f.clock.t += 1;
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.match(alertsOf(f).template_hooks_pending.message, /still missing/);
+
+  writeSlotHooks(f.zylosDir, { runtime: 'codex' });
+  f.serveAgain(bundle, '2026-10-18T00:00:00Z');
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.sent()[0].status, 'succeeded');
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  assert.equal(f.state.read('template_hooks', null), null);
+});
+
+test('on Claude missing slot hooks still fail the write at once', async (t) => {
+  const f = await harness(t);
+  fs.rmSync(path.join(f.zylosDir, '.claude', 'settings.json'));
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['CLIENT_INTERNAL', 'inject_unavailable']);
+  assert.equal(f.state.read('template_hooks', null), null);
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
 });

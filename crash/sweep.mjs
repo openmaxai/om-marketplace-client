@@ -5,13 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const SCENS = (process.env.SCENS ?? 'install,upgrade,disabled-upgrade,disable,enable,uninstall,refused,rollback,template').split(',');
+const SCENS = (process.env.SCENS ?? 'install,upgrade,disabled-upgrade,disable,enable,uninstall,refused,rollback,template,template-uninstall').split(',');
 const TIMER_ROUNDS = process.env.TIMER_ROUNDS ?? '40';
 const JOBS = Number(process.env.JOBS ?? os.availableParallelism());
 const PARENT = path.join(import.meta.dirname, 'kill-parent.mjs');
 
 const SHORT = new Set(['disable', 'enable', 'uninstall', 'rollback']);
-const maxd = (s) => process.env.MAXD ?? (SHORT.has(s) ? '60' : s === 'template' ? '200' : '400');
+const maxd = (s) => process.env.MAXD ?? (SHORT.has(s) ? '60' : s.startsWith('template') ? '200' : '400');
 const jobs = SCENS.flatMap((s) => [{ SCEN: s, MODE: 'count', ROUNDS: '5000' }, { SCEN: s, MODE: 'timer', ROUNDS: TIMER_ROUNDS, MAXD: maxd(s) }]);
 const run = (env) => new Promise((resolve) => {
   const c = spawn(process.execPath, [PARENT], { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'inherit'] });

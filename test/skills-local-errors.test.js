@@ -68,6 +68,23 @@ test('a local error that keeps an intent from running raises an alert, cleared o
   assert.equal(fs.existsSync(h.target), false);
 });
 
+test('an intent_failed alert is cleared once its intent leaves the queue without running', async (t) => {
+  const h = await skillHarness(t);
+  const s = h.make();
+  await h.queue(['install', 1]);
+  await s.runRound();
+  const trash = path.join(h.dataDir, 'trash');
+  fs.rmSync(trash, { recursive: true, force: true });
+  fs.writeFileSync(trash, '');
+  const [it] = await h.queue(['uninstall']);
+  assert.deepEqual(await s.runRound(), ['deferred']);
+  assert.ok(alerts(h)[`intent_failed:${it.id}`]);
+  h.state.update('intents', null, (d) => { d.queue = d.queue.filter((q) => q.id !== it.id); });
+  assert.deepEqual(await s.runRound(), []);
+  assert.equal(alerts(h)[`intent_failed:${it.id}`], undefined);
+  assert.ok(fs.existsSync(h.target));
+});
+
 test('startup cleanup never follows a linked trash or staging dir and survives entries it cannot remove', async (t) => {
   const h = await skillHarness(t);
   const outside = path.join(path.dirname(h.dataDir), 'outside');

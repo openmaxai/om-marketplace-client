@@ -79,6 +79,25 @@ test('install hook declares the shards and runs the hook sync only while a slot 
   assert.equal(calls.length, 2);
 });
 
+test('on Codex a hook sync that adds no hooks is not a failure: they come when the Codex session next starts', () => {
+  const z = zylos();
+  fs.mkdirSync(path.join(z, '.zylos'), { recursive: true });
+  fs.writeFileSync(path.join(z, '.zylos', 'config.json'), '{"runtime":"codex"}');
+  const lines = [];
+  const errors = [];
+  const quiet = { log: (l) => lines.push(l), error: (l) => errors.push(l) };
+  let calls = 0;
+  assert.equal(installShards({ zylosDir: z, sync: () => { calls += 1; }, ...quiet }), true);
+  assert.equal(calls, 1);
+  assert.deepEqual(errors, []);
+  assert.ok(lines.some((l) => /takes? effect when the Codex session next starts/.test(l)));
+  assert.ok(!lines.some((l) => /restarts once when idle/.test(l)));
+  assert.equal(installShards({ zylosDir: z, sync: () => { throw new Error('boom'); }, ...quiet }), false, 'a failing sync is still a failure');
+  writeSlotHooks(z, { runtime: 'codex' });
+  assert.equal(installShards({ zylosDir: z, sync: () => { calls += 1; }, ...quiet }), true);
+  assert.equal(calls, 1, 'hooks in place: no sync');
+});
+
 test('the slot hooks are looked for in the hook file of the active runtime', () => {
   const z = zylos();
   ensureDeclarations(z);

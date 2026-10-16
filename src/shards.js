@@ -42,11 +42,16 @@ export function declaration(n) {
 
 const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
 
-// The hook file of the active zylos runtime: Codex reads .codex/hooks.json, Claude .claude/settings.json.
-export function hookFile(zylosDir) {
+// The active zylos runtime, 'claude' or 'codex'.
+export function runtimeOf(zylosDir) {
   let runtime = 'claude';
   try { runtime = JSON.parse(fs.readFileSync(path.join(zylosDir, '.zylos', 'config.json'), 'utf8')).runtime ?? 'claude'; } catch { /* default */ }
-  return runtime === 'codex' ? path.join(zylosDir, '.codex', 'hooks.json') : path.join(zylosDir, '.claude', 'settings.json');
+  return runtime === 'codex' ? 'codex' : 'claude';
+}
+
+// The hook file of the active zylos runtime: Codex reads .codex/hooks.json, Claude .claude/settings.json.
+export function hookFile(zylosDir) {
+  return runtimeOf(zylosDir) === 'codex' ? path.join(zylosDir, '.codex', 'hooks.json') : path.join(zylosDir, '.claude', 'settings.json');
 }
 
 // True when the hook sync has turned all four declarations into session-start hooks.

@@ -10,9 +10,10 @@ import { downloadPackage } from './download.js';
 import { failureFor, scan, writeConfined } from './land.js';
 import { discard, fsyncDir } from './trash.js';
 import { INJECT, inspectBundle } from './pkg/bundle.js';
-import { declarationsReady, emptySlots, readSlots, writeSlots } from './shards.js';
+import { declarationsReady, emptySlots, readSlots, runtimeOf, writeSlots } from './shards.js';
 
 export const MAX_TOMBSTONES = 1000;
+export const HOOKS_PENDING_ALERT_MS = 24 * 60 * 60 * 1000;
 const C15_CODES = new Set(['PACKAGE_MISMATCH', 'PACKAGE_UNSAFE', 'INSTALL_TARGET_CONFLICT', 'CLIENT_INTERNAL']);
 const RETRY_LATER = new Set(['INTENT_OUT_OF_ORDER', 'CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 const LIVE = new Set(['queued', 'running']);
@@ -63,8 +64,10 @@ function land(dataDir, id, bundle) {
     try {
       fs.renameSync(stage, target);
     } catch (err) {
-      if (old) fs.renameSync(old, target);
+      // Not discarded below even when putting it back fails: cleanLeftovers restores it at the next start.
+      const o = old;
       old = null;
+      if (o) fs.renameSync(o, target);
       throw err;
     }
   } finally {
@@ -81,13 +84,13 @@ function leftovers(dataDir, id = null) {
     .filter(([, a]) => isCanonicalUuid(a) && (id === null || a === id)).sort();
 }
 
-// Cleans up after a crash inside land(): a staged copy is discarded; a replaced copy is put back when the swap did not
-// happen (templates/<id> is missing), else discarded.
+// Cleans up after a crash inside land(): a staged copy is discarded; a replaced copy (a real directory) is put back when
+// the swap did not happen (templates/<id> is missing), else discarded.
 export function cleanLeftovers(dataDir) {
   const root = path.join(dataDir, 'templates');
   for (const [name, id, kind] of leftovers(dataDir)) {
     const p = path.join(root, name);
-    if (kind === 'old' && !lstatOrNull(path.join(root, id))) {
+    if (kind === 'old' && !lstatOrNull(path.join(root, id)) && lstatOrNull(p)?.isDirectory()) {
       fs.renameSync(p, path.join(root, id));
       fsyncDir(root);
     } else {
@@ -142,7 +145,7 @@ export function createTemplates({
 
   // A new install epoch (no epoch record in this state dir) clears the slot map and quarantines every template dir
   // named by a canonical adoption id; declarations are never touched. Missing or unreadable slots.json: nothing is
-  // touched and nothing is written.
+  // touched and nothing is written; that is an alert unless templates/ holds no adoption dir (a fresh install).
   function startEpoch() {
     if (state.read('epoch', null)) return;
     let slots;
@@ -151,7 +154,13 @@ export function createTemplates({
       state.setAlert('template_epoch', 'slots.json is unreadable; template content was left untouched');
       logger.warn('slots.json is unreadable; template content was left untouched');
     } else if (slots === null) {
-      logger.warn('new install epoch without slots.json; template content was left untouched');
+      let names = [];
+      try { names = fs.readdirSync(path.join(dataDir, 'templates')); } catch { /* no templates dir */ }
+      if (names.some(isCanonicalUuid)) {
+        const msg = 'new install epoch without slots.json while templates/ holds adoption content; it was left untouched';
+        state.setAlert('template_epoch', msg);
+        logger.warn(msg);
+      }
     } else {
       writeSlots(dataDir, emptySlots());
       let names = [];
@@ -222,7 +231,33 @@ export function createTemplates({
     return 'closed';
   }
 
+  // Codex adds the slot hooks only when its session next starts, so a write waits for them instead of failing; the
+  // wait is an alert after HOOKS_PENDING_ALERT_MS.
+  function hooksPending(it) {
+    let since = state.read('template_hooks', null)?.pending_since;
+    if (!Number.isFinite(Date.parse(since))) {
+      since = iso();
+      state.write('template_hooks', { pending_since: since });
+      logger.info(`template intent ${it.id} waits for the slot hooks; it takes effect when the Codex session next starts`);
+    }
+    if (now() - Date.parse(since) >= HOOKS_PENDING_ALERT_MS) {
+      const msg = `template slot hooks are still missing from the Codex hook file since ${since}; expert templates are not written`;
+      if (state.setAlert('template_hooks_pending', msg)) logger.warn(msg);
+    }
+    return 'deferred';
+  }
+  function hooksReady() {
+    if (state.read('template_hooks', null) === null) return;
+    state.write('template_hooks', null);
+    state.clearAlert('template_hooks_pending');
+  }
+
   async function write(it, body) {
+    if (!declarationsReady(zylosDir)) {
+      if (runtimeOf(zylosDir) === 'codex') return hooksPending(it);
+    } else {
+      hooksReady();
+    }
     try {
       await writeBundle(it);
       return { ...body, status: 'succeeded', rendered_sha256: it.bundle_sha256 };
