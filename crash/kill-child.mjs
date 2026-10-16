@@ -20,6 +20,7 @@ import { createLogger } from '../src/logger.js';
 import { openState } from '../src/state.js';
 import { createOrgs } from '../src/orgs.js';
 import { createSkills } from '../src/skills.js';
+import { createTemplates } from '../src/templates.js';
 import { FAKE_KEY, VALID_ENV } from '../test/helpers.js';
 const a = JSON.parse(process.argv[2]);
 const ORG = VALID_ENV.COCO_ORG_ID, AGENT = VALID_ENV.COCO_MEMBER_ID;
@@ -31,8 +32,10 @@ const state = openState(a.dataDir, { bffUrl: a.url, orgId: ORG, memberId: AGENT,
 const config = { org_id: ORG, member_id: AGENT, orgs: { [ORG]: { member_id: AGENT } } };
 const orgs = createOrgs({ config, state, auth, logger, now });
 const s = createSkills({ api, state, orgs, logger, bffUrl: a.url, skillsDir: a.skillsDir, dataDir: a.dataDir, emulatorOrigin: a.origin, now, sleep: async () => {} });
+const templates = () => createTemplates({ api, state, orgs, logger, dataDir: a.dataDir, zylosDir: a.zylosDir, emulatorOrigin: a.origin, now, sleep: async () => {} });
 await auth.getAccessToken(ORG);
 process.stdout.write('GO\n'); armed = true;
-const out = a.action === 'rollback' ? s.rollback(a.skillId) : await s.runRound();
+// The template runner is built after GO, so its startup cleanup of an earlier crash can be killed too.
+const out = a.action === 'rollback' ? s.rollback(a.skillId) : a.action === 'template' ? await templates().runNext() : await s.runRound();
 armed=false; process.stdout.write(`DONE ${calls} ${JSON.stringify(out)}\n`);
 state.close();

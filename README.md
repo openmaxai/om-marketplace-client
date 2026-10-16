@@ -29,7 +29,11 @@ needed for them.
    `~/zylos/components/om-marketplace-client/config.json` (directory 0700,
    file 0600). If a required variable is missing it stops with a non-zero exit
    and names the missing variable. In an interactive terminal it asks for the
-   missing values instead (the API key is not echoed).
+   missing values instead (the API key is not echoed). It then declares the
+   four `market-template-*` session-start shards. Only while their hooks are
+   missing from the runtime's hook file does it run the zylos hook sync; the
+   agent restarts once when idle; memory and context are kept. Upgrades do the
+   same.
 4. Unset the `COCO_*` variables in that shell
    (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).
    The PM2 app filters them out and the service removes any it still inherits,

@@ -5,11 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, tmpHome } from './helpers.js';
 import {
-  declaration, declarationsReady, ensureDeclarations, estimateTokens, findHookSyncScript, readSlots, shardsDir, syncHooks, writeSlots,
+  declaration, declarationsReady, ensureDeclarations, estimateTokens, findHookSyncScript, hooksPresent, readSlots, shardsDir, syncHooks, writeSlots,
 } from '../src/shards.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { installShards } from '../hooks/lib/shards.js';
-import { fakeZylos } from './fake/zylos.js';
+import { fakeZylos, writeSlotHooks } from './fake/zylos.js';
 
 const ID = '0190f000-0000-7000-8000-000000000001';
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -43,6 +43,10 @@ test('the four declarations are written once, match zylos rules and leave other 
     assert.deepEqual(d.budget, { maxChars: 10000, maxTokens: 2200 });
   }
   assert.deepEqual(ensureDeclarations(z), []);
+  assert.equal(declarationsReady(z), false, 'declared but no hooks yet');
+  writeSlotHooks(z, { slots: [1, 2, 3] });
+  assert.equal(declarationsReady(z), false, 'one hook missing');
+  writeSlotHooks(z);
   assert.equal(declarationsReady(z), true);
   assert.equal(fs.readFileSync(path.join(shardsDir(z), 'other.json'), 'utf8'), '{"keep":true}');
 });
@@ -54,16 +58,46 @@ test('declarations are refused without a shard registry or outside the zylos .cl
   assert.equal(fs.existsSync(shardsDir(z)), false);
 });
 
-test('install hook declares the shards, then always runs the hook sync; failures do not throw', () => {
+test('install hook declares the shards and runs the hook sync only while a slot hook is missing; failures do not throw', () => {
   const z = zylos();
   const calls = [];
-  const quiet = { log: () => {}, error: () => {} };
-  assert.equal(installShards({ zylosDir: z, sync: (dir) => calls.push(dir), ...quiet }), true);
-  assert.equal(installShards({ zylosDir: z, sync: (dir) => calls.push(dir), ...quiet }), true);
+  const lines = [];
+  const quiet = { log: (l) => lines.push(l), error: (l) => lines.push(l) };
+  const sync = (dir) => { calls.push(dir); writeSlotHooks(dir); };
+  assert.equal(installShards({ zylosDir: z, sync, ...quiet }), true);
+  assert.ok(lines.some((l) => /restarts once when idle; memory and context are kept/.test(l)));
+  assert.equal(installShards({ zylosDir: z, sync, ...quiet }), true);
+  assert.deepEqual(calls, [z]);
+  writeSlotHooks(z, { slots: [1, 3, 4] });
+  assert.equal(installShards({ zylosDir: z, sync, ...quiet }), true);
   assert.deepEqual(calls, [z, z]);
-  assert.equal(installShards({ zylosDir: z, sync: () => { throw new Error('boom'); }, ...quiet }), false);
+
+  const y = zylos();
+  assert.equal(installShards({ zylosDir: y, sync: () => {}, ...quiet }), false, 'a sync that adds no hooks');
+  assert.equal(installShards({ zylosDir: y, sync: () => { throw new Error('boom'); }, ...quiet }), false);
   assert.equal(installShards({ zylosDir: zylos({ registry: false }), sync: () => calls.push('x'), ...quiet }), false);
   assert.equal(calls.length, 2);
+});
+
+test('the slot hooks are looked for in the hook file of the active runtime', () => {
+  const z = zylos();
+  ensureDeclarations(z);
+  writeSlotHooks(z, { runtime: 'codex' });
+  assert.equal(hooksPresent(z), false);
+  fs.mkdirSync(path.join(z, '.zylos'), { recursive: true });
+  fs.writeFileSync(path.join(z, '.zylos', 'config.json'), '{"runtime":"codex"}');
+  assert.equal(hooksPresent(z), true);
+  assert.equal(declarationsReady(z), true);
+  fs.writeFileSync(path.join(z, '.codex', 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [
+    ...[1, 2, 3].map((n) => ({ command: `node /x/session-start-orchestrator.js --shard market-template-${n}` })),
+    { command: 'node /x/session-start-orchestrator.js --shard market-template-40' },
+    { command: 'node /x/other.js --shard market-template-4' },
+  ] }] } }));
+  assert.equal(hooksPresent(z), false);
+  for (const bad of ['not json', '{}', '{"hooks":{"SessionStart":{}}}', '{"hooks":{"SessionStart":[null,{"hooks":[null]}]}}']) {
+    fs.writeFileSync(path.join(z, '.codex', 'hooks.json'), bad);
+    assert.equal(hooksPresent(z), false, bad);
+  }
 });
 
 test('hook sync runs the installed zylos sync-settings-hooks.js with ZYLOS_DIR', () => {

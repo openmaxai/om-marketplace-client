@@ -3,11 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { InstallFailure } from './failure.js';
 import { MarketError } from './http.js';
-import { isCanonicalUuid, uuidv7 } from './ids.js';
+import { isCanonicalUuid, isSha256Hex, uuidv7 } from './ids.js';
 import { EMPTY_INTENTS, tooOld } from './intents.js';
 import { revokedSet } from './revocations.js';
 import { downloadPackage } from './download.js';
 import { failureFor, scan, writeConfined } from './land.js';
+import { discard, fsyncDir } from './trash.js';
 import { INJECT, inspectBundle } from './pkg/bundle.js';
 import { declarationsReady, emptySlots, readSlots, writeSlots } from './shards.js';
 
@@ -39,7 +40,11 @@ export function quarantine(dataDir, id) {
   return true;
 }
 
-// Writes the files into templates/<id>.new-<rand>/, re-reads and compares them, then swaps the directory in.
+const trashOf = (dataDir) => path.join(dataDir, 'trash');
+const LEFTOVER_RE = /^(.+)\.(new|old)-[0-9a-f]{12}$/;
+
+// Writes the files into templates/<id>.new-<rand>/, re-reads and compares them, then swaps the directory in. What is
+// replaced or left over goes through the trash, so nothing is ever deleted in place.
 function land(dataDir, id, bundle) {
   const root = realDir(path.join(dataDir, 'templates'));
   const target = path.join(root, id);
@@ -63,8 +68,31 @@ function land(dataDir, id, bundle) {
       throw err;
     }
   } finally {
-    fs.rmSync(stage, { recursive: true, force: true });
-    if (old) fs.rmSync(old, { recursive: true, force: true });
+    // A copy that cannot be discarded now is left to cleanLeftovers at the next start.
+    for (const d of [stage, old]) try { if (d) discard(d, trashOf(dataDir)); } catch { /* left over */ }
+  }
+}
+
+// templates/<id>.new-* and .old-* of one adoption (all of them when id is null), as [name, id, kind].
+function leftovers(dataDir, id = null) {
+  let names = [];
+  try { names = fs.readdirSync(path.join(dataDir, 'templates')); } catch { /* none */ }
+  return names.map((n) => [n, ...(LEFTOVER_RE.exec(n)?.slice(1) ?? [])])
+    .filter(([, a]) => isCanonicalUuid(a) && (id === null || a === id)).sort();
+}
+
+// Cleans up after a crash inside land(): a staged copy is discarded; a replaced copy is put back when the swap did not
+// happen (templates/<id> is missing), else discarded.
+export function cleanLeftovers(dataDir) {
+  const root = path.join(dataDir, 'templates');
+  for (const [name, id, kind] of leftovers(dataDir)) {
+    const p = path.join(root, name);
+    if (kind === 'old' && !lstatOrNull(path.join(root, id))) {
+      fs.renameSync(p, path.join(root, id));
+      fsyncDir(root);
+    } else {
+      discard(p, trashOf(dataDir));
+    }
   }
 }
 
@@ -230,7 +258,8 @@ export function createTemplates({
         return { ...body, status: 'succeeded' };
       }
       clearSlot(id);
-      fs.rmSync(dir(id), { recursive: true, force: true });
+      discard(dir(id), trashOf(dataDir));
+      for (const [name] of leftovers(dataDir, id)) discard(path.join(dataDir, 'templates', name), trashOf(dataDir));
       putAdoption(id, { state: 'removed' });
       return { ...body, status: 'succeeded' };
     } catch (err) {
@@ -273,6 +302,11 @@ export function createTemplates({
     }
   }
 
+  try {
+    cleanLeftovers(dataDir);
+  } catch (err) {
+    logger.error(`template leftovers not cleaned up: ${err.message}`);
+  }
   try {
     startEpoch();
   } catch (err) {
@@ -321,11 +355,13 @@ export function createTemplates({
       const items = [];
       for (const [id, rec] of Object.entries(recs)) {
         if (rec.state !== 'active') continue;
-        if (!slotOf(slots, id) || !lstatOrNull(dir(id))?.isDirectory()) items.push({ kind: 'template_inject_missing', adoption_id: id });
-        else if (!unchanged(rec)) {
-          let inject = null;
-          try { inject = sha256(fs.readFileSync(path.join(dir(id), INJECT), { flag: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW })); } catch { /* missing */ }
-          items.push({ kind: 'template_locally_modified', adoption_id: id, ...(inject ? { rendered_sha256: inject } : {}) });
+        // The emitter prints nothing while the slot's sha differs from the landed inject.md.
+        const n = slotOf(slots, id);
+        if (!n || slots[n].inject_sha256 !== rec.inject_sha256 || !lstatOrNull(dir(id))?.isDirectory()) {
+          items.push({ kind: 'template_inject_missing', adoption_id: id });
+        } else if (!unchanged(rec)) {
+          // Same basis as C-15: the bundle the content was rendered from.
+          items.push({ kind: 'template_locally_modified', adoption_id: id, ...(isSha256Hex(rec.bundle_sha256) ? { rendered_sha256: rec.bundle_sha256 } : {}) });
         }
       }
       return items;
