@@ -292,6 +292,29 @@ export function stateScope(bffUrl, orgId, memberId) {
   return sha256Hex([new URL(bffUrl).origin, orgId, memberId].join('\n'));
 }
 
+const lockPath = (dataDir) => path.join(fs.realpathSync(path.join(dataDir, 'state')), 'lock');
+
+// The pid holding the data dir's state lock, read once, only when that process is provably the one that took it: its
+// recorded start id is known and equals the pid's current one. Null otherwise (no lock, unknown start, pid reused,
+// this process, or pid 1).
+export function verifiedLockHolder(dataDir) {
+  let text;
+  try { text = fs.readFileSync(lockPath(dataDir), 'utf8'); } catch { return null; }
+  const { pid, start } = parseLock(text);
+  if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || !start) return null;
+  return hooks.startId(pid) === start ? pid : null;
+}
+
+// Takes the data dir's state lock without opening a state scope; returns its release function. Throws
+// StateLockedError while a live process holds it.
+export function lockDataDir(dataDir) {
+  ensureDir(dataDir);
+  ensureDir(path.join(dataDir, 'state'));
+  const file = lockPath(dataDir);
+  acquireLock(file);
+  return () => releaseLock(file);
+}
+
 // State lives under <dataDir>/state/<sha256(bff origin, primary org, member id)>/ so cursors, queues and journals of
 // one market environment or agent are never applied to another; an API key rotation keeps them. The lock is per data dir.
 export function openState(dataDir, { bffUrl, orgId, memberId, now = Date.now }) {

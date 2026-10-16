@@ -20,6 +20,8 @@ export function createScheduler(tasks, {
 } = {}) {
   const timers = new Map();
   const inflight = new Set();
+  const running = new Set();
+  const again = new Set();
   let stopped = false;
 
   function schedule(task, delay) {
@@ -32,12 +34,15 @@ export function createScheduler(tasks, {
   async function run(task) {
     timers.delete(task.name);
     if (stopped) return;
+    running.add(task.name);
     const p = Promise.resolve()
       .then(() => task.run())
       .catch((err) => logger?.error(`${task.name} failed: ${err?.message || err}`));
     inflight.add(p);
     const res = await p;
     inflight.delete(p);
+    running.delete(task.name);
+    if (again.delete(task.name)) return schedule(task, 0);
     const min = Number(res?.minDelayMs);
     schedule(task, Math.max(jittered(task.baseMs, rand), Number.isFinite(min) ? min : 0));
   }
@@ -45,6 +50,14 @@ export function createScheduler(tasks, {
   return {
     start() {
       for (const task of tasks) schedule(task, 0);
+    },
+    // Runs a task now, or right after its current run; the regular cadence resumes from there.
+    runNow(name) {
+      const task = tasks.find((x) => x.name === name);
+      if (!task || stopped) return;
+      if (running.has(name)) return void again.add(name);
+      clearTimer(timers.get(name));
+      schedule(task, 0);
     },
     async stop() {
       stopped = true;

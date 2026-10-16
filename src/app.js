@@ -7,7 +7,7 @@ import { createScheduler, POLL_INTERVAL_MS } from './scheduler.js';
 import { createAuth } from './auth.js';
 import { createMarketHttp } from './http.js';
 import { createMarketApi } from './market-api.js';
-import { openState } from './state.js';
+import { StateLockedError, openState } from './state.js';
 import { createOrgs } from './orgs.js';
 import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
@@ -16,33 +16,56 @@ import { createTemplates } from './templates.js';
 import { createReconciler } from './reconcile.js';
 import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
+import { EXIT, execute, spool } from './commands.js';
 
 // Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
 // queued skill intents run, then at most one template intent, then reconcile when it is due (reconcile.maybeRun), so
 // a scan never runs alongside an install. A round is skipped while the token's member id contradicts the configured one.
-export function buildTasks(logger, { revocations, intents, skills, templates, reconcile, identity, now = Date.now } = {}) {
+export function pollRound(logger, { revocations, intents, skills, templates, reconcile, identity, now = Date.now } = {}) {
+  return async () => {
+    if (!revocations || !intents) return logger.debug('poll: not wired');
+    if (identity && !(await identity())) return undefined;
+    try {
+      await revocations.pull();
+    } finally {
+      await intents.pull();
+    }
+    try {
+      try {
+        await skills?.runRound();
+      } finally {
+        await templates?.runNext();
+      }
+    } finally {
+      await reconcile?.maybeRun();
+    }
+    return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
+  };
+}
+
+// CLI requests waiting in `commands` run first, one at a time; a sync request is answered when the round ends.
+export function buildTasks(logger, runtime = {}, commands = null) {
+  const round = pollRound(logger, runtime);
   return [
     {
       name: 'poll',
       baseMs: POLL_INTERVAL_MS,
       run: async () => {
-        if (!revocations || !intents) return logger.debug('poll: not wired');
-        if (identity && !(await identity())) return undefined;
-        try {
-          await revocations.pull();
-        } finally {
-          await intents.pull();
+        const reqs = commands?.claim() ?? [];
+        const syncs = reqs.filter((r) => r.cmd === 'sync');
+        for (const r of reqs.filter((x) => x.cmd !== 'sync')) {
+          let res;
+          try { res = await execute(runtime, r); } catch (err) { res = { code: EXIT.FAILED, message: err.message }; }
+          commands.answer(r.id, res);
         }
         try {
-          try {
-            await skills?.runRound();
-          } finally {
-            await templates?.runNext();
-          }
-        } finally {
-          await reconcile?.maybeRun();
+          const out = await round();
+          for (const r of syncs) commands.answer(r.id, { code: EXIT.OK, message: 'poll round finished' });
+          return out;
+        } catch (err) {
+          for (const r of syncs) commands.answer(r.id, { code: EXIT.FAILED, message: `poll round failed: ${err.message}` });
+          throw err;
         }
-        return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
     },
   ];
@@ -121,6 +144,7 @@ export function createRuntime({
     });
     return {
       state,
+      api,
       orgs,
       skills,
       identity: identityCheck({ config, auth, state, logger }),
@@ -134,6 +158,9 @@ export function createRuntime({
     throw err;
   }
 }
+
+const LOCK_RETRY_MS = 2000;
+const SPOOL_CHECK_MS = 1000;
 
 // Signal handlers are installed before any state is opened, so a stop request during start-up still releases the lock.
 export async function main({ dataDir } = {}) {
@@ -151,6 +178,7 @@ export async function main({ dataDir } = {}) {
   let runtime = null;
   let scheduler = null;
   let keepAlive = null;
+  let lockWait = null;
   let stopping = false;
   const abort = new AbortController();
   let finish;
@@ -160,6 +188,7 @@ export async function main({ dataDir } = {}) {
     stopping = true;
     logger.info(`${signal} received, shutting down`);
     clearInterval(keepAlive);
+    lockWait?.();
     abort.abort();
     await scheduler?.stop();
     runtime?.state.close();
@@ -171,16 +200,30 @@ export async function main({ dataDir } = {}) {
   process.once('SIGINT', onInt);
 
   logger.info(`om-marketplace-client ${CLIENT_VERSION} starting (bff_url=${config.bff_url}, org_id=${config.org_id})`);
-  try {
-    runtime = createRuntime({ config, dataDir, logger, signal: abort.signal });
-  } catch (err) {
-    process.off('SIGTERM', onTerm);
-    process.off('SIGINT', onInt);
-    logger.error(`cannot start: ${err.message}`);
-    return EXIT_CONFIG;
+  // A CLI command may hold the lock for a while; wait for it rather than exit.
+  for (let waited = false; !stopping && !runtime;) {
+    try {
+      runtime = createRuntime({ config, dataDir, logger, signal: abort.signal });
+    } catch (err) {
+      if (err instanceof StateLockedError) {
+        if (!waited) logger.warn(`${err.message}; waiting for it to finish`);
+        waited = true;
+        await new Promise((r) => { lockWait = r; setTimeout(r, LOCK_RETRY_MS); });
+        continue;
+      }
+      process.off('SIGTERM', onTerm);
+      process.off('SIGINT', onInt);
+      logger.error(`cannot start: ${err.message}`);
+      return EXIT_CONFIG;
+    }
   }
-  scheduler = createScheduler(buildTasks(logger, runtime), { logger });
+  if (stopping) {
+    runtime?.state.close();
+    return done;
+  }
+  const commands = spool(dataDir);
+  scheduler = createScheduler(buildTasks(logger, runtime, commands), { logger });
   scheduler.start();
-  keepAlive = setInterval(() => {}, 1 << 30);
+  keepAlive = setInterval(() => { if (commands.pending()) scheduler.runNow('poll'); }, SPOOL_CHECK_MS);
   return done;
 }

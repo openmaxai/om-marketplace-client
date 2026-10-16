@@ -33,6 +33,6 @@ const orgs = createOrgs({ config, state, auth, logger, now });
 const s = createSkills({ api, state, orgs, logger, bffUrl: a.url, skillsDir: a.skillsDir, dataDir: a.dataDir, emulatorOrigin: a.origin, now, sleep: async () => {} });
 await auth.getAccessToken(ORG);
 process.stdout.write('GO\n'); armed = true;
-const out = await s.runRound();
+const out = a.action === 'rollback' ? s.rollback(a.skillId) : await s.runRound();
 armed=false; process.stdout.write(`DONE ${calls} ${JSON.stringify(out)}\n`);
 state.close();
