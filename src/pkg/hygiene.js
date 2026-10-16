@@ -2,7 +2,9 @@
 // which they are reported match the server's InspectSkillPackage.
 import crypto from 'node:crypto';
 import { PackageError, readFiles, readZip } from './zip.js';
-import { PathIndex, checkEntryPath } from './paths.js';
+import { PathIndex, checkEntryPath, equalFoldAscii } from './paths.js';
+import { checkSkillPolicy } from './policy.js';
+import { parseSkillMD } from './frontmatter.js';
 
 const MAX_MANIFEST_JSON_BYTES = 1 << 20;
 const MAX_JSON_DEPTH = 10000;
@@ -29,14 +31,6 @@ export const simpleLower = (s) => [...s].map(simpleLowerChar).join('');
 // "Differs only in case" for JSON keys: Go strings.ToLower(strings.ToUpper(k)).
 export const foldKey = (s) => [...s].map((c) => simpleLowerChar(simpleUpperChar(c))).join('');
 
-// Go strings.EqualFold against an ASCII target.
-const ASCII_FOLD_PARTNERS = { '\u212a': 'k', '\u017f': 's' };
-export function equalFoldAscii(s, target) {
-  const a = [...s];
-  if (a.length !== target.length) return false;
-  return a.every((r, i) => (ASCII_FOLD_PARTNERS[r] ?? (r < '\x80' ? r.toLowerCase() : r)) === target[i].toLowerCase());
-}
-
 const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
 const extName = (p) => {
   const b = baseName(p);
@@ -46,7 +40,8 @@ const extName = (p) => {
 export const isSkillMDPath = (p) => equalFoldAscii(baseName(p), 'SKILL.md');
 export const isMarkdownPath = (p) => equalFoldAscii(extName(p), '.md');
 
-// Reads the zip, checks hygiene and returns the file manifest (sorted by path bytes), the root SKILL.md and every .md file.
+// Reads the zip, checks hygiene and the skill policy, and returns the file manifest (sorted by path bytes), the root
+// SKILL.md, every .md file and the root frontmatter.
 export function inspectPackage(buf) {
   const index = new PathIndex();
   const { files } = readZip(buf, {
@@ -76,8 +71,11 @@ export function inspectPackage(buf) {
   }
   for (const [name, raw] of jsons) checkPackageJSON(name, raw);
   if (!skillMD) throw new PackageError('skill_md_missing', 'no SKILL.md at the package root');
+  // Policy before the root frontmatter, so a disallowed key reports the policy code rather than skill_md_invalid.
+  checkSkillPolicy(markdown);
+  const meta = parseSkillMD(skillMD);
   manifest.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  return { manifest, skillMD, markdown };
+  return { manifest, skillMD, markdown, meta };
 }
 
 // Rejects npm install hooks and dependencies. Keys are read level by level with duplicates and case variants rejected,

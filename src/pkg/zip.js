@@ -31,11 +31,12 @@ const S_IFREG = 0x8000;
 
 // `reason` is a fixed PACKAGE_UNSAFE reason; `detail` may contain names from the package and is for local logs only.
 export class PackageError extends Error {
-  constructor(reason, detail) {
+  constructor(reason, detail, file) {
     super(`package unsafe: ${reason}`);
     this.name = 'PackageError';
     this.reason = reason;
     this.detail = detail;
+    if (file !== undefined) this.file = file;
   }
 }
 
