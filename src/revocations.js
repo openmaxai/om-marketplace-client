@@ -1,4 +1,5 @@
 import { MarketError } from './http.js';
+import { isRevocationCursor } from './market-api.js';
 
 export const MAX_PAGES_PER_PULL = 50;
 export const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -39,13 +40,19 @@ function addRevoked(state, items) {
   if (changed) state.write('revoked', doc);
 }
 
-// enforce(items) applies new revocations to installed content; it runs after the items are persisted.
+// enforce(items) applies new revocations to installed content and must be idempotent: it runs after the items are added
+// to the revoked set and before the cursor moves past them, so a crash re-delivers them.
 export function createRevocationPuller({ api, state, orgs, logger, now = Date.now, enforce = async () => {} }) {
   const iso = () => new Date(now()).toISOString();
   const doc = () => ({ ...EMPTY_REVOCATIONS, ...state.read('revocations', EMPTY_REVOCATIONS) });
+  // In-memory fallback for the staleness check when revocations.json cannot be read.
+  const startedAt = iso();
+  let lastSuccessAt = null;
+  let notBefore = 0;
 
   function checkStale() {
-    const d = doc();
+    let d;
+    try { d = doc(); } catch { d = { last_success_at: lastSuccessAt, first_attempt_at: startedAt }; }
     const base = Date.parse(d.last_success_at ?? d.first_attempt_at ?? '');
     if (Number.isNaN(base) || now() - base <= STALE_AFTER_MS) {
       state.clearAlert('revocations_stale');
@@ -59,10 +66,11 @@ export function createRevocationPuller({ api, state, orgs, logger, now = Date.no
   function handleError(err, orgId) {
     if (!(err instanceof MarketError)) throw err;
     if (err.code === 'MEMBER_LEFT_ORG') {
-      orgs.markInvalid(orgId, err.code);
-      return 'org_invalid';
+      orgs.markLeft(orgId, err.reason);
+      return 'org_left';
     }
     if (err.transient) {
+      if (err.retryAfterMs) notBefore = now() + err.retryAfterMs;
       logger.warn(`revocation pull failed transiently (${err.code || err.status}); retrying next round`);
       return 'transient';
     }
@@ -74,52 +82,71 @@ export function createRevocationPuller({ api, state, orgs, logger, now = Date.no
 
   async function pullPages(orgId) {
     let reset = false;
+    const restart = (d) => {
+      logger.warn('revocation cursor is invalid; pulling from the start');
+      reset = true;
+      state.write('revocations', { ...d, cursor: null });
+    };
     for (let i = 0; i < MAX_PAGES_PER_PULL; i++) {
       const d = doc();
+      if (d.cursor !== null && !isRevocationCursor(d.cursor)) {
+        restart(d);
+        continue;
+      }
       let page;
       try {
         page = await api.pullRevocations({ orgId, cursor: d.cursor });
       } catch (err) {
-        // A stored cursor the client itself refuses (TypeError) is reset the same way.
-        const badCursor = (err instanceof MarketError && err.code === 'CURSOR_INVALID') || err instanceof TypeError;
-        if (badCursor && d.cursor && !reset) {
-          logger.warn('revocation cursor is invalid; pulling from the start');
-          reset = true;
-          state.write('revocations', { ...d, cursor: null });
+        if (err instanceof MarketError && err.code === 'CURSOR_INVALID' && d.cursor && !reset) {
+          restart(d);
           continue;
         }
         throw err;
       }
+      orgs.markActive(orgId);
       addRevoked(state, page.items);
+      if (page.items.length) await enforce(page.items);
       if (page.next_cursor) d.cursor = page.next_cursor;
       if (!page.has_more) d.last_success_at = iso();
       state.write('revocations', d);
-      if (page.items.length) await enforce(page.items);
-      if (!page.has_more) return 'ok';
+      if (!page.has_more) {
+        lastSuccessAt = d.last_success_at;
+        return 'ok';
+      }
     }
     return 'partial';
   }
 
   return {
     checkStale,
+    // Earliest time the next pull may be sent (server Retry-After).
+    notBefore: () => notBefore,
     // C-11 is identity-wide and pulled through the primary org only.
     async pull() {
       const orgId = orgs.primary;
-      if (!doc().first_attempt_at) state.write('revocations', { ...doc(), first_attempt_at: iso() });
-      let outcome;
-      if (orgs.isInvalid(orgId)) {
-        logger.warn(`primary org ${orgId} is marked invalid; revocations are not pulled`);
-        outcome = 'org_invalid';
-      } else {
-        try {
-          outcome = await pullPages(orgId);
-        } catch (err) {
-          outcome = handleError(err, orgId);
+      let outcome = 'error';
+      try {
+        if (!doc().first_attempt_at) state.write('revocations', { ...doc(), first_attempt_at: startedAt });
+        if (now() < notBefore) {
+          outcome = 'backoff';
+        } else if (!orgs.mayContact(orgId)) {
+          logger.debug(`primary org ${orgId} is ${orgs.membership(orgId)}; revocations are not pulled`);
+          outcome = 'org_left';
+        } else {
+          try {
+            outcome = await pullPages(orgId);
+          } catch (err) {
+            outcome = handleError(err, orgId);
+          }
         }
+        if (outcome === 'ok' || outcome === 'partial') state.clearAlert('revocations_pull');
+      } catch (err) {
+        logger.error(`revocation pull failed: ${err.message}`);
+        try { state.setAlert('revocations_pull', `revocation pull failed: ${err.message}`); } catch { /* status unwritable */ }
+      } finally {
+        try { state.recordRun('revocations', outcome); } catch { /* status unwritable */ }
+        try { checkStale(); } catch (err) { logger.error(`revocation staleness check failed: ${err.message}`); }
       }
-      if (outcome === 'ok' || outcome === 'partial') state.clearAlert('revocations_pull');
-      state.recordRun('revocations', outcome);
-      checkStale();
       return { outcome };
     },
   };

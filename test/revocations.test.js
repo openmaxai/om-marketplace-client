@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { ORG, U, pullHarness } from './fake/pull.js';
 import { fakeCursor as C } from './fake/market.js';
 import { STALE_AFTER_MS, createRevocationPuller, revokedSet } from '../src/revocations.js';
@@ -98,9 +100,63 @@ test('no successful pull for 24 h writes a status alert and one warn log, and cl
 
 test('MEMBER_LEFT_ORG marks the primary org invalid; no other org is tried', async (t) => {
   const { fake, puller, orgs } = await setup(t);
-  fake.script('POST', PATH, { status: 403, problem: { code: 'MEMBER_LEFT_ORG' } });
-  assert.deepEqual(await puller.pull(), { outcome: 'org_invalid' });
-  assert.equal(orgs.isInvalid(ORG), true);
-  assert.deepEqual(await puller.pull(), { outcome: 'org_invalid' });
+  fake.script('POST', PATH, { status: 403, problem: { code: 'MEMBER_LEFT_ORG', reason: 'member_departed' } });
+  assert.deepEqual(await puller.pull(), { outcome: 'org_left' });
+  assert.equal(orgs.membership(ORG), 'invalid');
+  assert.deepEqual(await puller.pull(), { outcome: 'org_left' });
+  assert.equal(fake.market().length, 1);
+});
+
+test('enforcement runs before the cursor moves; a failed enforce re-delivers the page', async (t) => {
+  const h = await pullHarness(t);
+  let fail = true;
+  const enforced = [];
+  const puller = createRevocationPuller({
+    api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now,
+    enforce: async (items) => {
+      if (fail) throw new Error('enforce failed');
+      enforced.push(...items);
+    },
+  });
+  h.fake.script('POST', PATH, page([rev(5)], C(1)), page([rev(5)], C(1)));
+  assert.deepEqual(await puller.pull(), { outcome: 'error' });
+  assert.equal(h.state.read('revocations', null).cursor, null);
+  assert.equal(revokedSet(h.state).has('skill_version_id', U(5)), true);
+  assert.equal(h.state.read('status', null).runs.revocations.outcome, 'error');
+  fail = false;
+  assert.deepEqual(await puller.pull(), { outcome: 'ok' });
+  assert.deepEqual(sent(h.fake), [{}, {}]);
+  assert.equal(enforced.length, 1);
+  assert.equal(h.state.read('revocations', null).cursor, C(1));
+});
+
+test('a corrupt revocation document still raises the 24 h alert', async (t) => {
+  const { fake, puller, state, clock } = await setup(t);
+  fs.writeFileSync(path.join(state.dir, 'revocations.json'), '{nope');
+  assert.deepEqual(await puller.pull(), { outcome: 'error' });
+  assert.match(state.read('status', null).alerts.revocations_pull.message, /not valid JSON/);
+  assert.equal(state.read('status', null).alerts.revocations_stale, undefined);
+  clock.t += STALE_AFTER_MS + 1;
+  await puller.pull();
+  assert.match(state.read('status', null).alerts.revocations_stale.message, /since start-up/);
+  assert.equal(fake.market().length, 0);
+});
+
+test('only the client cursor check resets the cursor; other TypeErrors do not', async (t) => {
+  const h = await pullHarness(t);
+  const api = { pullRevocations: async () => { throw new TypeError('boom'); } };
+  const puller = createRevocationPuller({ api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
+  h.state.write('revocations', { cursor: C(4), last_success_at: null, first_attempt_at: null });
+  assert.deepEqual(await puller.pull(), { outcome: 'error' });
+  assert.equal(h.state.read('revocations', null).cursor, C(4));
+});
+
+test('Retry-After on revocations defers the next pull', async (t) => {
+  const { fake, puller, clock } = await setup(t);
+  fake.script('POST', PATH, { status: 503, headers: { 'retry-after': '900' }, problem: { code: 'DEPENDENCY_UNAVAILABLE' } });
+  assert.deepEqual(await puller.pull(), { outcome: 'transient' });
+  assert.equal(puller.notBefore(), clock.t + 900_000);
+  clock.t += 300_000;
+  assert.deepEqual(await puller.pull(), { outcome: 'backoff' });
   assert.equal(fake.market().length, 1);
 });

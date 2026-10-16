@@ -11,7 +11,8 @@ export function jittered(baseMs, rand = Math.random) {
 
 /**
  * Runs each task once at start, then again after a jittered delay measured
- * from the end of the previous run, so runs of one task never overlap.
+ * from the end of the previous run, so runs of one task never overlap. A run
+ * resolving to { minDelayMs } is not rescheduled sooner than that.
  */
 export function createScheduler(tasks, {
   rand = Math.random,
@@ -37,9 +38,10 @@ export function createScheduler(tasks, {
       .then(() => task.run())
       .catch((err) => logger?.error(`${task.name} failed: ${err?.message || err}`));
     inflight.add(p);
-    await p;
+    const res = await p;
     inflight.delete(p);
-    schedule(task, jittered(task.baseMs, rand));
+    const min = Number(res?.minDelayMs);
+    schedule(task, Math.max(jittered(task.baseMs, rand), Number.isFinite(min) ? min : 0));
   }
 
   return {

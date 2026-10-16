@@ -48,12 +48,12 @@ test('runtime never prints the API key on start, shutdown, or config rejection',
   let stdout = '', stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
+  const exited = new Promise((resolve) => child.on('exit', resolve));
   await new Promise((resolve) => {
     const check = setInterval(() => { if (stdout.includes('reconcile')) { clearInterval(check); resolve(); } }, 20);
   });
   child.kill('SIGTERM');
-  const code = await new Promise((resolve) => child.on('exit', resolve));
-  assert.equal(code, 0);
+  assert.equal(await exited, 0);
   assert.match(stdout, /SIGTERM received/);
   assertNoKey({ stdout, stderr }, 'runtime');
 
@@ -73,11 +73,12 @@ test('runtime warns about inherited COCO_* variables by name only and removes th
   let stdout = '', stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
+  const exited = new Promise((resolve) => child.on('exit', resolve));
   await new Promise((resolve) => {
     const check = setInterval(() => { if (stdout.includes('starting')) { clearInterval(check); resolve(); } }, 20);
   });
   child.kill('SIGTERM');
-  assert.equal(await new Promise((resolve) => child.on('exit', resolve)), 0);
+  assert.equal(await exited, 0);
   assert.match(stderr, /\[warn\].*COCO_API_KEY/);
   for (const name of Object.keys(VALID_ENV)) assert.ok(stderr.includes(name), name);
   for (const value of Object.values(VALID_ENV)) assert.ok(!stderr.includes(value), 'value in warning');

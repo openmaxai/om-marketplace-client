@@ -2,14 +2,17 @@ import { MarketError } from './http.js';
 import { POLICY_SHA256 } from './policy/pin.js';
 
 export const MAX_PAGES_PER_PULL = 50;
+export const MAX_QUEUE = 1000;
 export const EMPTY_INTENTS = Object.freeze({ after_seq: 0, queue: [] });
 export const EMPTY_GATE = Object.freeze({ too_old: null, policy_sha256: null });
 const POLICY_MISMATCH = 'policy_mismatch';
 
-// queued: runnable; org_not_configured: to be reported, never executed; org_invalid: the agent left that org.
+// queued: runnable; org_not_configured: to be reported, never executed; org_suspended / org_invalid: the agent's
+// membership in that org is suspended / gone.
 export function intentStatus(orgs, orgId) {
   if (!orgs.isConfigured(orgId)) return 'org_not_configured';
-  return orgs.isInvalid(orgId) ? 'org_invalid' : 'queued';
+  const m = orgs.membership(orgId);
+  return m ? `org_${m}` : 'queued';
 }
 
 // Too-old mode: no new intents are executed; revocation pulls and reconcile continue.
@@ -19,6 +22,7 @@ export function tooOld(state) {
 
 export function createIntentPuller({ api, state, orgs, logger, now = Date.now }) {
   const iso = () => new Date(now()).toISOString();
+  let notBefore = 0;
 
   function enterTooOld(reason, minVersion, policySha) {
     const gate = state.read('gate', EMPTY_GATE);
@@ -42,20 +46,44 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
     state.clearAlert('client_too_old');
   }
 
-  // Queue and cursor are one document, so items are durable no later than the cursor that skips them.
-  function persistPage(doc, page) {
+  // Expired intents can no longer be executed and are dropped; org_not_configured ones are kept to be reported.
+  function prune(queue) {
+    const t = now();
+    return queue.filter((it) => it.status === 'org_not_configured' || !(Date.parse(it.expires_at) <= t));
+  }
+
+  // Queue and cursor are one document, so items are durable no later than the cursor that skips them. When the queue
+  // is full the cursor stops at the last queued item, so nothing unqueued is skipped.
+  function persistPage(page) {
+    const doc = state.read('intents', EMPTY_INTENTS);
+    doc.queue = prune(doc.queue);
     const known = new Set(doc.queue.map((it) => it.id));
     let added = 0;
+    let cursor = doc.after_seq;
+    let full = false;
     for (const it of page.items) {
-      if (known.has(it.id)) continue;
-      const status = intentStatus(orgs, it.org_id);
-      if (status === 'org_not_configured') logger.info(`intent ${it.id} is for org ${it.org_id}, which is not configured; it will not be executed`);
-      doc.queue.push({ ...it, status, received_at: iso() });
-      added += 1;
+      if (!known.has(it.id)) {
+        if (doc.queue.length >= MAX_QUEUE) {
+          full = true;
+          break;
+        }
+        const status = intentStatus(orgs, it.org_id);
+        if (status === 'org_not_configured') logger.info(`intent ${it.id} is for org ${it.org_id}, which is not configured; it will not be executed`);
+        doc.queue.push({ ...it, status, received_at: iso() });
+        known.add(it.id);
+        added += 1;
+      }
+      cursor = it.seq;
     }
-    doc.after_seq = page.next_after_seq;
+    doc.after_seq = full ? cursor : page.next_after_seq;
     state.write('intents', doc);
-    return added;
+    return { added, full };
+  }
+
+  function queueFull(full) {
+    if (!full) return state.clearAlert('intents_queue_full');
+    const msg = `install intent queue is full (${MAX_QUEUE}); new intents are not pulled until it drains`;
+    if (state.setAlert('intents_queue_full', msg)) logger.warn(msg);
   }
 
   function handleError(err, orgId) {
@@ -65,10 +93,11 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
       return 'too_old';
     }
     if (err.code === 'MEMBER_LEFT_ORG') {
-      orgs.markInvalid(orgId, err.code);
-      return 'org_invalid';
+      orgs.markLeft(orgId, err.reason);
+      return 'org_left';
     }
     if (err.transient) {
+      if (err.retryAfterMs) notBefore = now() + err.retryAfterMs;
       logger.warn(`install intent pull failed transiently (${err.code || err.status}); retrying next round`);
       return 'transient';
     }
@@ -83,10 +112,16 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
     try {
       const agentId = await orgs.agentId(orgId);
       for (let i = 0; i < MAX_PAGES_PER_PULL; i++) {
-        const doc = state.read('intents', EMPTY_INTENTS);
-        const page = await api.pullInstallIntents({ orgId, agentId, afterSeq: doc.after_seq });
+        const { after_seq: afterSeq, queue } = state.read('intents', EMPTY_INTENTS);
+        if (prune(queue).length >= MAX_QUEUE) {
+          queueFull(true);
+          return { outcome: 'queue_full', added };
+        }
+        const page = await api.pullInstallIntents({ orgId, agentId, afterSeq });
+        orgs.markActive(orgId);
         if (!page) {
           leaveTooOld(null);
+          queueFull(false);
           return { outcome: 'ok', added };
         }
         if (page.policy_sha256 !== POLICY_SHA256) {
@@ -94,7 +129,10 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
           return { outcome: 'too_old', added };
         }
         leaveTooOld(page.policy_sha256);
-        added += persistPage(doc, page);
+        const r = persistPage(page);
+        added += r.added;
+        queueFull(r.full);
+        if (r.full) return { outcome: 'queue_full', added };
         if (!page.has_more) return { outcome: 'ok', added };
       }
       return { outcome: 'partial', added };
@@ -104,19 +142,29 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
   }
 
   return {
+    // Earliest time the next pull may be sent (server Retry-After).
+    notBefore: () => notBefore,
     // C-01 is identity-wide and pulled through the primary org only.
     async pull() {
       const orgId = orgs.primary;
-      let result;
-      if (orgs.isInvalid(orgId)) {
-        logger.warn(`primary org ${orgId} is marked invalid; install intents are not pulled`);
-        result = { outcome: 'org_invalid', added: 0 };
-      } else {
-        result = await pullPages(orgId);
+      let result = { outcome: 'error', added: 0 };
+      try {
+        if (now() < notBefore) {
+          result = { outcome: 'backoff', added: 0 };
+        } else if (!orgs.mayContact(orgId)) {
+          logger.debug(`primary org ${orgId} is ${orgs.membership(orgId)}; install intents are not pulled`);
+          result = { outcome: 'org_left', added: 0 };
+        } else {
+          result = await pullPages(orgId);
+        }
+        if (result.outcome === 'ok' || result.outcome === 'partial' || result.outcome === 'queue_full') state.clearAlert('intents_pull');
+        if (result.added) logger.info(`queued ${result.added} install intent(s)`);
+      } catch (err) {
+        logger.error(`install intent pull failed: ${err.message}`);
+        try { state.setAlert('intents_pull', `install intent pull failed: ${err.message}`); } catch { /* status unwritable */ }
+      } finally {
+        try { state.recordRun('intents', result.outcome); } catch { /* status unwritable */ }
       }
-      if (result.outcome === 'ok' || result.outcome === 'partial') state.clearAlert('intents_pull');
-      state.recordRun('intents', result.outcome);
-      if (result.added) logger.info(`queued ${result.added} install intent(s)`);
       return result;
     },
   };

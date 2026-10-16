@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
-import { createIntentPuller, tooOld } from '../src/intents.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { MAX_QUEUE, createIntentPuller, tooOld } from '../src/intents.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
 
 const PATH = `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`;
@@ -71,24 +73,97 @@ test('CLIENT_VERSION_TOO_OLD enters too-old mode with min_version; a later 204 l
   assert.equal(tooOld(state), null);
 });
 
-test('MEMBER_LEFT_ORG marks the org invalid and stops pulling without another org', async (t) => {
+test('MEMBER_LEFT_ORG (departed) marks the primary org invalid and stops pulling without another org', async (t) => {
   const { fake, puller, state, orgs, lines } = await setup(t);
-  fake.script('POST', PATH, { status: 403, problem: { code: 'MEMBER_LEFT_ORG' } });
-  assert.equal((await puller.pull()).outcome, 'org_invalid');
-  assert.equal(orgs.isInvalid(ORG), true);
-  assert.ok(state.read('status', null).alerts[`org_invalid:${ORG}`]);
+  fake.script('POST', PATH, { status: 403, problem: { code: 'MEMBER_LEFT_ORG', reason: 'member_departed' } });
+  assert.equal((await puller.pull()).outcome, 'org_left');
+  assert.equal(orgs.membership(ORG), 'invalid');
+  assert.match(state.read('status', null).alerts[`org_membership:${ORG}`].message, /pulling has stopped for ALL orgs/);
   assert.ok(lines.some((l) => l.includes('[warn]') && l.includes('pulling has stopped for ALL orgs')));
-  assert.match(JSON.stringify(state.read('status', null).alerts[`org_invalid:${ORG}`]), /primary org .* ALL orgs/);
-  assert.equal((await puller.pull()).outcome, 'org_invalid');
+  assert.equal((await puller.pull()).outcome, 'org_left');
   assert.equal(fake.market().length, 1, 'no further pulls through any org');
 });
 
-test('intents of an org marked invalid are kept but not runnable', async (t) => {
-  const { fake, puller, state, orgs } = await setup(t);
-  orgs.markInvalid(ORG2, 'MEMBER_LEFT_ORG');
-  fake.script('POST', PATH, page([intent(1, { org_id: ORG2 })], 1));
+test('intents of a suspended or departed org are kept but not runnable', async (t) => {
+  const { fake, puller, state, orgs } = await setup(t, { orgs: { [ORG2]: {}, [U(9)]: {} } });
+  orgs.markLeft(ORG2, 'member_departed');
+  orgs.markLeft(U(9), 'member_suspended');
+  fake.script('POST', PATH, page([intent(1, { org_id: ORG2 }), intent(2, { org_id: U(9) })], 2));
   await puller.pull();
-  assert.equal(state.read('intents', null).queue[0].status, 'org_invalid');
+  assert.deepEqual(state.read('intents', null).queue.map((it) => it.status), ['org_invalid', 'org_suspended']);
+});
+
+test('a re-delivered intent id is queued once', async (t) => {
+  const { fake, puller, state } = await setup(t);
+  fake.script('POST', PATH, page([intent(1)], 1), page([intent(2, { id: intent(1).id })], 2));
+  await puller.pull();
+  await puller.pull();
+  const doc = state.read('intents', null);
+  assert.deepEqual(doc.queue.map((it) => it.seq), [1]);
+  assert.equal(doc.after_seq, 2);
+});
+
+test('every intents write holds each item the cursor has passed', async (t) => {
+  const { fake, puller, state } = await setup(t);
+  const writes = [];
+  const write = state.write;
+  state.write = (name, value) => {
+    if (name === 'intents') writes.push(structuredClone(value));
+    return write(name, value);
+  };
+  fake.script('POST', PATH, page([intent(1), intent(2)], 2, true), page([intent(3)], 5));
+  await puller.pull();
+  assert.equal(writes.length, 2);
+  for (const w of writes) {
+    for (const seq of [1, 2, 3].filter((n) => n <= w.after_seq)) assert.ok(w.queue.some((it) => it.seq === seq), `seq ${seq}`);
+  }
+});
+
+test('a full queue stops the cursor at the last queued item and raises an alert until it drains', async (t) => {
+  const { fake, puller, state, clock, lines } = await setup(t);
+  const filler = Array.from({ length: MAX_QUEUE - 1 }, (_, i) => ({ ...intent(0, { id: U(5000 + i) }), status: 'queued' }));
+  const expired = { ...intent(0, { id: U(9000), expires_at: '2026-10-15T00:00:00Z' }), status: 'queued' };
+  state.write('intents', { after_seq: 0, queue: [...filler, expired] });
+  fake.script('POST', PATH, page([intent(1), intent(2), intent(3)], 9));
+  assert.deepEqual(await puller.pull(), { outcome: 'queue_full', added: 1 });
+  let doc = state.read('intents', null);
+  assert.equal(doc.queue.length, MAX_QUEUE);
+  assert.ok(!doc.queue.some((it) => it.id === U(9000)), 'expired intent dropped');
+  assert.equal(doc.after_seq, 1);
+  assert.match(state.read('status', null).alerts.intents_queue_full.message, /queue is full/);
+  assert.equal(lines.filter((l) => l.includes('[warn]') && l.includes('queue is full')).length, 1);
+  assert.equal((await puller.pull()).outcome, 'queue_full');
+  assert.equal(fake.market().length, 1, 'no pull while full');
+  doc.queue = doc.queue.slice(10);
+  state.write('intents', doc);
+  clock.t += 1;
+  fake.script('POST', PATH, page([intent(2), intent(3)], 9));
+  assert.deepEqual(await puller.pull(), { outcome: 'ok', added: 2 });
+  assert.deepEqual(sentSeqs(fake), [0, 1]);
+  doc = state.read('intents', null);
+  assert.equal(doc.after_seq, 9);
+  assert.equal(state.read('status', null).alerts.intents_queue_full, undefined);
+});
+
+test('Retry-After defers the next pull at least as long as the server asked', async (t) => {
+  const { fake, puller, clock } = await setup(t);
+  fake.script('POST', PATH, { status: 429, headers: { 'retry-after': '1800' }, problem: { code: 'RATE_LIMITED' } }, { status: 204 });
+  assert.equal((await puller.pull()).outcome, 'transient');
+  assert.equal(puller.notBefore(), clock.t + 1_800_000);
+  clock.t += 1_799_999;
+  assert.equal((await puller.pull()).outcome, 'backoff');
+  assert.equal(fake.market().length, 1);
+  clock.t += 1;
+  assert.equal((await puller.pull()).outcome, 'ok');
+});
+
+test('a corrupt intents document is reported and the run is recorded', async (t) => {
+  const { puller, state, fake } = await setup(t);
+  fs.writeFileSync(path.join(state.dir, 'intents.json'), '{nope');
+  assert.equal((await puller.pull()).outcome, 'error');
+  assert.match(state.read('status', null).alerts.intents_pull.message, /not valid JSON/);
+  assert.equal(state.read('status', null).runs.intents.outcome, 'error');
+  assert.equal(fake.market().length, 0);
 });
 
 test('404 and malformed responses raise an alert and keep the cursor', async (t) => {

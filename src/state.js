@@ -87,27 +87,95 @@ function pidAlive(pid) {
   }
 }
 
-// O_EXCL lock file holding the owner's pid; a lock left by a dead process is taken over.
+function readTrim(file) {
+  try { return fs.readFileSync(file, 'utf8').trim(); } catch { return null; }
+}
+
+// Boot id plus the kernel start time (clock ticks since boot) of pid; null where /proc is not available.
+export function processStartId(pid) {
+  const stat = readTrim(`/proc/${pid}/stat`);
+  if (!stat) return null;
+  const starttime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+  if (!/^\d+$/.test(starttime ?? '')) return null;
+  return `${readTrim('/proc/sys/kernel/random/boot_id') ?? ''}:${starttime}`;
+}
+
+function parseLock(text) {
+  try {
+    const o = JSON.parse(text);
+    if (o && typeof o === 'object') return { pid: o.pid, start: typeof o.start === 'string' ? o.start : null };
+  } catch { /* older plain-pid format */ }
+  return { pid: Number.parseInt(text, 10), start: null };
+}
+
+const heldLocks = new Map();
+
+// A lock is stale when its pid is not a live process, is this process (a previous incarnation with the same pid,
+// e.g. pid 1 in a container), or now belongs to a process with a different start time.
+function lockIsStale({ pid, start }) {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || !pidAlive(pid)) return true;
+  const current = start ? processStartId(pid) : null;
+  return current !== null && current !== start;
+}
+
+function readLockFile(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch (err) { if (err.code === 'ENOENT') return null; throw err; }
+}
+
+// The lock is published complete via link(2), so it is never seen half-written. A stale lock is moved aside with
+// rename(2); if what was moved is not the lock judged stale, another instance just took it and it is put back.
 function acquireLock(file) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = fs.openSync(file, 'wx', 0o600);
-      fs.writeSync(fd, `${process.pid}\n`);
-      fs.closeSync(fd);
-      return;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-    }
-    const pid = Number.parseInt(fs.readFileSync(file, 'utf8'), 10);
-    if (Number.isSafeInteger(pid) && pid > 0 && pidAlive(pid)) throw new StateLockedError(pid);
-    fs.unlinkSync(file);
+  if (heldLocks.has(file)) throw new StateLockedError(process.pid);
+  const content = JSON.stringify({ pid: process.pid, start: processStartId(process.pid), nonce: crypto.randomBytes(8).toString('hex') });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
   }
-  throw new StateError('cannot acquire the state lock');
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.linkSync(tmp, file);
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        const seen = readLockFile(file);
+        if (seen === null) continue;
+        const owner = parseLock(seen);
+        if (!lockIsStale(owner)) throw new StateLockedError(owner.pid);
+        const aside = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.stale`;
+        try {
+          fs.renameSync(file, aside);
+        } catch (e) {
+          if (e.code === 'ENOENT') continue;
+          throw e;
+        }
+        if (readLockFile(aside) !== seen) {
+          try { fs.linkSync(aside, file); } catch { /* a third instance holds it now */ }
+          fs.unlinkSync(aside);
+          throw new StateLockedError(parseLock(readLockFile(file) ?? '').pid);
+        }
+        fs.unlinkSync(aside);
+        continue;
+      }
+      if (readLockFile(file) !== content) throw new StateLockedError(parseLock(readLockFile(file) ?? '').pid);
+      heldLocks.set(file, content);
+      return;
+    }
+    throw new StateError('cannot acquire the state lock');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+  }
 }
 
 function releaseLock(file) {
+  const content = heldLocks.get(file);
+  if (content === undefined) return;
+  heldLocks.delete(file);
   try {
-    if (Number.parseInt(fs.readFileSync(file, 'utf8'), 10) === process.pid) fs.unlinkSync(file);
+    if (readLockFile(file) === content) fs.unlinkSync(file);
   } catch { /* already gone */ }
 }
 

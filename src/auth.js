@@ -53,7 +53,7 @@ const sha256Hex = (v) => crypto.createHash('sha256').update(String(v), 'utf8').d
 // exchanged again.
 export function createAuth({
   bffUrl, apiKey, tokenDir = null, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now,
-  uid = process.getuid?.(),
+  uid = process.getuid?.(), signal = null,
 }) {
   if (!apiKey) throw new Error('api key is required');
   const origin = normalizeBffUrl(bffUrl);
@@ -160,6 +160,7 @@ export function createAuth({
       body,
       timeoutMs,
       label,
+      signal,
     });
     if (r.status < 200 || r.status >= 300) throw errorFromResponse(label, r, now());
     const d = r.data && typeof r.data === 'object' && r.data.data && typeof r.data.data === 'object' ? r.data.data : r.data;

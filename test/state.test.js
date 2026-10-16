@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { mode, tmpHome } from './helpers.js';
-import { StateError, StateLockedError, openState as open, stateScope } from '../src/state.js';
+import { spawn, spawnSync } from 'node:child_process';
+import { ROOT, mode, tmpHome } from './helpers.js';
+import { StateError, StateLockedError, openState as open, processStartId, stateScope, writeJsonAtomic } from '../src/state.js';
 
 const BFF = 'https://bff.example.test';
 const SCOPE = { orgId: 'org-1', memberId: 'm-1' };
@@ -52,15 +52,101 @@ test('corrupt or symlinked documents fail closed', () => {
   s.close();
 });
 
+const lockPath = (dataDir) => path.join(dataDir, 'state', 'lock');
+const writeLock = (dataDir, content) => {
+  fs.mkdirSync(path.dirname(lockPath(dataDir)), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(lockPath(dataDir), content);
+};
+
 test('the lock admits one instance and is taken over from a dead owner', () => {
   const dataDir = path.join(tmpHome(), 'd');
   const s = openState(dataDir, { bffUrl: BFF });
   assert.throws(() => openState(dataDir, { bffUrl: BFF }), StateLockedError);
   s.close();
-  assert.equal(fs.existsSync(path.join(dataDir, 'state', 'lock')), false);
+  assert.equal(fs.existsSync(lockPath(dataDir)), false);
   const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-  fs.writeFileSync(path.join(dataDir, 'state', 'lock'), `${dead}\n`);
+  writeLock(dataDir, `${dead}\n`);
   openState(dataDir, { bffUrl: BFF }).close();
+  assert.deepEqual(fs.readdirSync(path.dirname(lockPath(dataDir))).filter((n) => n.startsWith('lock')), []);
+});
+
+test('a lock carrying this process id is left by a previous incarnation and is taken over', () => {
+  for (const content of [`${process.pid}\n`, JSON.stringify({ pid: process.pid, start: processStartId(process.pid) })]) {
+    const dataDir = path.join(tmpHome(), 'd');
+    writeLock(dataDir, content);
+    const s = openState(dataDir, { bffUrl: BFF });
+    assert.equal(JSON.parse(fs.readFileSync(lockPath(dataDir), 'utf8')).pid, process.pid);
+    s.close();
+    assert.equal(fs.existsSync(lockPath(dataDir)), false);
+  }
+});
+
+test('a live pid holds the lock only while its start time matches', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  t.after(() => child.kill('SIGKILL'));
+  await new Promise((r) => child.once('spawn', r));
+  const start = processStartId(child.pid);
+  assert.ok(start);
+  assert.equal(processStartId(child.pid), start, 'stable');
+  for (const [content, held] of [
+    [`${child.pid}\n`, true],
+    [JSON.stringify({ pid: child.pid, start }), true],
+    [JSON.stringify({ pid: child.pid, start: `${start}0` }), false],
+  ]) {
+    const dataDir = path.join(tmpHome(), 'd');
+    writeLock(dataDir, content);
+    if (held) {
+      assert.throws(() => openState(dataDir, { bffUrl: BFF }), (err) => err instanceof StateLockedError && err.pid === child.pid);
+      assert.equal(fs.readFileSync(lockPath(dataDir), 'utf8'), content, 'a live lock is left alone');
+    } else {
+      openState(dataDir, { bffUrl: BFF }).close();
+    }
+  }
+});
+
+test('processes starting together over a stale lock: exactly one acquires it', async () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeLock(dataDir, '999999999\n');
+  const script = `
+    import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
+    try {
+      const s = openState(${JSON.stringify(dataDir)}, { bffUrl: 'https://bff.example.test', orgId: 'org-1', memberId: 'm-1' });
+      process.stdout.write('acquired');
+      setTimeout(() => s.close(), 1500);
+    } catch (err) {
+      process.stdout.write(err.name);
+    }`;
+  const runs = Array.from({ length: 6 }, () => new Promise((resolve) => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e', script]);
+    let out = '';
+    c.stdout.on('data', (d) => { out += d; });
+    c.on('exit', () => resolve(out));
+  }));
+  const outs = await Promise.all(runs);
+  assert.equal(outs.filter((o) => o === 'acquired').length, 1, outs.join(','));
+  assert.ok(outs.every((o) => o === 'acquired' || o === 'StateLockedError'), outs.join(','));
+});
+
+test('writes replace the document by rename and fsync the directory', (t) => {
+  const s = openState(path.join(tmpHome(), 'd'), { bffUrl: BFF });
+  t.after(() => s.close());
+  s.write('intents', { a: 1 });
+  const file = path.join(s.dir, 'intents.json');
+  const ino = fs.statSync(file).ino;
+  const dirFds = new Set();
+  const synced = [];
+  const openSync = fs.openSync;
+  t.mock.method(fs, 'openSync', (p, ...rest) => {
+    const fd = openSync(p, ...rest);
+    if (p === s.dir) dirFds.add(fd);
+    return fd;
+  });
+  t.mock.method(fs, 'fsyncSync', (fd) => { synced.push(fd); });
+  writeJsonAtomic(file, { a: 2 });
+  assert.notEqual(fs.statSync(file).ino, ino, 'a new inode: written aside and renamed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { a: 2 });
+  assert.equal(synced.length, 2);
+  assert.ok(dirFds.has(synced[1]), 'directory fsynced after the rename');
 });
 
 test('journal and outbox store one record per canonical id', () => {

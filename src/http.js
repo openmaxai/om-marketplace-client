@@ -76,12 +76,22 @@ async function readLimited(res, max, label) {
   return Buffer.concat(chunks);
 }
 
-// One HTTP exchange: timeout covers headers and body, redirects are never followed, body size is capped.
-export async function sendJson({ fetchImpl = globalThis.fetch, url, method, headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, label }) {
-  const signal = AbortSignal.timeout(timeoutMs);
-  const netError = () => new MarketError(`${label}: ${signal.aborted ? 'timed out' : 'network error'}`, {
-    code: signal.aborted ? 'TIMEOUT' : 'NETWORK_ERROR', transient: true,
-  });
+// One HTTP exchange: timeout covers headers and body, redirects are never followed, body size is capped. An abort
+// of `signal` (shutdown) ends the exchange early.
+export async function sendJson({
+  fetchImpl = globalThis.fetch, url, method, headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, label, signal: stop = null,
+}) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const ctl = new AbortController();
+  const onAbort = () => ctl.abort();
+  timeout.addEventListener('abort', onAbort, { once: true });
+  stop?.addEventListener('abort', onAbort, { once: true });
+  if (stop?.aborted) ctl.abort();
+  const { signal } = ctl;
+  const netError = () => {
+    const [code, what] = stop?.aborted ? ['ABORTED', 'aborted'] : timeout.aborted ? ['TIMEOUT', 'timed out'] : ['NETWORK_ERROR', 'network error'];
+    return new MarketError(`${label}: ${what}`, { code, transient: true });
+  };
   let res;
   let raw;
   try {
@@ -96,6 +106,9 @@ export async function sendJson({ fetchImpl = globalThis.fetch, url, method, head
   } catch (err) {
     if (err instanceof MarketError) throw err;
     throw netError();
+  } finally {
+    timeout.removeEventListener('abort', onAbort);
+    stop?.removeEventListener('abort', onAbort);
   }
   const type = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
   let data = null;
@@ -107,7 +120,9 @@ export async function sendJson({ fetchImpl = globalThis.fetch, url, method, head
 
 // Market calls under {bffUrl}/api/v1/orgs/{orgId}. Only the bearer token, the client version and content
 // negotiation headers are sent; callers cannot add headers. subPath segments must already be percent-encoded.
-export function createMarketHttp({ bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now }) {
+export function createMarketHttp({
+  bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now, signal = null,
+}) {
   const base = new URL(normalizeBffUrl(bffUrl));
   async function request(method, orgId, subPath, body) {
     if (!isOrgOrMemberId(orgId)) throw new TypeError('invalid orgId');
@@ -126,7 +141,7 @@ export function createMarketHttp({ bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       });
       logger.debug(label);
-      return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label }) };
+      return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label, signal }) };
     };
     let { token, r } = await send();
     if (r.status === 401 && await auth.renewAfter401(orgId, token)) {
