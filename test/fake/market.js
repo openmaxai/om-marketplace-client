@@ -11,9 +11,15 @@ export function fakeJwt(claims) {
   return `${enc({ alg: 'none', typ: 'JWT' })}.${enc(claims)}.fake-signature`;
 }
 
+// Revocation log epoch of the fake deployment; cursors are written like the server's FormatRevocationCursor.
+export const REVOCATION_EPOCH = '5f0c9e2a-7b1d-4c3e-9a8f-0123456789ab';
+export const fakeCursor = (seq, epoch = REVOCATION_EPOCH) => `${epoch}:${seq}`;
+
 // Fake BFF on 127.0.0.1. Token endpoints mint fake JWTs by default; script(method, path, ...responses) queues
 // responses ({status, json, problem, headers, delayMs, raw}) or functions of the recorded request, consumed in order.
+// apiKey may be a list of accepted keys. Unscripted revocations:query answers an empty page with a real-shaped cursor.
 export async function startFakeMarket({ apiKey, memberId, ttlSec = 3600 } = {}) {
+  const keys = [].concat(apiKey ?? []);
   const requests = [];
   const scripts = new Map();
   const issued = { access: [], refresh: [] };
@@ -34,12 +40,15 @@ export async function startFakeMarket({ apiKey, memberId, ttlSec = 3600 } = {}) 
   const problem = (status, code) => ({ status, problem: { type: 'about:blank', title: code, status, code } });
 
   const defaults = {
-    'POST /auth/agent/token': (req) => (req.headers.authorization === `Bearer ${apiKey}` && req.json?.org_id
+    'POST /auth/agent/token': (req) => (keys.some((k) => req.headers.authorization === `Bearer ${k}`) && req.json?.org_id
       ? mint(req.json.org_id) : problem(401, 'UNAUTHENTICATED')),
     'POST /auth/refresh': (req) => (issued.refresh.includes(req.json?.refresh_token)
       && issued.access.includes(req.headers.authorization?.slice(7))
       ? mint(req.json.org_id) : problem(401, 'UNAUTHENTICATED')),
   };
+  const revocationsDefault = (req) => ({
+    status: 200, json: { items: [], next_cursor: req.json?.cursor ?? fakeCursor(0), has_more: false },
+  });
 
   const server = http.createServer((req, res) => {
     let body = '';
@@ -50,7 +59,8 @@ export async function startFakeMarket({ apiKey, memberId, ttlSec = 3600 } = {}) 
       const rec = { method: req.method, path: req.url, headers: req.headers, rawHeaders: req.rawHeaders, body, json };
       requests.push(rec);
       const key = `${req.method} ${req.url}`;
-      let step = scripts.get(key)?.shift() ?? defaults[key] ?? problem(404, 'NOT_FOUND');
+      let step = scripts.get(key)?.shift() ?? defaults[key]
+        ?? (/^POST \/api\/v1\/orgs\/[^/]+\/revocations:query$/.test(key) ? revocationsDefault : problem(404, 'NOT_FOUND'));
       if (typeof step === 'function') step = step(rec);
       if (step.delayMs) await new Promise((r) => setTimeout(r, step.delayMs));
       const headers = { ...step.headers };

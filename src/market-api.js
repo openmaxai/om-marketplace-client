@@ -1,10 +1,12 @@
 import { MarketError } from './http.js';
-import { isCanonicalUuid, isSha256Hex } from './ids.js';
+import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex } from './ids.js';
 
 export const INTENT_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall', 'write_template']);
 export const REVOCATION_KINDS = new Set(['version_revoke', 'template_revoke', 'shelf_revoke', 'sha_block']);
 export const MAX_INTENT_LIMIT = 100;
-const CURSOR_RE = /^\d{1,19}:\d{1,19}$/;
+// <revocation log epoch (canonical UUID)>:<seq as int64 decimal without leading zeros>, as the server writes it.
+const CURSOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:(0|[1-9]\d{0,18})$/;
+const INT64_MAX = 2n ** 63n - 1n;
 const RFC3339_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
 class ShapeError extends Error {}
@@ -19,7 +21,9 @@ const uuid = (v, p) => (isCanonicalUuid(v) ? v : fail(p, 'must be a canonical UU
 const sha = (v, p) => (isSha256Hex(v) ? v : fail(p, 'must be 64 lowercase hex'));
 const nullable = (check) => (v, p) => (v == null ? null : check(v, p));
 const time = (v, p) => (typeof v === 'string' && RFC3339_RE.test(v) && !Number.isNaN(Date.parse(v)) ? v : fail(p, 'must be an RFC 3339 time'));
-const cursor = (v, p) => (typeof v === 'string' && CURSOR_RE.test(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
+const isCursor = (v) => typeof v === 'string' && CURSOR_RE.test(v) && BigInt(v.slice(37)) <= INT64_MAX;
+const cursor = (v, p) => (isCursor(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
+const orgId = (v, p) => (isOrgOrMemberId(v) ? v : fail(p, 'must be an org id'));
 const oneOf = (set) => (v, p) => (set.has(v) ? v : fail(p, 'has an unknown value'));
 
 // Builds a fresh object from the known fields only, so unvalidated server data never reaches callers.
@@ -31,7 +35,7 @@ function pick(src, p, spec) {
 
 function parseIntent(raw, p) {
   const it = pick(object(raw, p), p, {
-    id: uuid, org_id: uuid, op: oneOf(INTENT_OPS),
+    id: uuid, org_id: orgId, op: oneOf(INTENT_OPS),
     skill_id: nullable(uuid), skill_version_id: nullable(uuid), template_id: nullable(uuid),
     source_market_id: nullable(uuid), adoption_id: nullable(uuid),
     discard_local_changes: bool, expires_at: time, seq: uint,
@@ -75,9 +79,8 @@ function parseRevocation(raw, p) {
 }
 
 function parseRevocationPage(raw) {
-  const page = pick(object(raw, 'body'), 'body', { items: array, has_more: bool, next_cursor: nullable(cursor) });
+  const page = pick(object(raw, 'body'), 'body', { items: array, has_more: bool, next_cursor: cursor });
   page.items = page.items.map((it, i) => parseRevocation(it, `body.items[${i}]`));
-  if (page.has_more && !page.next_cursor) fail('body.next_cursor', 'is required when has_more is true');
   return page;
 }
 
@@ -96,10 +99,10 @@ export function createMarketApi({ http }) {
   return {
     // Resolves to null on 204 (nothing after afterSeq), otherwise to the validated page.
     async pullInstallIntents({ orgId, agentId, afterSeq = 0, limit = MAX_INTENT_LIMIT }) {
-      if (!isCanonicalUuid(agentId)) throw new TypeError('agentId must be a lowercase canonical UUID');
+      if (!isOrgOrMemberId(agentId)) throw new TypeError('invalid agentId');
       if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) throw new TypeError('afterSeq must be a non-negative integer');
       if (!Number.isInteger(limit) || limit < 1 || limit > MAX_INTENT_LIMIT) throw new TypeError('limit must be 1..100');
-      const r = await http.request('POST', orgId, `/agents/${agentId}/install-intents:query`, {
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/install-intents:query`, {
         status: 'pending', after_seq: afterSeq, limit,
       });
       const label = 'install-intents:query';
@@ -109,7 +112,7 @@ export function createMarketApi({ http }) {
     },
 
     async pullRevocations({ orgId, cursor: from = null }) {
-      if (from !== null && !(typeof from === 'string' && CURSOR_RE.test(from))) throw new TypeError('cursor must be <epoch>:<seq> or null');
+      if (from !== null && !isCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
       const r = await http.request('POST', orgId, '/revocations:query', from === null ? {} : { cursor: from });
       const label = 'revocations:query';
       if (r.status !== 200) return validated(label, r, () => fail('status', `${r.status} is not expected`));

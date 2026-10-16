@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { VALID_ENV } from './helpers.js';
-import { marketHarness } from './fake/market.js';
+import { REVOCATION_EPOCH, fakeCursor, marketHarness } from './fake/market.js';
 import { createMarketApi } from '../src/market-api.js';
 import { MarketError } from '../src/http.js';
 
@@ -69,7 +69,7 @@ test('install-intents:query rejects malformed responses as RESPONSE_INVALID', as
 
 test('install-intents:query validates arguments and surfaces gate errors', async (t) => {
   const { fake, api } = await setup(t);
-  for (const args of [{ agentId: 'x' }, { agentId: AGENT, afterSeq: -1 }, { agentId: AGENT, limit: 101 }, { agentId: AGENT, limit: 0 }]) {
+  for (const args of [{ agentId: '..' }, { agentId: 'a/b' }, { agentId: AGENT, afterSeq: -1 }, { agentId: AGENT, limit: 101 }, { agentId: AGENT, limit: 0 }]) {
     await assert.rejects(api.pullInstallIntents({ orgId: ORG, ...args }), TypeError);
   }
   fake.script('POST', INTENTS, { status: 409, problem: { code: 'CLIENT_VERSION_TOO_OLD', reason: 'missing', min_version: '1.0.0' } });
@@ -79,18 +79,36 @@ test('install-intents:query validates arguments and surfaces gate errors', async
 test('revocations:query sends the cursor and validates the page', async (t) => {
   const { fake, api } = await setup(t);
   const tpl = revocation({ kind: 'template_revoke', skill_id: null, skill_version_id: null, template_version_id: U(5), package_sha256: null, manifest_sha256: SHA });
+  const c17 = fakeCursor(17);
   fake.script('POST', REVOCATIONS,
-    { status: 200, json: { items: [revocation(), tpl], next_cursor: '3:17', has_more: true } },
-    { status: 200, json: { items: [], next_cursor: null, has_more: false } });
-  assert.deepEqual(await api.pullRevocations({ orgId: ORG }), { items: [revocation(), tpl], has_more: true, next_cursor: '3:17' });
-  assert.deepEqual(await api.pullRevocations({ orgId: ORG, cursor: '3:17' }), { items: [], has_more: false, next_cursor: null });
-  assert.deepEqual(fake.market().map((r) => r.json), [{}, { cursor: '3:17' }]);
-  await assert.rejects(api.pullRevocations({ orgId: ORG, cursor: 'abc' }), TypeError);
+    { status: 200, json: { items: [revocation(), tpl], next_cursor: c17, has_more: true } },
+    { status: 200, json: { items: [], next_cursor: c17, has_more: false } });
+  assert.deepEqual(await api.pullRevocations({ orgId: ORG }), { items: [revocation(), tpl], has_more: true, next_cursor: c17 });
+  assert.deepEqual(await api.pullRevocations({ orgId: ORG, cursor: c17 }), { items: [], has_more: false, next_cursor: c17 });
+  assert.deepEqual(fake.market().map((r) => r.json), [{}, { cursor: c17 }]);
+  for (const bad of ['abc', '3:17', `${REVOCATION_EPOCH}:01`, `${REVOCATION_EPOCH.toUpperCase()}:1`, `${REVOCATION_EPOCH}:9223372036854775808`]) {
+    await assert.rejects(api.pullRevocations({ orgId: ORG, cursor: bad }), TypeError, bad);
+  }
+  assert.equal(fake.market().length, 2);
+});
+
+test('revocations:query round-trips the server cursor format', async (t) => {
+  const { fake, api } = await setup(t);
+  // Shapes written by the server's FormatRevocationCursor(epoch, seq): epoch ":" strconv.FormatInt(seq, 10).
+  const first = await api.pullRevocations({ orgId: ORG });
+  assert.equal(first.next_cursor, `${REVOCATION_EPOCH}:0`);
+  const max = `${REVOCATION_EPOCH}:9223372036854775807`;
+  fake.script('POST', REVOCATIONS, { status: 200, json: { items: [revocation()], next_cursor: max, has_more: false } });
+  const second = await api.pullRevocations({ orgId: ORG, cursor: first.next_cursor });
+  assert.equal(second.next_cursor, max);
+  const third = await api.pullRevocations({ orgId: ORG, cursor: second.next_cursor });
+  assert.equal(third.next_cursor, max);
+  assert.deepEqual(fake.market().map((r) => r.json), [{}, { cursor: `${REVOCATION_EPOCH}:0` }, { cursor: max }]);
 });
 
 test('revocations:query rejects malformed responses and surfaces CURSOR_INVALID', async (t) => {
   const { fake, api } = await setup(t);
-  const ok = { next_cursor: '1:1', has_more: false };
+  const ok = { next_cursor: fakeCursor(1), has_more: false };
   const bad = [
     { items: [revocation({ kind: 'unpublish' })], ...ok },
     { items: [revocation({ skill_version_id: null })], ...ok },
@@ -99,6 +117,13 @@ test('revocations:query rejects malformed responses and surfaces CURSOR_INVALID'
     { items: [revocation({ package_sha256: 'zz' })], ...ok },
     { items: [revocation({ revoked_at: 1 })], ...ok },
     { items: [], next_cursor: 'x', has_more: false },
+    { items: [], next_cursor: '3:17', has_more: false },
+    { items: [], next_cursor: `${REVOCATION_EPOCH}:007`, has_more: false },
+    { items: [], next_cursor: `${REVOCATION_EPOCH}:-1`, has_more: false },
+    { items: [], next_cursor: `${REVOCATION_EPOCH}:9223372036854775808`, has_more: false },
+    { items: [], next_cursor: `${REVOCATION_EPOCH.toUpperCase()}:1`, has_more: false },
+    { items: [], next_cursor: null, has_more: false },
+    { items: [], has_more: false },
     { items: [], next_cursor: null, has_more: true },
     { items: {}, ...ok },
   ];
@@ -108,5 +133,32 @@ test('revocations:query rejects malformed responses and surfaces CURSOR_INVALID'
     await assert.rejects(api.pullRevocations({ orgId: ORG }), { code: 'RESPONSE_INVALID' }, `case ${i}`);
   }
   fake.script('POST', REVOCATIONS, { status: 400, problem: { code: 'CURSOR_INVALID' } });
-  await assert.rejects(api.pullRevocations({ orgId: ORG, cursor: '1:1' }), { status: 400, code: 'CURSOR_INVALID' });
+  await assert.rejects(api.pullRevocations({ orgId: ORG, cursor: fakeCursor(1) }), { status: 400, code: 'CURSOR_INVALID' });
+});
+
+test('org and agent ids use the server character set and are percent-encoded in the path', async (t) => {
+  const { fake, api } = await setup(t);
+  const org = 'org-1';
+  const agent = 'a:b@c';
+  const path = `/api/v1/orgs/${org}/agents/a%3Ab%40c/install-intents:query`;
+  fake.script('POST', path, { status: 200, json: page([intent({ org_id: org })]) });
+  const got = await api.pullInstallIntents({ orgId: org, agentId: agent });
+  assert.equal(got.items[0].org_id, org);
+  assert.equal(fake.market()[0].path, path);
+  const rev = await api.pullRevocations({ orgId: 'a:b@c' });
+  assert.equal(rev.next_cursor, fakeCursor(0));
+  assert.equal(fake.market()[1].path, '/api/v1/orgs/a%3Ab%40c/revocations:query');
+});
+
+test('"." and ".." org or agent ids are rejected before any request', async (t) => {
+  const { fake, api } = await setup(t);
+  for (const id of ['.', '..']) {
+    await assert.rejects(api.pullInstallIntents({ orgId: ORG, agentId: id }), TypeError, `agent ${id}`);
+    await assert.rejects(api.pullInstallIntents({ orgId: id, agentId: AGENT }), TypeError, `org ${id}`);
+    await assert.rejects(api.pullRevocations({ orgId: id }), TypeError, `org ${id}`);
+  }
+  for (const id of ['', 'a/b', 'a b', 'x'.repeat(129), '%2e%2e', null]) {
+    await assert.rejects(api.pullInstallIntents({ orgId: ORG, agentId: id }), TypeError, String(id));
+  }
+  assert.equal(fake.requests.length, 0);
 });

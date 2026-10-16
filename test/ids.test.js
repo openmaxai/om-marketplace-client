@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isCanonicalUuid, isSha256Hex, uuidv7 } from '../src/ids.js';
+import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex, uuidv7 } from '../src/ids.js';
 
 test('uuidv7 is canonical, version 7, RFC variant, timestamp-prefixed and ordered', () => {
   const ms = Date.parse('2026-10-16T12:00:00Z');
@@ -27,5 +27,14 @@ test('canonical UUID and sha256 validators', () => {
   assert.ok(isSha256Hex('0f'.repeat(32)));
   for (const bad of ['0F'.repeat(32), '0f'.repeat(31), `${'0f'.repeat(32)}0`, 'g'.repeat(64), undefined]) {
     assert.equal(isSha256Hex(bad), false, String(bad));
+  }
+});
+
+test('org and member ids accept the server character set except "." and ".."', () => {
+  for (const ok of ['org-1', 'm-owner', 'a:b@c', 'A.b_c-9', '...', 'x'.repeat(128), '0b6f4f3e-1111-4c2a-9d1e-aaaaaaaaaaaa']) {
+    assert.ok(isOrgOrMemberId(ok), ok);
+  }
+  for (const bad of ['.', '..', '', 'x'.repeat(129), 'a/b', 'a b', 'a%2e', 'a?b', 'a#b', 'é', null, 7]) {
+    assert.equal(isOrgOrMemberId(bad), false, String(bad));
   }
 });

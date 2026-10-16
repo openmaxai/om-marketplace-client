@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { isCanonicalUuid } from './ids.js';
+import { isOrgOrMemberId } from './ids.js';
+import { normalizeBffUrl } from './config.js';
 import { DEFAULT_TIMEOUT_MS, MarketError, SILENT_LOGGER, errorFromResponse, sendJson } from './http.js';
 
 export const REFRESH_MARGIN_MS = 60_000;
@@ -21,7 +23,7 @@ export function decodeJwtClaims(jwt) {
 export function memberIdFromJwt(jwt) {
   const claims = decodeJwtClaims(jwt);
   const id = claims?.member_id ?? claims?.mid;
-  return isCanonicalUuid(id) ? id : null;
+  return isOrgOrMemberId(id) ? id : null;
 }
 
 function toMs(v) {
@@ -43,30 +45,74 @@ function toState(d, label) {
   };
 }
 
+const sha256Hex = (v) => crypto.createHash('sha256').update(String(v), 'utf8').digest('hex');
+
 // Org-scoped JWTs: the API key is exchanged at POST /auth/agent/token for one org at a time, cached per org in memory
-// and (when tokenDir is set) on disk as <tokenDir>/<org_id>.json with mode 0600 in a 0700 directory.
-export function createAuth({ bffUrl, apiKey, tokenDir = null, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now }) {
+// and (when tokenDir is set) on disk as <tokenDir>/<sha256(org_id)>.json with mode 0600 in a 0700 directory. A cached
+// file is used only if it was written for the same BFF origin and API key; otherwise it is deleted and the key is
+// exchanged again.
+export function createAuth({
+  bffUrl, apiKey, tokenDir = null, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now,
+  uid = process.getuid?.(),
+}) {
   if (!apiKey) throw new Error('api key is required');
-  const base = new URL(bffUrl);
+  const origin = normalizeBffUrl(bffUrl);
+  const base = new URL(origin);
+  const keyFingerprint = sha256Hex(apiKey);
   const cache = new Map();
   const inflight = new Map();
   const last401 = new Map();
 
   const checkOrg = (orgId) => {
-    if (!isCanonicalUuid(orgId)) throw new TypeError('orgId must be a lowercase canonical UUID');
+    if (!isOrgOrMemberId(orgId)) throw new TypeError('invalid orgId');
   };
-  const tokenFile = (orgId) => path.join(tokenDir, `${orgId}.json`);
+  const tokenFile = (orgId) => path.join(tokenDir, `${sha256Hex(orgId)}.json`);
+
+  function discard(file, why) {
+    logger.warn(`ignoring cached token file ${path.basename(file)}: ${why}`);
+    try { fs.unlinkSync(file); } catch { /* already gone or not ours to remove */ }
+    return null;
+  }
 
   function readDisk(orgId) {
     if (!tokenDir) return null;
+    const file = tokenFile(orgId);
+    let st;
     try {
-      const st = fs.lstatSync(tokenFile(orgId));
-      if (!st.isFile()) return null;
-      const s = JSON.parse(fs.readFileSync(tokenFile(orgId), 'utf8'));
-      return s && typeof s.access_token === 'string' ? s : null;
+      st = fs.lstatSync(file);
     } catch {
       return null;
     }
+    if (!st.isFile()) return discard(file, 'not a regular file');
+    if (uid !== undefined && st.uid !== uid) return discard(file, 'not owned by the current user');
+    if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) return discard(file, 'accessible by group/other');
+    let s;
+    try {
+      s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return discard(file, 'unreadable');
+    }
+    if (!s || typeof s !== 'object' || typeof s.access_token !== 'string') return discard(file, 'malformed');
+    if (s.bff_origin !== origin || s.api_key_sha256 !== keyFingerprint || s.org_id !== orgId) {
+      return discard(file, 'written for another BFF origin, API key or org');
+    }
+    const { bff_origin: _o, api_key_sha256: _k, org_id: _g, ...state } = s;
+    return state;
+  }
+
+  // The token directory must be a real directory owned by this user; a symlink is never followed.
+  function prepareTokenDir() {
+    let st;
+    try {
+      st = fs.lstatSync(tokenDir);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      fs.mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
+      st = fs.lstatSync(tokenDir);
+    }
+    if (!st.isDirectory()) throw Object.assign(new Error('token dir is not a directory'), { code: 'ENOTDIR' });
+    if (uid !== undefined && st.uid !== uid) throw Object.assign(new Error('token dir owner'), { code: 'EPERM' });
+    if ((st.mode & 0o777) !== 0o700) fs.chmodSync(tokenDir, 0o700);
   }
 
   function writeDisk(orgId, state) {
@@ -74,11 +120,10 @@ export function createAuth({ bffUrl, apiKey, tokenDir = null, fetchImpl, timeout
     const file = tokenFile(orgId);
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
     try {
-      fs.mkdirSync(tokenDir, { recursive: true, mode: 0o700 });
-      fs.chmodSync(tokenDir, 0o700);
+      prepareTokenDir();
       const fd = fs.openSync(tmp, 'wx', 0o600);
       try {
-        fs.writeSync(fd, JSON.stringify(state));
+        fs.writeSync(fd, JSON.stringify({ bff_origin: origin, api_key_sha256: keyFingerprint, org_id: orgId, ...state }));
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
@@ -165,11 +210,21 @@ export function createAuth({ bffUrl, apiKey, tokenDir = null, fetchImpl, timeout
     async memberId(orgId) {
       return memberIdFromJwt(await getAccessToken(orgId));
     },
-    // At most one 401-triggered refresh per org per window, so a persistent 401 cannot storm the auth endpoints.
-    consume401Refresh(orgId) {
+    // Called after a market 401 on staleToken. Resolves to true when a retry is worthwhile: another caller already
+    // renewed the token, a renewal is in flight, or this call renews it. At most one 401-triggered renewal per org per
+    // window, so a persistent 401 cannot storm the auth endpoints.
+    async renewAfter401(orgId, staleToken) {
+      checkOrg(orgId);
+      const current = load(orgId)?.access_token;
+      if (current && current !== staleToken) return true;
+      if (inflight.has(orgId)) {
+        await inflight.get(orgId);
+        return true;
+      }
       const t = now();
       if (t - (last401.get(orgId) ?? -Infinity) < REFRESH_ON_401_WINDOW_MS) return false;
       last401.set(orgId, t);
+      await renew(orgId);
       return true;
     },
   };

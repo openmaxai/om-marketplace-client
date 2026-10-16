@@ -2,10 +2,17 @@ import crypto from 'node:crypto';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const ORG_OR_MEMBER_ID_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
 
 // Lowercase canonical form only; the market rejects uppercase or braced UUIDs.
 export function isCanonicalUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v);
+}
+
+// Org and member (agent) ids use the server's character set. "." and ".." are refused because they are dot segments
+// once placed in a URL path.
+export function isOrgOrMemberId(v) {
+  return typeof v === 'string' && ORG_OR_MEMBER_ID_RE.test(v) && v !== '.' && v !== '..';
 }
 
 export function isSha256Hex(v) {

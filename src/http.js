@@ -1,5 +1,6 @@
 import { buildHeaders } from './version.js';
-import { isCanonicalUuid } from './ids.js';
+import { isOrgOrMemberId } from './ids.js';
+import { normalizeBffUrl } from './config.js';
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
@@ -46,7 +47,7 @@ function problemFields(data) {
     code: typeof data.code === 'string' && CODE_RE.test(data.code) ? data.code : null,
     reason: str(data.reason),
     min_version: str(data.min_version),
-    installed_by_org_id: isCanonicalUuid(data.installed_by_org_id) ? data.installed_by_org_id : null,
+    installed_by_org_id: isOrgOrMemberId(data.installed_by_org_id) ? data.installed_by_org_id : null,
     errors: Array.isArray(data.errors) ? data.errors : null,
     details: data.details && typeof data.details === 'object' ? data.details : null,
   };
@@ -105,15 +106,17 @@ export async function sendJson({ fetchImpl = globalThis.fetch, url, method, head
 }
 
 // Market calls under {bffUrl}/api/v1/orgs/{orgId}. Only the bearer token, the client version and content
-// negotiation headers are sent; callers cannot add headers.
+// negotiation headers are sent; callers cannot add headers. subPath segments must already be percent-encoded.
 export function createMarketHttp({ bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now }) {
-  const base = new URL(bffUrl);
+  const base = new URL(normalizeBffUrl(bffUrl));
   async function request(method, orgId, subPath, body) {
-    if (!isCanonicalUuid(orgId)) throw new TypeError('orgId must be a lowercase canonical UUID');
-    if (!/^\/[A-Za-z0-9\-._~:/]*$/.test(subPath) || subPath.includes('//') || /(^|\/)\.\.?(\/|$)/.test(subPath)) {
+    if (!isOrgOrMemberId(orgId)) throw new TypeError('invalid orgId');
+    // %2E and %2F are refused because URL parsing treats them as dot segments or separators.
+    if (!/^\/(?:[A-Za-z0-9\-._~:/]|%[0-9A-F]{2})*$/.test(subPath) || /%2[EF]/.test(subPath)
+      || subPath.includes('//') || /(^|\/)\.\.?(\/|$)/.test(subPath)) {
       throw new TypeError('invalid market path');
     }
-    const url = new URL(`/api/v1/orgs/${orgId}${subPath}`, base);
+    const url = new URL(`/api/v1/orgs/${encodeURIComponent(orgId)}${subPath}`, base);
     if (url.origin !== base.origin) throw new TypeError('market path left the configured origin');
     const label = `market ${method} ${url.pathname}`;
     const send = async () => {
@@ -123,13 +126,12 @@ export function createMarketHttp({ bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       });
       logger.debug(label);
-      return sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label });
+      return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label }) };
     };
-    let r = await send();
-    if (r.status === 401 && auth.consume401Refresh(orgId)) {
-      logger.warn(`${label}: HTTP 401, refreshing the token for org ${orgId} and retrying once`);
-      await auth.refresh(orgId);
-      r = await send();
+    let { token, r } = await send();
+    if (r.status === 401 && await auth.renewAfter401(orgId, token)) {
+      logger.warn(`${label}: HTTP 401, retrying once with a renewed token for org ${orgId}`);
+      ({ r } = await send());
     }
     if (r.status >= 200 && r.status < 300) {
       logger.debug(`${label}: HTTP ${r.status}`);

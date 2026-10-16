@@ -107,15 +107,46 @@ test('timeouts, network errors and oversized bodies are typed', async (t) => {
   const slow = await call(http);
   assert.deepEqual([slow.code, slow.transient], ['TIMEOUT', true]);
   assert.equal((await call(http)).code, 'RESPONSE_TOO_LARGE');
-  const auth = { getAccessToken: async () => 'a.b.c', consume401Refresh: () => false };
+  const auth = { getAccessToken: async () => 'a.b.c', renewAfter401: async () => false };
   const dead = createMarketHttp({ bffUrl: 'http://127.0.0.1:1', auth });
   assert.deepEqual(await call(dead).then((e) => [e.code, e.transient]), ['NETWORK_ERROR', true]);
 });
 
 test('paths and org ids are validated before anything is sent', async (t) => {
   const { fake, http } = await marketHarness(t);
-  for (const [org, p] of [[ORG, '/../x'], [ORG, 'x'], [ORG, '//evil.test/x'], [ORG, '/a?b=1'], ['../x', '/x'], [ORG.toUpperCase(), '/x']]) {
-    await assert.rejects(http.request('GET', org, p), TypeError, p);
+  for (const [org, p] of [[ORG, '/../x'], [ORG, 'x'], [ORG, '//evil.test/x'], [ORG, '/a?b=1'], [ORG, '/%2e%2e/x'],
+    [ORG, '/%2E%2E/x'], [ORG, '/a%2Fb'], [ORG, '/a%zz'], ['../x', '/x'], ['.', '/x'], ['..', '/x'], ['a/b', '/x'], ['', '/x']]) {
+    await assert.rejects(http.request('GET', org, p), TypeError, `${org} ${p}`);
   }
   assert.equal(fake.requests.length, 0);
+});
+
+test('createMarketHttp enforces the BFF URL rules', () => {
+  const auth = { getAccessToken: async () => 'a.b.c', renewAfter401: async () => false };
+  for (const bffUrl of ['http://bff.example.test', 'ftp://127.0.0.1', 'https://u:p@bff.example.test', 'https://bff.example.test/x']) {
+    assert.throws(() => createMarketHttp({ bffUrl, auth }), { name: 'ConfigError' }, bffUrl);
+  }
+});
+
+test('concurrent 401s share one renewal and both requests succeed', async (t) => {
+  const { fake, http } = await marketHarness(t);
+  await http.request('POST', ORG, '/revocations:query', {});
+  const unauthorized = fake.problem(401, 'PRINCIPAL_INVALID');
+  fake.script('POST', PATH, unauthorized, unauthorized, { status: 200, json: {} }, { status: 200, json: {} });
+  const [a, b] = await Promise.all([call(http), call(http)]);
+  assert.deepEqual([a.status, b.status], [200, 200]);
+  assert.deepEqual(fake.auth().map((r) => r.path), ['/auth/agent/token', '/auth/refresh']);
+});
+
+test('a 401 on a token already replaced retries without using the renewal window', async (t) => {
+  const { fake, http } = await marketHarness(t);
+  await http.request('POST', ORG, '/revocations:query', {});
+  const unauthorized = fake.problem(401, 'PRINCIPAL_INVALID');
+  fake.script('POST', PATH, unauthorized, { ...unauthorized, delayMs: 200 }, { status: 200, json: {} }, { status: 200, json: {} });
+  const [a, b] = await Promise.all([call(http), call(http)]);
+  assert.deepEqual([a.status, b.status], [200, 200]);
+  assert.equal(fake.auth().length, 2, 'one renewal');
+  const stale = `Bearer ${fake.issued.access[0]}`;
+  const fresh = `Bearer ${fake.issued.access[1]}`;
+  assert.deepEqual(fake.market().slice(1).map((r) => r.headers.authorization).sort(), [stale, stale, fresh, fresh].sort());
 });
