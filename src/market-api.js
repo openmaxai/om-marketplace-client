@@ -21,8 +21,8 @@ const uuid = (v, p) => (isCanonicalUuid(v) ? v : fail(p, 'must be a canonical UU
 const sha = (v, p) => (isSha256Hex(v) ? v : fail(p, 'must be 64 lowercase hex'));
 const nullable = (check) => (v, p) => (v == null ? null : check(v, p));
 const time = (v, p) => (typeof v === 'string' && RFC3339_RE.test(v) && !Number.isNaN(Date.parse(v)) ? v : fail(p, 'must be an RFC 3339 time'));
-const isCursor = (v) => typeof v === 'string' && CURSOR_RE.test(v) && BigInt(v.slice(37)) <= INT64_MAX;
-const cursor = (v, p) => (isCursor(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
+export const isRevocationCursor = (v) => typeof v === 'string' && CURSOR_RE.test(v) && BigInt(v.slice(37)) <= INT64_MAX;
+const cursor = (v, p) => (isRevocationCursor(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
 const orgId = (v, p) => (isOrgOrMemberId(v) ? v : fail(p, 'must be an org id'));
 const oneOf = (set) => (v, p) => (set.has(v) ? v : fail(p, 'has an unknown value'));
 
@@ -112,7 +112,7 @@ export function createMarketApi({ http }) {
     },
 
     async pullRevocations({ orgId, cursor: from = null }) {
-      if (from !== null && !isCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
+      if (from !== null && !isRevocationCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
       const r = await http.request('POST', orgId, '/revocations:query', from === null ? {} : { cursor: from });
       const label = 'revocations:query';
       if (r.status !== 200) return validated(label, r, () => fail('status', `${r.status} is not expected`));

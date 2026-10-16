@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isOrgOrMemberId } from './ids.js';
 
 export const COMPONENT_NAME = 'om-marketplace-client';
 export const CONFIG_SCHEMA_VERSION = 1;
@@ -120,11 +121,45 @@ function prepareDataDir(dataDir, tightenExisting) {
   }
 }
 
+// orgs: {<org_id>: {member_id?}}. The primary org_id/member_id is always part of the map; a member_id left out is read
+// from that org's token at run time.
+export function normalizeOrgs(raw, primaryOrg, primaryMember) {
+  if (raw != null && (typeof raw !== 'object' || Array.isArray(raw))) throw new ConfigError('config.json orgs must be an object');
+  const orgs = {};
+  for (const [orgId, entry] of Object.entries(raw ?? {})) {
+    if (!isOrgOrMemberId(orgId) || orgId === '__proto__') throw new ConfigError('config.json orgs has an invalid org id');
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new ConfigError('config.json orgs entries must be objects');
+    if (Object.keys(entry).some((k) => k !== 'member_id')) throw new ConfigError('config.json orgs entries allow only member_id');
+    const m = entry.member_id ?? null;
+    if (m !== null && !isOrgOrMemberId(m)) throw new ConfigError('config.json orgs has an invalid member_id');
+    orgs[orgId] = { member_id: m };
+  }
+  if (!isOrgOrMemberId(primaryOrg) || primaryOrg === '__proto__') throw new ConfigError('config.json org_id is not a valid id');
+  if (!isOrgOrMemberId(primaryMember)) throw new ConfigError('config.json member_id is not a valid id');
+  const listed = orgs[primaryOrg]?.member_id;
+  if (listed && listed !== primaryMember) throw new ConfigError('config.json orgs disagrees with member_id for org_id');
+  return { [primaryOrg]: { member_id: primaryMember }, ...Object.fromEntries(Object.entries(orgs).filter(([k]) => k !== primaryOrg)) };
+}
+
+// The primary entry is dropped so a rewritten org_id/member_id cannot conflict with it.
+function existingOrgs(dataDir, primaryOrg) {
+  try {
+    const orgs = JSON.parse(fs.readFileSync(configPath(dataDir), 'utf8'))?.orgs;
+    if (!orgs || typeof orgs !== 'object' || Array.isArray(orgs)) return undefined;
+    const rest = Object.entries(orgs).filter(([k]) => k !== primaryOrg);
+    return rest.length ? Object.fromEntries(rest) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Single write path for every install route (env, interactive, configure hook).
-// Always rewrites the whole file, so a complete value set also rotates the key.
+// Always rewrites the whole file, so a complete value set also rotates the key; a hand-edited orgs map is kept.
 export function writeConfig(values, dataDir, { tightenExisting = false } = {}) {
   const config = buildConfig(values);
   prepareDataDir(dataDir, tightenExisting);
+  const orgs = existingOrgs(dataDir, config.org_id);
+  if (orgs) config.orgs = orgs;
   const target = configPath(dataDir);
   const tmp = path.join(dataDir, `.config.json.${process.pid}.${Date.now()}.tmp`);
   try {
@@ -161,6 +196,7 @@ export function validateConfig(obj) {
     if (!LOG_LEVELS.has(obj.log_level)) throw new ConfigError('config.json log_level must be one of debug, info, warn, error');
     config.log_level = obj.log_level;
   }
+  config.orgs = normalizeOrgs(obj.orgs, config.org_id, config.member_id);
   return config;
 }
 

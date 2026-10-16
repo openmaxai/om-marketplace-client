@@ -59,6 +59,17 @@ test('a failing task is logged and rescheduled', async () => {
   assert.equal(pending[0].ms, 800);
 });
 
+test('a run asking for a minimum delay is not rescheduled sooner', async () => {
+  const pending = [];
+  const s = createScheduler(
+    [{ name: 'a', baseMs: 1000, run: () => ({ minDelayMs: 30_000 }) }],
+    { rand: () => 1, setTimer: (fn, ms) => { const t = { fn, ms }; pending.push(t); return t; }, clearTimer: () => {} },
+  );
+  s.start();
+  await pending.shift().fn();
+  assert.equal(pending[0].ms, 30_000);
+});
+
 test('headers carry the bearer token and client version from package.json', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(CLIENT_VERSION, pkg.version);

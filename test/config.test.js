@@ -92,3 +92,30 @@ test('loadConfig rejects a file owned by another uid', { skip: typeof process.ge
   assert.throws(() => loadConfig(dataDir, { uid: process.getuid() + 1 }), /not owned/);
   assert.ok(loadConfig(dataDir));
 });
+
+test('orgs map: the primary org is always present; other orgs keep their own member id', () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV }, dataDir);
+  const file = path.join(dataDir, 'config.json');
+  const put = (orgs) => fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), orgs }));
+  assert.deepEqual(loadConfig(dataDir).orgs, { [VALID_ENV.COCO_ORG_ID]: { member_id: VALID_ENV.COCO_MEMBER_ID } });
+  put({ 'org-2': { member_id: 'm:2' }, 'org-3': {} });
+  assert.deepEqual(loadConfig(dataDir).orgs, {
+    [VALID_ENV.COCO_ORG_ID]: { member_id: VALID_ENV.COCO_MEMBER_ID }, 'org-2': { member_id: 'm:2' }, 'org-3': { member_id: null },
+  });
+  for (const bad of [[], { 'a/b': {} }, { __proto__: null, ['__proto__']: {} }, { o: { member_id: 'x y' } }, { o: { api_key: 'k' } },
+    { o: 'm' }, { [VALID_ENV.COCO_ORG_ID]: { member_id: 'other' } }]) {
+    put(bad);
+    assert.throws(() => loadConfig(dataDir), ConfigError, JSON.stringify(bad));
+  }
+});
+
+test('rewriting the config keeps the extra orgs and drops a stale primary entry', () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV }, dataDir);
+  const file = path.join(dataDir, 'config.json');
+  const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...cfg, orgs: { 'org-2': {}, [VALID_ENV.COCO_ORG_ID]: { member_id: 'old' } } }));
+  writeConfig({ ...VALID_ENV, COCO_API_KEY: 'rotated' }, dataDir);
+  assert.deepEqual(Object.keys(loadConfig(dataDir).orgs), [VALID_ENV.COCO_ORG_ID, 'org-2']);
+});

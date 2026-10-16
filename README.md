@@ -62,6 +62,13 @@ rewrites the whole `config.json`. Then unset the variables and run
 If the data directory already exists it must be mode 0700; the hook refuses to
 write into a directory that is accessible by group or other.
 
+## One instance per data directory
+
+A lock file under `state/` admits one running client per data directory. Do not
+share a data directory between containers: processes in different PID
+namespaces cannot see each other, so two containers that both run the client
+as PID 1 would each treat the other's lock as their own stale lock.
+
 ## Upgrade
 
 `zylos upgrade om-marketplace-client`
