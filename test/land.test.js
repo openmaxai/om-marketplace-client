@@ -361,3 +361,21 @@ test('a local SKILL.md is read only up to the cap, whatever fstat reported', (t)
   });
   assert.equal(land().previous, null);
 });
+
+test('a local SKILL.md that fstat reports over the cap is not read at all', (t) => {
+  const { skillsDir, land } = setup();
+  fs.mkdirSync(path.join(skillsDir, 'other'));
+  const md = path.join(skillsDir, 'other', 'SKILL.md');
+  fs.writeFileSync(md, skillMd('demo-skill'));
+  const opened = new Map();
+  const reads = [];
+  const { openSync, fstatSync, readSync } = fs;
+  t.mock.method(fs, 'openSync', (...a) => { const fd = openSync(...a); opened.set(fd, String(a[0])); return fd; });
+  t.mock.method(fs, 'fstatSync', (fd, ...a) => {
+    const st = fstatSync(fd, ...a);
+    return opened.get(fd) === md ? Object.assign(Object.create(st), { size: MAX_SKILL_MD_BYTES + 1 }) : st;
+  });
+  t.mock.method(fs, 'readSync', (fd, ...a) => { if (opened.get(fd) === md) reads.push(fd); return readSync(fd, ...a); });
+  assert.equal(land().previous, null, 'a SKILL.md claiming the same name is skipped by size alone');
+  assert.deepEqual(reads, []);
+});
