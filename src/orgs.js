@@ -13,8 +13,11 @@ export function createOrgs({ config, state, auth, logger, now = Date.now }) {
     markInvalid(orgId, code) {
       if (!Object.hasOwn(configured, orgId) || Object.hasOwn(invalid(), orgId)) return;
       state.update('orgs', {}, (d) => { d[orgId] = { reason: code, since: new Date(now()).toISOString() }; });
-      state.setAlert(`org_invalid:${orgId}`, `org ${orgId} rejected this agent (${code}); its orders are no longer pulled or executed`);
-      logger.warn(`org ${orgId} rejected this agent (${code}); stopped working for that org, installed content is left as is`);
+      const msg = orgId === config.org_id
+        ? `primary org ${orgId} is invalid (${code}); pulling has stopped for ALL orgs; change the primary org in config to resume`
+        : `org ${orgId} rejected this agent (${code}); its orders are no longer pulled or executed`;
+      state.setAlert(`org_invalid:${orgId}`, msg);
+      logger.warn(`${msg}; installed content is left as is`);
     },
 
     // The agent's member id in that org: from config, else from the org-scoped token.

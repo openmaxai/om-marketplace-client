@@ -77,7 +77,8 @@ test('MEMBER_LEFT_ORG marks the org invalid and stops pulling without another or
   assert.equal((await puller.pull()).outcome, 'org_invalid');
   assert.equal(orgs.isInvalid(ORG), true);
   assert.ok(state.read('status', null).alerts[`org_invalid:${ORG}`]);
-  assert.ok(lines.some((l) => l.includes('[warn]') && l.includes('rejected this agent')));
+  assert.ok(lines.some((l) => l.includes('[warn]') && l.includes('pulling has stopped for ALL orgs')));
+  assert.match(JSON.stringify(state.read('status', null).alerts[`org_invalid:${ORG}`]), /primary org .* ALL orgs/);
   assert.equal((await puller.pull()).outcome, 'org_invalid');
   assert.equal(fake.market().length, 1, 'no further pulls through any org');
 });
