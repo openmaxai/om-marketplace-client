@@ -192,6 +192,29 @@ test('a package over the size or file caps is PACKAGE_UNSAFE before downloading'
   assert.deepEqual(edge.results().map((r) => r.json.error_message), ['download_metadata_mismatch']);
 });
 
+test('the caps are inclusive: exactly 200 files and a manifest of exactly 20 MiB pass, one more is refused', async (t) => {
+  const pkg = skillPackage();
+  const rest = pkg.manifest.slice(1).reduce((n, e) => n + e.size, 0);
+  const total = (extra) => pkg.manifest.map((e, i) => (i === 0 ? { ...e, size: MAX_PACKAGE_BYTES - rest + extra } : e));
+  const files = (n) => Array.from({ length: n }, (_, i) => ({ path: `f${i}`, size: 1, sha256: 'a'.repeat(64) }));
+  for (const [manifest, refused] of [
+    [total(0), null], [total(1), 'too_large'], [files(MAX_PACKAGE_FILES), null], [files(MAX_PACKAGE_FILES + 1), 'too_many_files'],
+  ]) {
+    const h = await skillHarness(t, { versions: { 1: pkg } });
+    h.patch.c02 = () => ({ file_manifest: manifest });
+    await h.queue(['install', 1]);
+    assert.deepEqual(await h.make().runRound(), ['failed']);
+    const why = `${manifest.length} files, ${manifest.reduce((n, e) => n + e.size, 0)} bytes`;
+    if (refused) {
+      assert.deepEqual(h.results().map((r) => r.json), [failure('PACKAGE_UNSAFE', refused)], why);
+      assert.equal(downloads(h), 0, why);
+    } else {
+      assert.deepEqual(h.results().map((r) => r.json), [failure('PACKAGE_MISMATCH', 'file_manifest_mismatch')], why);
+      assert.ok(downloads(h) > 0, why);
+    }
+  }
+});
+
 test('a package_url that is not this request\'s C-03 path fails CLIENT_INTERNAL without a download', async (t) => {
   const h = await skillHarness(t);
   h.patch.c02 = (rid) => ({ package_url: `https://evil.example.test${B}/agents/${AGENT}/packages/${rid}` });
