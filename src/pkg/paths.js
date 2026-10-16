@@ -1,5 +1,5 @@
 // Entry path rules and name-collision checks for skill packages, in the server's order.
-import { MAX_PACKAGE_FILES, PackageError } from './zip.js';
+import { PackageError } from './zip.js';
 
 export const MAX_PATH_BYTES = 1024;
 export const MAX_SEGMENT_BYTES = 255;
@@ -9,6 +9,8 @@ const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const isControl = (cp) => cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
 
 // Relative path, no `..`, no backslash, colon or control character, every segment non-empty and not `.`.
+// Works on the raw name bytes: strict UTF-8 (no invalid or overlong sequences, surrogates or code points past
+// U+10FFFF), and the length caps count bytes, not characters.
 export function checkEntryPath(nameBytes) {
   let name = null;
   try {
@@ -113,12 +115,14 @@ export class PathIndex {
     if (!e.isDir) this.#fileCanon.push([e.name, canon]);
   }
 
-  // Runs once the whole central directory was added.
-  finish(files) {
+  // Both run once the whole central directory was added: forbidden segments before the file count, clashes after it.
+  checkForbidden() {
     if (this.#forbidden !== null) {
       throw new PackageError('forbidden_path', `${JSON.stringify(this.#forbidden)} has a forbidden path segment`);
     }
-    if (files.length > MAX_PACKAGE_FILES) throw new PackageError('too_many_files', `${files.length} files`);
+  }
+
+  checkFileDirClashes() {
     for (const [name, canon] of this.#fileCanon) {
       let id = -1;
       for (const c of canon) {

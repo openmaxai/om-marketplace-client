@@ -47,6 +47,15 @@ test('path syntax checks run on raw name bytes', () => {
   assert.equal(reasonOf(() => checkEntryPath(Buffer.from('a/'))), null);
   assert.equal(reasonOf(() => checkEntryPath(Buffer.from('a//'))), 'invalid_path');
   assert.equal(reasonOf(() => checkEntryPath(Buffer.from('\u00e9:/x'))), 'invalid_path');
+  // Rejected by the strict decoder, not later as U+FFFD.
+  for (const bytes of [[0x61, 0xff], [0xc0, 0xaf], [0xe0, 0x80, 0xae], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80], [0x61, 0xe2, 0x82]]) {
+    assert.throws(() => checkEntryPath(Buffer.from(bytes)), (err) => err.reason === 'invalid_path' && /non-UTF-8/.test(err.detail), String(bytes));
+  }
+  assert.equal(checkEntryPath(Buffer.from('\ufeffa')), '\ufeffa');
+  const at = (n) => Buffer.from(`${'\u00e9/'.repeat(341)}${'a'.repeat(n)}`);
+  assert.equal(at(1).length, 1024);
+  assert.equal(reasonOf(() => checkEntryPath(at(1))), null);
+  assert.throws(() => checkEntryPath(at(2)), (err) => /longer than 1024 bytes/.test(err.detail));
 });
 
 test('case folding follows the server', () => {

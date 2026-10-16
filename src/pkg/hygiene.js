@@ -57,7 +57,8 @@ export function inspectPackage(buf) {
         throw new PackageError('npm_dependencies', `${JSON.stringify(e.name)} is an npm / yarn / pnpm dependency file`);
       }
     },
-    onCentral: (entries, fileEntries) => index.finish(fileEntries),
+    onCentral: () => index.checkForbidden(),
+    onCounted: () => index.checkFileDirClashes(),
   });
   const manifest = [];
   const jsons = [];
