@@ -1,7 +1,6 @@
 import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex } from './ids.js';
 import { validSlug } from './pkg/frontmatter.js';
-import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
 
 export const INTENT_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall', 'write_template']);
 export const REVOCATION_KINDS = new Set(['version_revoke', 'template_revoke', 'shelf_revoke', 'sha_block']);
@@ -104,12 +103,10 @@ function parseInstall(raw, status, req) {
   });
   if (r.request_id !== req.request_id || r.skill_id !== req.skill_id
     || (req.skill_version_id && r.skill_version_id !== req.skill_version_id)) fail('body', 'does not match the request');
-  if (r.size_bytes > MAX_PACKAGE_BYTES) fail('body.size_bytes', 'exceeds the package cap');
-  if (r.file_manifest.length > MAX_PACKAGE_FILES) fail('body.file_manifest', 'has too many entries');
+  // Sizes and file counts over the package caps pass here; the installer reports them as PACKAGE_UNSAFE.
   r.file_manifest = r.file_manifest.map((e, i) => pick(object(e, `body.file_manifest[${i}]`), `body.file_manifest[${i}]`, {
     path: text(1024), size: uint, sha256: sha,
   }));
-  if (r.file_manifest.reduce((n, e) => n + e.size, 0) > MAX_PACKAGE_BYTES) fail('body.file_manifest', 'exceeds the package cap');
   r.skill_md = pick(r.skill_md, 'body.skill_md', { name: text(64), description: text(2000) });
   if (r.skill_md.name !== r.slug) fail('body.skill_md.name', 'differs from the slug');
   return r;

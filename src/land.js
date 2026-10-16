@@ -8,7 +8,7 @@ import { MAX_SKILL_MD_BYTES } from './pkg/frontmatter.js';
 
 export const MARKER = '.market-managed';
 export const SKILL_DIR_PREFIX = 'market--';
-const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
 
 // The market's config/reserved-skill-names.txt; names starting with zylos- or market- are reserved too.
 export const RESERVED_SKILL_NAMES = new Set([
@@ -33,17 +33,19 @@ export function failureFor(err) {
 }
 
 const conflict = (why) => new InstallFailure('INSTALL_TARGET_CONFLICT', why);
+const stagedMismatch = () => new InstallFailure('CLIENT_INTERNAL', 'staged_files_mismatch');
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 
 function lstatOrNull(p) {
   try { return fs.lstatSync(p); } catch (err) { if (err.code === 'ENOENT') return null; throw err; }
 }
 
-// Reads a regular file without following a final symlink; null when absent, a link, or larger than max.
+// Reads a regular file without following a final symlink; null when absent, a link, not a regular file, or larger than
+// max. O_NONBLOCK keeps a FIFO from blocking the open.
 function readNoFollow(file, max) {
   let fd;
   try {
-    fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW);
+    fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     const st = fs.fstatSync(fd);
     return st.isFile() && st.size <= max ? fs.readFileSync(fd) : null;
   } catch {
@@ -112,10 +114,10 @@ function scan(root, rel = '', out = []) {
   for (const ent of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
     const p = rel ? `${rel}/${ent.name}` : ent.name;
     if (ent.isDirectory()) scan(root, p, out);
-    else if (!ent.isFile()) throw new InstallFailure('PACKAGE_MISMATCH', 'staged_files_mismatch');
+    else if (!ent.isFile()) throw stagedMismatch();
     else {
       const data = readNoFollow(path.join(root, p), Infinity);
-      if (!data) throw new InstallFailure('PACKAGE_MISMATCH', 'staged_files_mismatch');
+      if (!data) throw stagedMismatch();
       out.push({ path: p, size: data.length, sha256: sha256(data) });
     }
   }
@@ -156,10 +158,9 @@ export function landSkill({ skillsDir, stagingRoot, rollbackRoot, requestId, ins
   let previous = null;
   try {
     for (const f of inspected.files) writeConfined(stage, f.path, f.data);
-    if (!sameManifest(scan(stage), want)) throw new InstallFailure('PACKAGE_MISMATCH', 'staged_files_mismatch');
+    if (!sameManifest(scan(stage), want)) throw stagedMismatch();
     writeConfined(stage, MARKER, JSON.stringify({ skill_id: skillId, version_no: versionNo, package_sha256: packageSha }));
     fsyncDir(stage);
-    if (targetState(target, skillId) !== prior) throw conflict('target_changed');
     if (prior === 'ours') {
       let oldNo = 'unknown';
       try { oldNo = String(JSON.parse(readNoFollow(path.join(target, MARKER), 4096)).version_no); } catch { /* kept as unknown */ }
@@ -168,9 +169,14 @@ export function landSkill({ skillsDir, stagingRoot, rollbackRoot, requestId, ins
       realDir(slot);
       previous = path.join(slot, /^\d+$/.test(oldNo) ? oldNo : 'unknown');
       fs.rmSync(previous, { recursive: true, force: true });
-      fs.renameSync(target, previous);
     }
+    // Last check, kept as close to the renames as possible.
+    if (targetState(target, skillId) !== prior) throw conflict('target_changed');
+    if (previous) fs.renameSync(target, previous);
     try {
+      // rename(2) has no no-replace mode here. On Linux it replaces only an empty directory; a non-empty one fails with
+      // ENOTEMPTY and a file or symlink with ENOTDIR. Only the owner of skillsDir can create an entry there, so a racing
+      // empty directory does not cross a privilege boundary and no data is lost.
       fs.renameSync(stage, target);
     } catch (err) {
       if (previous) fs.renameSync(previous, target);

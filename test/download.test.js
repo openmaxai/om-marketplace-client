@@ -6,6 +6,7 @@ import { skillPackage } from './fake/package.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { createMarketApi } from '../src/market-api.js';
 import { checkPackageUrl, downloadPackage, downloadUrlAllowed } from '../src/download.js';
+import { MarketError } from '../src/http.js';
 import { InstallFailure } from '../src/failure.js';
 import { ConfigError, emulatorOrigin } from '../src/config.js';
 
@@ -65,6 +66,7 @@ test('downloads exactly the package bytes without credentials', async (t) => {
   const [req] = storage.requests;
   assert.equal(req.headers.authorization, undefined);
   assert.equal(req.headers['x-market-client-version'], undefined);
+  assert.equal(req.headers['accept-encoding'], 'identity');
 });
 
 test('storage 403 gets one fresh URL; a second 403 fails CLIENT_INTERNAL', async (t) => {
@@ -113,6 +115,59 @@ test('C-03 metadata or host that does not match fails CLIENT_INTERNAL without do
   await assert.rejects(run(), failsWith('CLIENT_INTERNAL', 'download_metadata_mismatch'));
   await assert.rejects(run(), failsWith('CLIENT_INTERNAL', 'download_host_refused'));
   assert.equal(storage.requests.length, 0);
+});
+
+test('C-03 SHELF_RESPONSE_INVALID is reported as itself', async (t) => {
+  const { fake, run } = await harness(t);
+  fake.script('GET', C03, fake.problem(409, 'SHELF_RESPONSE_INVALID'));
+  await assert.rejects(run(), failsWith('SHELF_RESPONSE_INVALID', 'shelf_response_invalid'));
+});
+
+test('a content-length other than the size is refused even when the body is right', async (t) => {
+  const { fake, storage, link, run } = await harness(t);
+  fake.script('GET', C03, link(`${storage.origin}/b/cl`));
+  const fetchImpl = async () => new Response(pkg.zip, { headers: { 'content-length': String(pkg.size + 1) } });
+  await assert.rejects(run({ fetchImpl }), failsWith('PACKAGE_MISMATCH', 'size_mismatch'));
+});
+
+test('an oversized body is cut off while streaming, not read to the end', async (t) => {
+  const { fake, storage, link, run } = await harness(t);
+  fake.script('GET', C03, link(`${storage.origin}/b/endless`));
+  let pulls = 0;
+  const body = new ReadableStream({
+    pull(c) {
+      if (++pulls > 100) return c.error(new Error('read too far'));
+      c.enqueue(new Uint8Array(pkg.size));
+    },
+  }, { highWaterMark: 0 });
+  await assert.rejects(run({ fetchImpl: async () => new Response(body) }), failsWith('PACKAGE_MISMATCH', 'size_mismatch'));
+  assert.ok(pulls <= 3, `${pulls} chunks read`);
+});
+
+test('the whole download, retries included, stops at the deadline', async (t) => {
+  const { fake, storage, link, run } = await harness(t);
+  fake.script('GET', C03, link(`${storage.origin}/b/slow`));
+  const signals = [];
+  const fetchImpl = (url, { signal }) => {
+    signals.push(signal);
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+  };
+  const t0 = Date.now();
+  await assert.rejects(run({ fetchImpl, deadlineMs: 200 }), (e) => e instanceof MarketError && e.transient);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(signals.length, 1);
+  assert.ok(signals[0].aborted);
+});
+
+test('no storage request starts once the deadline has passed', async (t) => {
+  const { storage, link } = await harness(t);
+  const api = { packageDownload: async () => { await new Promise((r) => setTimeout(r, 150)); return link(`${storage.origin}/b/late`).json; } };
+  let fetched = 0;
+  const fetchImpl = async () => { fetched++; return new Response(pkg.zip); };
+  await assert.rejects(downloadPackage({
+    api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, emulatorOrigin: storage.origin, fetchImpl, deadlineMs: 100,
+  }), (e) => e instanceof MarketError && e.transient);
+  assert.equal(fetched, 0);
 });
 
 test('C-03 errors: revoked, re-judged, transient retried, request ended rethrown', async (t) => {

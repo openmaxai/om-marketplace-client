@@ -7,10 +7,12 @@ import { revokedSet } from './revocations.js';
 import { checkPackageUrl, downloadPackage } from './download.js';
 import { inspectInWorker } from './inspect.js';
 import { failureFor, landSkill } from './land.js';
+import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
 
 // Left for a later round: the request is replayed with the same id and body.
 const RETRY_LATER = new Set(['INTENT_OUT_OF_ORDER', 'CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 const ALERT = new Set(['AGENT_NOT_SELF', 'REQUEST_ID_CONFLICT', 'VALIDATION_FAILED']);
+const failed = (code, message) => ({ status: 'failed', error_code: code, error_message: message });
 
 // Executes queued install intents one at a time: C-02, C-03 and download, inspection, landing, C-06. Results not yet
 // accepted stay in the outbox and are resent unchanged first.
@@ -67,6 +69,18 @@ export function createInstaller({
     return true;
   }
 
+  // The server may pick the version, so the revoked set is checked again against what C-02 selected.
+  function refuseBeforeDownload(res) {
+    const revoked = revokedSet(state);
+    if (revoked.has('skill_version_id', res.skill_version_id)) return failed('VERSION_REVOKED', 'version_revoked');
+    if (revoked.blocksSha(res.package_sha256)) return failed('VERSION_REVOKED', 'sha_blocked');
+    if (res.size_bytes > MAX_PACKAGE_BYTES || res.file_manifest.reduce((n, e) => n + e.size, 0) > MAX_PACKAGE_BYTES) {
+      return failed('PACKAGE_UNSAFE', 'too_large');
+    }
+    if (res.file_manifest.length > MAX_PACKAGE_FILES) return failed('PACKAGE_UNSAFE', 'too_many_files');
+    return null;
+  }
+
   async function execute(it) {
     const agentId = await orgs.agentId(it.org_id);
     const requestId = it.request_id ?? uuidv7(now());
@@ -87,6 +101,11 @@ export function createInstaller({
       journal(requestId, { phase: 'closed', response: res });
       setIntent(it.id, null);
       return 'already_installed';
+    }
+    const refused = refuseBeforeDownload(res);
+    if (refused) {
+      journal(requestId, { phase: 'refused', response: res });
+      return report(requestId, it.org_id, it.id, refused);
     }
     journal(requestId, { phase: 'downloading', response: res });
     let result;

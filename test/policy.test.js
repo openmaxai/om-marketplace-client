@@ -151,4 +151,6 @@ test('builtin placeholders delete $ARGUMENTS[n] before $n', () => {
 test('generic placeholder deletion keeps no state between calls', () => {
   assert.equal(deleteGeneric('$ARGUMENTS['), deleteGenericReference('$ARGUMENTS['));
   assert.equal(deleteGeneric('x$ARGUMENTS[1]'), 'x');
+  assert.equal(deleteGeneric('$ARGUMENTS[12'), deleteGenericReference('$ARGUMENTS[12'));
+  assert.equal(deleteGeneric('$ARGUMENTS[1]x'), 'x');
 });

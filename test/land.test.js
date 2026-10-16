@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { BroadcastChannel } from 'node:worker_threads';
 import { mode, tmpHome } from './helpers.js';
 import { skillMd, skillPackage } from './fake/package.js';
 import { buildZip } from './fake/zip.js';
@@ -16,18 +19,34 @@ import { InstallFailure } from '../src/failure.js';
 const SKILL = U(1);
 const pkg = skillPackage();
 
-function setup() {
+function setup({ stagingRoot } = {}) {
   const home = tmpHome();
   const skillsDir = path.join(home, 'skills');
   fs.mkdirSync(skillsDir);
   const land = (over = {}, inspected = inspectPackage(pkg.zip)) => landSkill({
-    skillsDir, stagingRoot: path.join(home, 'data', 'staging'), rollbackRoot: path.join(home, 'data', 'rollback'), requestId: U(9),
+    skillsDir, stagingRoot: stagingRoot ?? path.join(home, 'data', 'staging'), rollbackRoot: path.join(home, 'data', 'rollback'), requestId: U(9),
     install: { slug: 'demo-skill', skill_id: SKILL, version_no: 1, package_sha256: pkg.sha, file_manifest: pkg.manifest, ...over }, inspected,
   });
   return { home, skillsDir, land, target: path.join(skillsDir, 'market--demo-skill') };
 }
 
 const failsWith = (code, reason) => (e) => e instanceof InstallFailure && e.code === code && e.reason === reason;
+const STAGE = U(9);
+
+function mkfifo(p) {
+  const r = spawnSync('mkfifo', [p]);
+  assert.equal(r.status, 0, String(r.stderr));
+}
+
+// Inspected files whose iteration runs `after` once every file has been handed out, i.e. once all are staged.
+function afterStaging(after, inspected = inspectPackage(pkg.zip)) {
+  const files = inspected.files.slice();
+  files[Symbol.iterator] = function* iterate() {
+    yield* Array.prototype.values.call(this);
+    after();
+  };
+  return { ...inspected, files };
+}
 
 test('lands the files and the marker with private modes, leaving no staging behind', () => {
   const { home, land, target } = setup();
@@ -142,4 +161,91 @@ test('worker failures come back as package and policy errors', async () => {
 test('inspection does not block the event loop and times out as inspect_timeout', async () => {
   assert.equal(await Promise.race([inspectInWorker(pkg.zip), new Promise((r) => setTimeout(() => r('tick'), 0))]), 'tick');
   await assert.rejects(inspectInWorker(pkg.zip, { timeoutMs: 1 }), failsWith('CLIENT_INTERNAL', 'inspect_timeout'));
+});
+
+test('a FIFO in another skill, at the target marker or in staging neither blocks nor lands', () => {
+  {
+    const { skillsDir, land } = setup();
+    fs.mkdirSync(path.join(skillsDir, 'other'));
+    mkfifo(path.join(skillsDir, 'other', 'SKILL.md'));
+    assert.equal(land().previous, null);
+  }
+  {
+    const { land, target } = setup();
+    fs.mkdirSync(target);
+    mkfifo(path.join(target, MARKER));
+    assert.throws(() => land(), failsWith('INSTALL_TARGET_CONFLICT', 'target_exists'));
+  }
+  {
+    const { home, land, target } = setup();
+    const stage = path.join(home, 'data', 'staging', STAGE);
+    assert.throws(() => land({}, afterStaging(() => mkfifo(path.join(stage, 'docs', 'pipe')))), failsWith('CLIENT_INTERNAL', 'staged_files_mismatch'));
+    assert.equal(fs.existsSync(target), false);
+  }
+});
+
+test('staged files that read back differently from the manifest are CLIENT_INTERNAL', () => {
+  const { land, target } = setup();
+  const inspected = inspectPackage(pkg.zip);
+  inspected.files = inspected.files.map((f) => (f.path === 'docs/guide.md' ? { ...f, data: Buffer.from('other\n') } : f));
+  assert.throws(() => land({}, inspected), failsWith('CLIENT_INTERNAL', 'staged_files_mismatch'));
+  assert.equal(fs.existsSync(target), false);
+});
+
+test('staged files are created exclusively', () => {
+  const { land, target } = setup();
+  const inspected = inspectPackage(pkg.zip);
+  inspected.files = [...inspected.files, inspected.files[1]];
+  assert.throws(() => land({}, inspected), (e) => e.code === 'EEXIST');
+  assert.equal(fs.existsSync(target), false);
+});
+
+test('a target that appears while staging is a conflict and is left alone', () => {
+  const { land, target } = setup();
+  const make = () => { fs.mkdirSync(target); fs.writeFileSync(path.join(target, 'mine'), 'x'); };
+  assert.throws(() => land({}, afterStaging(make)), failsWith('INSTALL_TARGET_CONFLICT', 'target_exists'));
+  assert.deepEqual(fs.readdirSync(target), ['mine']);
+});
+
+test('a failed final rename puts the previous version back', (t) => {
+  const { land, target } = setup();
+  land();
+  const v2 = skillPackage('demo-skill', { 'docs/guide.md': 'v2\n' });
+  const real = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (from.endsWith(STAGE)) throw Object.assign(new Error('EIO'), { code: 'EIO' });
+    return real(from, to);
+  });
+  assert.throws(() => land({ version_no: 2, package_sha256: v2.sha, file_manifest: v2.manifest }, inspectPackage(v2.zip)), /EIO/);
+  t.mock.restoreAll();
+  assert.equal(fs.readFileSync(path.join(target, 'docs/guide.md'), 'utf8'), 'guide\n');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(target, MARKER))).version_no, 1);
+});
+
+test('staging on another filesystem than the skills dir is refused', (t) => {
+  const shm = '/dev/shm';
+  if (!fs.existsSync(shm) || fs.statSync(shm).dev === fs.statSync(os.tmpdir()).dev) return t.skip('no second filesystem');
+  const stagingRoot = fs.mkdtempSync(path.join(shm, 'om-mc-test-'));
+  t.after(() => fs.rmSync(stagingRoot, { recursive: true, force: true }));
+  const { land, target } = setup({ stagingRoot });
+  assert.throws(() => land(), failsWith('CLIENT_INTERNAL', 'staging_other_filesystem'));
+  assert.equal(fs.existsSync(target), false);
+});
+
+test('a timed-out worker is terminated', async () => {
+  const beats = new BroadcastChannel('spin-worker');
+  let n = 0;
+  try {
+    const workerUrl = new URL('./fake/spin-worker.js', import.meta.url);
+    const started = new Promise((r) => { beats.onmessage = () => { n++; r(); }; });
+    const run = inspectInWorker(pkg.zip, { workerUrl, timeoutMs: 1000 });
+    await started;
+    await assert.rejects(run, failsWith('CLIENT_INTERNAL', 'inspect_timeout'));
+    await new Promise((r) => setTimeout(r, 100));
+    const seen = n;
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(n, seen);
+  } finally {
+    beats.close();
+  }
 });

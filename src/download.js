@@ -4,6 +4,9 @@ import { MarketError, backoffMs } from './http.js';
 
 export const GCS_HOST = 'storage.googleapis.com';
 export const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
+// Whole download, retries included. The market fails a request with no result after MARKET_REQUEST_TIMEOUT (default 10
+// min); this leaves time for inspection (INSPECT_TIMEOUT_MS), landing and the C-06 report.
+export const DOWNLOAD_DEADLINE_MS = 6 * 60_000;
 const MAX_ATTEMPTS = 3;
 const EXPIRY_MARGIN_MS = 5_000;
 const ENDED = new Set(['AGENT_NOT_SELF', 'NOT_FOUND', 'MEMBER_LEFT_ORG']);
@@ -33,7 +36,10 @@ async function fetchExact({ fetchImpl, url, size, sha, signal, timeoutMs }) {
   const signals = [AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])];
   let res;
   try {
-    res = await fetchImpl(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.any(signals) });
+    // identity: a Content-Encoding would make the body differ from the stored bytes.
+    res = await fetchImpl(new URL(url).href, {
+      method: 'GET', redirect: 'manual', headers: { 'accept-encoding': 'identity' }, signal: AbortSignal.any(signals),
+    });
   } catch {
     return { transient: true };
   }
@@ -64,19 +70,26 @@ async function fetchExact({ fetchImpl, url, size, sha, signal, timeoutMs }) {
 }
 
 // C-03 then a direct storage download. Storage 403 or an expired URL gets one fresh URL; transient failures are retried
-// a few times and then rethrown. Throws InstallFailure for anything that must be reported.
+// a few times and then rethrown, as is running past deadlineMs. Throws InstallFailure for anything that must be reported.
 export async function downloadPackage({
   api, orgId, subPath, sha, size, emulatorOrigin = null, fetchImpl = globalThis.fetch, now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), signal = null, timeoutMs = DOWNLOAD_TIMEOUT_MS,
+  deadlineMs = DOWNLOAD_DEADLINE_MS,
 }) {
+  const started = performance.now();
+  const left = () => deadlineMs - (performance.now() - started);
+  const overdue = () => new MarketError('package download deadline passed', { code: 'NETWORK_ERROR', transient: true });
   let link = null;
   let urls = 0;
   let flaky = 0;
   const retry = async (err) => {
     if (++flaky >= MAX_ATTEMPTS || signal?.aborted) throw err;
-    await sleep(backoffMs(err, flaky - 1));
+    const wait = backoffMs(err, flaky - 1);
+    if (wait >= left()) throw overdue();
+    await sleep(wait);
   };
   for (;;) {
+    if (left() <= 0) throw overdue();
     if (!link || now() >= Date.parse(link.expires_at) - EXPIRY_MARGIN_MS) {
       if (urls === 2) throw internal('download_url_expired');
       try {
@@ -84,6 +97,7 @@ export async function downloadPackage({
       } catch (err) {
         if (!(err instanceof MarketError)) throw err;
         if (err.code === 'VERSION_REVOKED') throw new InstallFailure('VERSION_REVOKED', 'version_revoked');
+        if (err.code === 'SHELF_RESPONSE_INVALID') throw new InstallFailure('SHELF_RESPONSE_INVALID', 'shelf_response_invalid');
         if (ENDED.has(err.code) || err.code === 'CLIENT_VERSION_TOO_OLD') throw err;
         if (!err.transient) throw internal(err.code === 'RESPONSE_INVALID' ? 'download_response_invalid' : 'download_unavailable');
         link = null;
@@ -95,7 +109,7 @@ export async function downloadPackage({
       if (!downloadUrlAllowed(link.download_url, emulatorOrigin)) throw internal('download_host_refused');
       continue;
     }
-    const r = await fetchExact({ fetchImpl, url: link.download_url, size, sha, signal, timeoutMs });
+    const r = await fetchExact({ fetchImpl, url: link.download_url, size, sha, signal, timeoutMs: Math.ceil(Math.min(timeoutMs, left())) });
     if (r instanceof InstallFailure) throw r;
     if (r.bytes) return r.bytes;
     if (r.expired) link = null;
