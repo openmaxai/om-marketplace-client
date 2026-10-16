@@ -42,3 +42,16 @@ export function runHook(hook, { env, input } = {}) {
 export function mode(p) {
   return fs.statSync(p).mode & 0o777;
 }
+
+// Real timers, captured before any test can mock them.
+const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis;
+export const delay = (ms) => new Promise((r) => realSetTimeout(r, ms));
+
+// Settles like p, or fails with an assertion error after ms, so a hang fails the test instead of the runner.
+export function within(p, ms, what) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = realSetTimeout(() => reject(new Error(`${what}: not settled within ${ms} ms`)), ms);
+  });
+  return Promise.race([p, late]).finally(() => realClearTimeout(timer));
+}

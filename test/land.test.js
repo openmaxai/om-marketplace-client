@@ -5,11 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { BroadcastChannel } from 'node:worker_threads';
-import { mode, tmpHome } from './helpers.js';
+import { delay, mode, tmpHome, within } from './helpers.js';
 import { skillMd, skillPackage } from './fake/package.js';
 import { buildZip } from './fake/zip.js';
 import { U } from './fake/pull.js';
 import { MARKER, failureFor, landSkill, skillNameReserved } from '../src/land.js';
+import { MAX_SKILL_MD_BYTES } from '../src/pkg/frontmatter.js';
 import { inspectInWorker } from '../src/inspect.js';
 import { inspectPackage } from '../src/pkg/hygiene.js';
 import { PackageError } from '../src/pkg/zip.js';
@@ -82,22 +83,68 @@ test('an existing directory, link or file at the target that is not this skill i
   }
 });
 
-test('the slug may not be another local skill directory or SKILL.md name; links are not followed', () => {
+test('the slug may not be another local skill directory or SKILL.md name, also of a linked skill', () => {
   const taken = {
     dir: (s) => fs.mkdirSync(path.join(s, 'Demo-Skill')),
     link: (s, home) => fs.symlinkSync(home, path.join(s, 'demo-skill')),
     'skill name': (s) => { fs.mkdirSync(path.join(s, 'other')); fs.writeFileSync(path.join(s, 'other', 'SKILL.md'), skillMd('"demo-skill"')); },
+    'linked skill name': (s, home) => {
+      fs.mkdirSync(path.join(home, 'elsewhere'));
+      fs.writeFileSync(path.join(home, 'elsewhere', 'SKILL.md'), skillMd('demo-skill'));
+      fs.symlinkSync(path.join(home, 'elsewhere'), path.join(s, 'linked'));
+    },
   };
   for (const [name, make] of Object.entries(taken)) {
     const { home, skillsDir, land } = setup();
     make(skillsDir, home);
     assert.throws(() => land(), failsWith('INSTALL_TARGET_CONFLICT', 'name_taken'), name);
   }
+});
+
+test('a linked SKILL.md is read without following its own link and leaves the linked skill untouched', () => {
   const { home, skillsDir, land } = setup();
   fs.mkdirSync(path.join(home, 'elsewhere'));
-  fs.writeFileSync(path.join(home, 'elsewhere', 'SKILL.md'), skillMd('demo-skill'));
+  fs.writeFileSync(path.join(home, 'named.md'), skillMd('demo-skill'));
+  fs.symlinkSync(path.join(home, 'named.md'), path.join(home, 'elsewhere', 'SKILL.md'));
   fs.symlinkSync(path.join(home, 'elsewhere'), path.join(skillsDir, 'linked'));
   assert.equal(land().previous, null);
+  assert.deepEqual(fs.readdirSync(path.join(home, 'elsewhere')), ['SKILL.md']);
+  assert.equal(fs.readlinkSync(path.join(skillsDir, 'linked')), path.join(home, 'elsewhere'));
+});
+
+test('links without a readable skill name are compared by entry name only and do not block the install', () => {
+  const links = {
+    'dir without SKILL.md': (home) => { fs.mkdirSync(path.join(home, 'empty')); return path.join(home, 'empty'); },
+    dangling: (home) => path.join(home, 'missing'),
+    fifo: (home) => { mkfifo(path.join(home, 'pipe')); return path.join(home, 'pipe'); },
+  };
+  for (const [name, make] of Object.entries(links)) {
+    const { home, skillsDir, land, target } = setup();
+    fs.symlinkSync(make(home), path.join(skillsDir, 'linked'));
+    assert.equal(land().previous, null, name);
+    assert.ok(fs.lstatSync(target).isDirectory(), name);
+    assert.ok(fs.lstatSync(path.join(skillsDir, 'linked')).isSymbolicLink(), name);
+  }
+});
+
+test('a local SKILL.md that fstat does not report as a regular file is not read', (t) => {
+  const { skillsDir, land } = setup();
+  fs.mkdirSync(path.join(skillsDir, 'other'));
+  const md = path.join(skillsDir, 'other', 'SKILL.md');
+  fs.writeFileSync(md, skillMd('demo-skill'));
+  const opened = new Map();
+  const { openSync, fstatSync } = fs;
+  t.mock.method(fs, 'openSync', (...a) => { const fd = openSync(...a); opened.set(fd, String(a[0])); return fd; });
+  t.mock.method(fs, 'fstatSync', (fd, ...a) => {
+    const st = fstatSync(fd, ...a);
+    return opened.get(fd) === md ? Object.assign(Object.create(st), { isFile: () => false }) : st;
+  });
+  assert.equal(land().previous, null);
+  t.mock.restoreAll();
+  const again = setup();
+  fs.mkdirSync(path.join(again.skillsDir, 'other'));
+  fs.writeFileSync(path.join(again.skillsDir, 'other', 'SKILL.md'), skillMd('demo-skill'));
+  assert.throws(() => again.land(), failsWith('INSTALL_TARGET_CONFLICT', 'name_taken'));
 });
 
 test('reserved names, a name or manifest that differs from C-02, and a packaged marker are refused before writing', () => {
@@ -159,22 +206,35 @@ test('worker failures come back as package and policy errors', async () => {
 });
 
 test('inspection does not block the event loop and times out as inspect_timeout', async () => {
-  assert.equal(await Promise.race([inspectInWorker(pkg.zip), new Promise((r) => setTimeout(() => r('tick'), 0))]), 'tick');
+  const run = inspectInWorker(pkg.zip);
+  assert.equal(await Promise.race([run, new Promise((r) => setTimeout(() => r('tick'), 0))]), 'tick');
+  await run;
   await assert.rejects(inspectInWorker(pkg.zip, { timeoutMs: 1 }), failsWith('CLIENT_INTERNAL', 'inspect_timeout'));
 });
 
+// Opening a FIFO blocks synchronously, which no timer in this process can interrupt; the child is killed instead.
+function landInChild(home) {
+  const t0 = performance.now();
+  const r = spawnSync(process.execPath, [CHILD], { env: { PATH: process.env.PATH, OM_MC_LAND_CHILD: home }, encoding: 'utf8', timeout: 10_000 });
+  assert.equal(r.error?.code, undefined, `landing did not finish in 10 s (${Math.round(performance.now() - t0)} ms)`);
+  assert.equal(r.status, 0, r.stderr);
+  return JSON.parse(r.stdout);
+}
+const CHILD = new URL('./fake/land-child.js', import.meta.url).pathname;
+
 test('a FIFO in another skill, at the target marker or in staging neither blocks nor lands', () => {
   {
-    const { skillsDir, land } = setup();
+    const { home, skillsDir, target } = setup();
     fs.mkdirSync(path.join(skillsDir, 'other'));
     mkfifo(path.join(skillsDir, 'other', 'SKILL.md'));
-    assert.equal(land().previous, null);
+    assert.deepEqual(landInChild(home), { landed: true });
+    assert.ok(fs.existsSync(path.join(target, MARKER)));
   }
   {
-    const { land, target } = setup();
+    const { home, target } = setup();
     fs.mkdirSync(target);
     mkfifo(path.join(target, MARKER));
-    assert.throws(() => land(), failsWith('INSTALL_TARGET_CONFLICT', 'target_exists'));
+    assert.deepEqual(landInChild(home), { code: 'INSTALL_TARGET_CONFLICT', reason: 'target_exists' });
   }
   {
     const { home, land, target } = setup();
@@ -232,20 +292,90 @@ test('staging on another filesystem than the skills dir is refused', (t) => {
   assert.equal(fs.existsSync(target), false);
 });
 
-test('a timed-out worker is terminated', async () => {
+// The inspection timeout runs on mocked time and fires only once the worker has beaten, however slow it is to start.
+test('a timed-out worker is terminated', async (t) => {
   const beats = new BroadcastChannel('spin-worker');
   let n = 0;
+  let last = 0;
+  const started = new Promise((r) => { beats.onmessage = () => { n++; last = performance.now(); r(); }; });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
     const workerUrl = new URL('./fake/spin-worker.js', import.meta.url);
-    const started = new Promise((r) => { beats.onmessage = () => { n++; r(); }; });
     const run = inspectInWorker(pkg.zip, { workerUrl, timeoutMs: 1000 });
-    await started;
-    await assert.rejects(run, failsWith('CLIENT_INTERNAL', 'inspect_timeout'));
-    await new Promise((r) => setTimeout(r, 100));
-    const seen = n;
-    await new Promise((r) => setTimeout(r, 200));
-    assert.equal(n, seen);
+    run.catch(() => {});
+    await within(started, 20_000, 'first worker beat');
+    t.mock.timers.tick(1000);
+    t.mock.timers.reset();
+    await within(assert.rejects(run, failsWith('CLIENT_INTERNAL', 'inspect_timeout')), 1000, 'timeout rejection');
+    const t0 = performance.now();
+    while (performance.now() - last < 300) {
+      assert.ok(performance.now() - t0 < 5000, `worker still beating after 5 s (${n} beats)`);
+      await delay(50);
+    }
   } finally {
+    t.mock.timers.reset();
     beats.close();
   }
+});
+
+test('a link aliasing our own target does not block an upgrade or a reinstall and is left as it is', () => {
+  const { home, skillsDir, land, target } = setup();
+  land();
+  const alias = path.join(skillsDir, 'alias');
+  fs.symlinkSync('market--demo-skill', alias);
+  const v2 = skillPackage('demo-skill', { 'docs/guide.md': 'v2\n' });
+  const r = land({ version_no: 2, package_sha256: v2.sha, file_manifest: v2.manifest }, inspectPackage(v2.zip));
+  assert.equal(r.previous, path.join(home, 'data', 'rollback', 'demo-skill', '1'));
+  assert.equal(fs.readFileSync(path.join(target, 'docs/guide.md'), 'utf8'), 'v2\n');
+  assert.equal(land({ version_no: 2, package_sha256: v2.sha, file_manifest: v2.manifest }, inspectPackage(v2.zip)).previous,
+    path.join(home, 'data', 'rollback', 'demo-skill', '2'));
+  assert.equal(fs.readlinkSync(alias), 'market--demo-skill');
+  assert.equal(fs.readFileSync(path.join(alias, 'docs/guide.md'), 'utf8'), 'v2\n');
+});
+
+test('a local SKILL.md over the size cap is not read; one at the cap is', () => {
+  const sized = (n) => {
+    const md = skillMd('demo-skill');
+    return md + 'x'.repeat(n - Buffer.byteLength(md));
+  };
+  for (const [size, conflict] of [[MAX_SKILL_MD_BYTES + 1, false], [MAX_SKILL_MD_BYTES, true]]) {
+    const { skillsDir, land } = setup();
+    fs.mkdirSync(path.join(skillsDir, 'other'));
+    fs.writeFileSync(path.join(skillsDir, 'other', 'SKILL.md'), sized(size));
+    if (conflict) assert.throws(() => land(), failsWith('INSTALL_TARGET_CONFLICT', 'name_taken'), String(size));
+    else assert.equal(land().previous, null, String(size));
+  }
+});
+
+test('a local SKILL.md is read only up to the cap, whatever fstat reported', (t) => {
+  const { skillsDir, land } = setup();
+  fs.mkdirSync(path.join(skillsDir, 'other'));
+  const md = path.join(skillsDir, 'other', 'SKILL.md');
+  fs.writeFileSync(md, skillMd('demo-skill') + 'x'.repeat(MAX_SKILL_MD_BYTES));
+  const opened = new Map();
+  const { openSync, fstatSync } = fs;
+  t.mock.method(fs, 'openSync', (...a) => { const fd = openSync(...a); opened.set(fd, String(a[0])); return fd; });
+  t.mock.method(fs, 'fstatSync', (fd, ...a) => {
+    const st = fstatSync(fd, ...a);
+    return opened.get(fd) === md ? Object.assign(Object.create(st), { size: 10 }) : st;
+  });
+  assert.equal(land().previous, null);
+});
+
+test('a local SKILL.md that fstat reports over the cap is not read at all', (t) => {
+  const { skillsDir, land } = setup();
+  fs.mkdirSync(path.join(skillsDir, 'other'));
+  const md = path.join(skillsDir, 'other', 'SKILL.md');
+  fs.writeFileSync(md, skillMd('demo-skill'));
+  const opened = new Map();
+  const reads = [];
+  const { openSync, fstatSync, readSync } = fs;
+  t.mock.method(fs, 'openSync', (...a) => { const fd = openSync(...a); opened.set(fd, String(a[0])); return fd; });
+  t.mock.method(fs, 'fstatSync', (fd, ...a) => {
+    const st = fstatSync(fd, ...a);
+    return opened.get(fd) === md ? Object.assign(Object.create(st), { size: MAX_SKILL_MD_BYTES + 1 }) : st;
+  });
+  t.mock.method(fs, 'readSync', (fd, ...a) => { if (opened.get(fd) === md) reads.push(fd); return readSync(fd, ...a); });
+  assert.equal(land().previous, null, 'a SKILL.md claiming the same name is skipped by size alone');
+  assert.deepEqual(reads, []);
 });

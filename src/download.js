@@ -71,8 +71,9 @@ async function fetchExact({ fetchImpl, url, size, sha, signal, timeoutMs }) {
 }
 
 // C-03 (or C-04) then a direct storage download. size null takes the size from the signed link, capped at 20 MiB.
-// Storage 403 or an expired URL gets one fresh URL; transient failures are retried a few times and then rethrown, as is
-// running past deadlineMs. Throws InstallFailure for anything that must be reported.
+// Storage 403 or an expired URL gets one fresh URL; transient failures are retried a few times and then rethrown.
+// deadlineMs bounds the whole call: every C-03/C-04 call, storage fetch and retry wait; running past it throws a
+// transient error. Throws InstallFailure for anything that must be reported.
 export async function downloadPackage({
   api, orgId, subPath, sha, size, emulatorOrigin = null, fetchImpl = globalThis.fetch, now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), signal = null, timeoutMs = DOWNLOAD_TIMEOUT_MS,
@@ -84,6 +85,20 @@ export async function downloadPackage({
   let link = null;
   let urls = 0;
   let flaky = 0;
+  // A C-03 call has its own request timeout; a slow answer still may not run past the deadline, where it is aborted.
+  const beforeDeadline = (call) => {
+    const ctl = new AbortController();
+    let timer;
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(overdue());
+        ctl.abort();
+      }, Math.max(0, left()));
+    });
+    const p = (async () => call(ctl.signal))();
+    p.catch(() => {});
+    return Promise.race([p, late]).finally(() => clearTimeout(timer));
+  };
   const retry = async (err) => {
     if (++flaky >= MAX_ATTEMPTS || signal?.aborted) throw err;
     const wait = backoffMs(err, flaky - 1);
@@ -95,9 +110,10 @@ export async function downloadPackage({
     if (!link || now() >= Date.parse(link.expires_at) - EXPIRY_MARGIN_MS) {
       if (urls === 2) throw internal('download_url_expired');
       try {
-        link = await api.packageDownload({ orgId, subPath });
+        link = await beforeDeadline((cancel) => api.packageDownload({ orgId, subPath, signal: cancel }));
       } catch (err) {
         if (!(err instanceof MarketError)) throw err;
+        if (left() <= 0) throw overdue();
         if (err.code === 'VERSION_REVOKED') throw new InstallFailure('VERSION_REVOKED', 'version_revoked');
         if (err.code === 'SHELF_RESPONSE_INVALID') throw new InstallFailure('SHELF_RESPONSE_INVALID', 'shelf_response_invalid');
         if (ENDED.has(err.code) || err.code === 'CLIENT_VERSION_TOO_OLD') throw err;
