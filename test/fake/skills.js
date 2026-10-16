@@ -32,8 +32,11 @@ export function crashingState(state, at) {
     return r;
   };
   const col = (c, kind) => ({ ...c, put: guard(kind, c.put), remove: guard(kind, c.remove) });
+  // Status writes never throw in production; after the crash they are simply lost.
+  const status = (fn) => (...args) => (dead ? false : fn(...args));
   return {
-    ...state, write: guard('write', state.write), update: guard('update', state.update), setAlert: guard('alert', state.setAlert),
+    ...state, write: guard('write', state.write), update: guard('update', state.update),
+    setAlert: status(state.setAlert), clearAlert: status(state.clearAlert), recordRun: status(state.recordRun),
     journal: col(state.journal, 'journal'), outbox: col(state.outbox, 'outbox'),
   };
 }

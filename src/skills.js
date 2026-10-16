@@ -55,8 +55,10 @@ export function createSkills({
   const stagingRoot = path.join(dataDir, 'staging');
   const drop = (dir) => discard(dir, trashRoot);
   // Nothing is in flight at startup: what a crash left in the trash or in staging goes first.
-  emptyTrash(trashRoot);
-  emptyTrash(stagingRoot);
+  for (const d of [trashRoot, stagingRoot]) {
+    const left = emptyTrash(d);
+    if (left) logger.warn(`${left} entries under ${d} could not be removed; retried at the next start`);
+  }
   const journal = (id, patch) => {
     const j = { ...state.journal.get(id), ...patch, updated_at: iso() };
     state.journal.put(id, j);
@@ -179,10 +181,11 @@ export function createSkills({
   }
 
   // Takes a landing back: the landed copy is discarded (quarantined when revoked) and the replaced version restored.
+  // A no-op landing (the version was already in place) leaves the directories to restorePrior alone.
   function undoLanding(j) {
     const { response: res, prior } = j;
     const revoked = isRevoked(res);
-    for (const w of ['enabled', 'disabled']) {
+    for (const w of j.noop ? [] : ['enabled', 'disabled']) {
       const d = dirOf(res.slug, w);
       if (readMarker(d)?.package_sha256 !== res.package_sha256) continue;
       if (revoked) quarantine(d, res, res.skill_id);
@@ -356,7 +359,7 @@ export function createSkills({
     if (refused) return fail(...refused);
     if (alreadyLanded(res, prior)) {
       putRec(res.skill_id, { ...prior, install_id: res.install_id, request_id: rid });
-      journal(rid, { phase: 'landed', prior });
+      journal(rid, { phase: 'landed', prior, noop: true });
       return report(rid, it, { status: 'succeeded', installed_sha256: res.package_sha256 });
     }
     if (versionRefused(res, prior)) return fail('INSTALL_TARGET_CONFLICT', 'not_higher');
@@ -542,6 +545,7 @@ export function createSkills({
       const sid = peek('outbox', id)?.skill_id ?? peek('journal', id)?.response?.skill_id;
       if (sid) busy.add(sid);
     }
+    for (const sid of stuckRollbacks.values()) if (sid) busy.add(sid);
     return busy;
   }
 
@@ -565,7 +569,12 @@ export function createSkills({
       from: { version_no: rec.version_no, skill_version_id: rec.skill_version_id, package_sha256: rec.package_sha256 },
       to: { version_no: prev.version_no, skill_version_id: prev.skill_version_id, package_sha256: m.package_sha256 },
     });
-    return finishRollback(rid, j);
+    try {
+      return finishRollback(rid, j);
+    } catch (err) {
+      stuck(rid, skillId, err);
+      throw err;
+    }
   }
 
   // Idempotent: each step is taken only when the directories show it has not happened yet.
@@ -604,13 +613,36 @@ export function createSkills({
     return 'none';
   }
 
-  function resumeRollbacks() {
-    for (const id of state.journal.list()) {
-      const j = readEntry('journal', id);
-      if (j !== CORRUPT && j?.op === 'rollback' && j.phase === 'rollback') finishRollback(id, j);
+  // Open rollback journals that failed to finish (a persistent fs error): skill id by journal id. Retried every round;
+  // their skills count as busy meanwhile.
+  const stuckRollbacks = new Map();
+  function stuck(id, skillId, err) {
+    stuckRollbacks.set(id, skillId);
+    const msg = `rollback ${id}${skillId ? ` of skill ${skillId}` : ''} could not be completed (${err.code ?? err.message}); retried every round`;
+    if (state.setAlert(`rollback_open:${id}`, msg)) logger.error(msg);
+  }
+
+  // One failing entry never stops the others or the caller.
+  function resumeRollbacks(ids) {
+    for (const id of ids) {
+      let j;
+      try {
+        j = readEntry('journal', id);
+        if (j !== CORRUPT && j?.op === 'rollback' && j.phase === 'rollback') finishRollback(id, j);
+      } catch (err) {
+        stuck(id, j?.skill_id ?? stuckRollbacks.get(id) ?? null, err);
+        continue;
+      }
+      if (stuckRollbacks.delete(id)) state.clearAlert(`rollback_open:${id}`);
     }
   }
-  resumeRollbacks();
+  try {
+    resumeRollbacks(state.journal.list());
+  } catch (err) {
+    const msg = `the request journal cannot be listed (${err.code ?? err.message}); interrupted rollbacks are not resumed`;
+    state.setAlert('journal_unreadable', msg);
+    logger.error(msg);
+  }
 
   return {
     enforceRevocations,
@@ -620,6 +652,7 @@ export function createSkills({
     async runRound({ limit = MAX_INTENTS_PER_ROUND } = {}) {
       const blocked = new Set();
       const outcomes = [];
+      if (stuckRollbacks.size) resumeRollbacks([...stuckRollbacks.keys()]);
       enforceRevocations();
       await flushOutbox(blocked);
       for (let n = 0; n < limit && !signal?.aborted && !tooOld(state); n++) {
@@ -629,9 +662,13 @@ export function createSkills({
         try {
           r = await runIntent(it);
         } catch (err) {
-          logger.error(`intent ${it.id} failed: ${err.message}`);
+          // A local error that persists (e.g. no same-filesystem trash) holds the org back every round: raise it.
+          const msg = `intent ${it.id} (${it.op} of skill ${it.skill_id}) failed locally: ${err.message}; retried every round`;
+          if (state.setAlert(`intent_failed:${it.id}`, msg)) logger.error(msg);
+          else logger.warn(msg);
           r = 'deferred';
         }
+        if (r !== 'deferred') state.clearAlert(`intent_failed:${it.id}`);
         outcomes.push(r);
         if (r === 'deferred') blocked.add(it.org_id);
       }

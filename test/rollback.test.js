@@ -136,3 +136,49 @@ test('an interrupted rollback whose kept copy vanished puts the moved version ba
   assert.equal(version(other.rb(1)), 1);
   assert.equal(other.state.journal.get(U(50)).phase, 'closed');
 });
+
+test('a rollback stopped by a persistent fs error never blocks startup; it is retried each round with an alert', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  const slot = path.dirname(f.rb(1));
+  fs.chmodSync(slot, 0o500);
+  t.after(() => fs.chmodSync(slot, 0o700));
+  assert.throws(() => f.make().rollback(SKILL), { code: 'EACCES' });
+  const open = () => Object.keys(f.state.read('status', null).alerts).filter((k) => k.startsWith('rollback_open:'));
+  assert.equal(open().length, 1);
+  const s = f.make();
+  assert.equal(open().length, 1);
+  assert.equal(s.rollback(SKILL), 'busy');
+  assert.deepEqual(s.localScan().busy, new Set([SKILL]));
+  await s.runRound();
+  untouched(f);
+  fs.chmodSync(slot, 0o700);
+  await s.runRound();
+  rolledBack(f);
+  assert.deepEqual(open(), []);
+  assert.deepEqual(s.localScan().busy, new Set());
+});
+
+test('one rollback that cannot be resumed does not stop the others', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  const S2 = U(2);
+  const live2 = path.join(path.dirname(f.live), 'market--demo2');
+  const rb2 = (n) => path.join(f.dataDir, 'rollback', 'demo2', String(n));
+  f.state.update('installs', {}, (d) => { d[S2] = { ...d[SKILL], slug: 'demo2' }; });
+  marker(live2, 2, S2);
+  marker(rb2(1), 1, S2);
+  const journal = (id, skillId, slug) => f.state.journal.put(id, {
+    op: 'rollback', phase: 'rollback', skill_id: skillId, slug, where: 'enabled',
+    from: { version_no: 2, skill_version_id: VID(2), package_sha256: SHA(2) }, to: { version_no: 1, skill_version_id: VID(1), package_sha256: SHA(1) },
+  });
+  journal(U(49), SKILL, 'demo');
+  journal(U(50), S2, 'demo2');
+  const slot = path.dirname(f.rb(1));
+  fs.chmodSync(slot, 0o500);
+  t.after(() => fs.chmodSync(slot, 0o700));
+  f.make();
+  untouched(f);
+  assert.deepEqual([version(live2), version(rb2(2))], [1, 2]);
+  assert.equal(f.state.journal.get(U(50)).phase, 'closed');
+  assert.equal(f.state.journal.get(U(49)).phase, 'rollback');
+  assert.match(f.state.read('status', null).alerts[`rollback_open:${U(49)}`].message, new RegExp(`of skill ${SKILL}`));
+});

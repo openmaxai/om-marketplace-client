@@ -80,7 +80,7 @@ test('a sha mismatch or an over-budget inject segment writes nothing', async (t)
   assert.deepEqual([g.sent()[0].error_code, g.sent()[0].error_message], ['PACKAGE_UNSAFE', 'inject_too_large']);
   for (const x of [f, g]) {
     assert.equal(fs.existsSync(x.dir), false);
-    assert.equal(readSlots(x.dataDir)['1'], null);
+    assert.equal(readSlots(x.dataDir), null);
   }
 });
 
@@ -193,6 +193,7 @@ test('a new epoch clears the slot map and quarantines adoption dirs only when sl
   f.state.write('epoch', null);
   f.make();
   assert.equal(fs.existsSync(f.dir), true);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'slots.json')), false);
 
   writeSlots(f.dataDir, { 1: { adoption_id: ADOPTION, inject_sha256: MANIFEST_SHA } });
   restart();

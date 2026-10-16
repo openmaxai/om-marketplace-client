@@ -213,7 +213,11 @@ export function landSkill({ skillsDir, targetRoot = skillsDir, stagingRoot, roll
       // empty directory does not cross a privilege boundary and no data is lost.
       fs.renameSync(stage, target);
     } catch (err) {
-      if (previous) fs.renameSync(previous, target);
+      if (previous) {
+        fs.renameSync(previous, target);
+        fsyncDir(path.dirname(previous));
+        fsyncDir(targetRoot);
+      }
       throw err;
     }
     fsyncDir(targetRoot);

@@ -424,3 +424,26 @@ test('a release whose delete fails has already let go of the rollback and leaves
   assert.equal(f.state.read('installs', {})[SK(7)].rollback, null);
   assert.deepEqual(fs.readdirSync(rb).sort(), ['.market-managed', 'SKILL.md']);
 });
+
+test('a budget read failing with any error, or a broken status.json, still does not abort reconcile', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  const eacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+  const state = { ...f.state, read: (n, fb) => { if (n === 'reconcile') throw eacces; return f.state.read(n, fb); } };
+  const r = createReconciler({ api: f.api, state, orgs: f.orgs, skills: f.skills, templates: f.templates, logger: f.logger, now: f.now });
+  f.queue({});
+  fs.writeFileSync(path.join(f.state.dir, 'status.json'), '{broken');
+  assert.equal((await r.run()).outcome, 'rate_limited');
+  assert.equal(f.reports().length, 0);
+  const st = f.state.read('status', null);
+  assert.ok(st.alerts['reconcile:budget']);
+  assert.ok(st.alerts['corrupt:status']);
+});
+
+test('a budget that cannot be stored is not spent: nothing is sent', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  const state = { ...f.state, write: (n, v) => { if (n === 'reconcile') throw new Error('ENOSPC'); return f.state.write(n, v); } };
+  const r = createReconciler({ api: f.api, state, orgs: f.orgs, skills: f.skills, templates: f.templates, logger: f.logger, now: f.now });
+  f.queue({});
+  assert.equal((await r.run()).outcome, 'rate_limited');
+  assert.equal(f.reports().length, 0);
+});

@@ -1,7 +1,6 @@
 import { MAX_RETRY_AFTER_MS, MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex } from './ids.js';
 import { EMPTY_INTENTS, enterTooOldMode, tooOld } from './intents.js';
-import { StateError } from './state.js';
 
 export const MAX_ITEMS = 200;
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -102,12 +101,7 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
   // exceeds the budget.
   function readDoc() {
     let d;
-    try {
-      d = state.read('reconcile', EMPTY_RECONCILE);
-    } catch (err) {
-      if (!(err instanceof StateError)) throw err;
-      d = undefined;
-    }
+    try { d = state.read('reconcile', EMPTY_RECONCILE); } catch { /* unusable, like a corrupt one */ }
     if (validDoc(d)) return d;
     const msg = 'reconcile budget file was unreadable; it was reset as spent and reporting pauses for one hour';
     state.setAlert('reconcile:budget', msg);
@@ -120,11 +114,17 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
     return null;
   }
 
+  // False when the document is unusable or the change cannot be stored.
   function updateDoc(fn) {
     const d = readDoc();
     if (!d) return false;
     fn(d);
-    state.write('reconcile', d);
+    try {
+      state.write('reconcile', d);
+    } catch (err) {
+      logger.error(`reconcile budget file cannot be written: ${err.message}`);
+      return false;
+    }
     return true;
   }
 
@@ -133,13 +133,14 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
   function takeBudget() {
     const t = now();
     let ok = false;
-    updateDoc((d) => {
+    const stored = updateDoc((d) => {
       d.sent = d.sent.filter((s) => Date.parse(s) <= t && t - Date.parse(s) < RATE_WINDOW_MS);
       if (Date.parse(d.blocked_until) > t + MAX_RETRY_AFTER_MS) d.blocked_until = new Date(t + MAX_RETRY_AFTER_MS).toISOString();
       if (t < Date.parse(d.blocked_until ?? '') || d.sent.length >= RATE_BUDGET) return;
       d.sent.push(iso());
       ok = true;
     });
+    if (!stored) return false;
     if (ok) state.clearAlert('reconcile:budget');
     return ok;
   }
