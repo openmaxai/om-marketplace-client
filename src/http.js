@@ -77,16 +77,17 @@ async function readLimited(res, max, label) {
 }
 
 // One HTTP exchange: timeout covers headers and body, redirects are never followed, body size is capped. An abort
-// of `signal` (shutdown) ends the exchange early.
+// of `signal` (shutdown) or of `cancel` (the caller gave up on this request) ends the exchange early.
 export async function sendJson({
-  fetchImpl = globalThis.fetch, url, method, headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, label, signal: stop = null,
+  fetchImpl = globalThis.fetch, url, method, headers, body, timeoutMs = DEFAULT_TIMEOUT_MS, label, signal: stop = null, cancel = null,
 }) {
   const timeout = AbortSignal.timeout(timeoutMs);
   const ctl = new AbortController();
   const onAbort = () => ctl.abort();
   timeout.addEventListener('abort', onAbort, { once: true });
   stop?.addEventListener('abort', onAbort, { once: true });
-  if (stop?.aborted) ctl.abort();
+  cancel?.addEventListener('abort', onAbort, { once: true });
+  if (stop?.aborted || cancel?.aborted) ctl.abort();
   const { signal } = ctl;
   const netError = () => {
     const [code, what] = stop?.aborted ? ['ABORTED', 'aborted'] : timeout.aborted ? ['TIMEOUT', 'timed out'] : ['NETWORK_ERROR', 'network error'];
@@ -109,6 +110,7 @@ export async function sendJson({
   } finally {
     timeout.removeEventListener('abort', onAbort);
     stop?.removeEventListener('abort', onAbort);
+    cancel?.removeEventListener('abort', onAbort);
   }
   const type = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
   let data = null;
@@ -124,7 +126,8 @@ export function createMarketHttp({
   bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now, signal = null,
 }) {
   const base = new URL(normalizeBffUrl(bffUrl));
-  async function request(method, orgId, subPath, body) {
+  // An abort of `cancel` ends this one request.
+  async function request(method, orgId, subPath, body, { cancel = null } = {}) {
     if (!isOrgOrMemberId(orgId)) throw new TypeError('invalid orgId');
     // %2E and %2F are refused because URL parsing treats them as dot segments or separators.
     if (!/^\/(?:[A-Za-z0-9\-._~:/]|%[0-9A-F]{2})*$/.test(subPath) || /%2[EF]/.test(subPath)
@@ -141,7 +144,7 @@ export function createMarketHttp({
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       });
       logger.debug(label);
-      return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label, signal }) };
+      return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label, signal, cancel }) };
     };
     let { token, r } = await send();
     if (r.status === 401 && await auth.renewAfter401(orgId, token)) {

@@ -147,8 +147,8 @@ export function createMarketApi({ http }) {
     },
 
     // C-03 at subPath, which the caller derived from a checked package_url.
-    async packageDownload({ orgId, subPath }) {
-      const r = await http.request('GET', orgId, subPath);
+    async packageDownload({ orgId, subPath, signal = null }) {
+      const r = await http.request('GET', orgId, subPath, undefined, { cancel: signal });
       return validated('packages', r, (data) => {
         if (r.status !== 200) fail('status', `${r.status} is not expected`);
         return pick(object(data, 'body'), 'body', { download_url: text(8192), expires_at: time, sha256: sha, size: posInt });

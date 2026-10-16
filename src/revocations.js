@@ -9,7 +9,9 @@ export const EMPTY_REVOKED = Object.freeze({
 });
 const ID_FIELDS = ['skill_version_id', 'template_version_id', 'package_sha256', 'manifest_sha256'];
 
-// The revoked set only grows; it is never cleared, also not on uninstall.
+// The revoked set only grows; it is never cleared, also not on uninstall. It is the persisted result of every earlier
+// pull: when this round's pull fails, installs are checked against the set as of the last successful page. That is
+// accepted because C-03 re-checks revocations and sha blocks on the market before handing out a download URL.
 export function revokedSet(state) {
   const doc = { ...structuredClone(EMPTY_REVOKED), ...state.read('revoked', EMPTY_REVOKED) };
   const sets = Object.fromEntries(Object.entries(doc).map(([k, v]) => [k, new Set(v)]));
