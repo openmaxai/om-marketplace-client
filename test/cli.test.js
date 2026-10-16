@@ -8,6 +8,7 @@ import { startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, ORG2, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { openState, stateScope, writeJsonAtomic } from '../src/state.js';
+import { commandSignals } from '../src/cli.js';
 
 const SKILL = U(1);
 const VID = (n) => U(100 + n);
@@ -214,4 +215,28 @@ test('a signal during a local command lets it finish, releases the lock and exit
   assert.equal(await exited, 130);
   assert.match(stdout, /finishing the current step/);
   assert.ok(!fs.existsSync(lock), 'the lock was released, so the command ran to its end');
+});
+
+test('locally a first signal lets the step finish; a second SIGINT exits at once, a second SIGTERM does not', () => {
+  const run = (sigs, ctx) => {
+    const out = { exits: [], lines: [], aborted: 0, withdrawn: [] };
+    const sp = { withdraw: (id) => { out.withdrawn.push(id); return true; } };
+    const on = commandSignals(ctx, { abort: { abort: () => { out.aborted += 1; } }, sp, print: (l) => out.lines.push(l), exit: (c) => out.exits.push(c) });
+    for (const sg of sigs) on(sg);
+    return out;
+  };
+  const local = () => ({ reqId: null, local: true, interrupted: false });
+  let ctx = local();
+  let r = run(['SIGINT'], ctx);
+  assert.deepEqual([r.exits, ctx.interrupted, r.aborted], [[], true, 1]);
+  assert.match(r.lines[0], /finishing the current step first \(Ctrl-C again to exit now\)/);
+  r = run(['SIGINT', 'SIGINT'], local());
+  assert.deepEqual(r.exits, [130]);
+  assert.match(r.lines.at(-1), /exiting now/);
+  r = run(['SIGINT', 'SIGTERM', 'SIGTERM'], local());
+  assert.deepEqual([r.exits, r.lines.length], [[], 1]);
+  r = run(['SIGTERM', 'SIGINT'], local());
+  assert.deepEqual(r.exits, [130]);
+  r = run(['SIGINT'], { reqId: 'x', local: false, interrupted: false });
+  assert.deepEqual([r.exits, r.withdrawn, r.lines], [[130], ['x'], ['request withdrawn']]);
 });
