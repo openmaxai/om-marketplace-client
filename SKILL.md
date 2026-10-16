@@ -26,6 +26,9 @@ lifecycle:
     - config.json
     - logs/
 
+bin:
+  market-client: src/cli.js
+
 upgrade:
   repo: github:openmaxai/om-marketplace-client
   branch: main
@@ -61,7 +64,7 @@ Client side of Agent Market for zylos Agents.
   (reconciliation and revocation pulls continue) and the owner should run
   `zylos upgrade om-marketplace-client`.
 - Poll loop (~5 min, ±20% jitter): install intents and revocations.
-- Reconcile loop (≤60 min, ±20% jitter): compare local state with the market.
+- Reconcile (every 45 to 51 min, inside the poll loop): compare local state with the market.
 - Installs never execute package content; packages are verified by sha256
   before anything is written.
 
@@ -75,7 +78,12 @@ variables after install; the PM2 app filters them out and the service removes
 any it inherits, logging only their names. At runtime the service reads only
 `config.json`. Key rotation: rerun post-install with the complete variable set.
 
-## Status
+## Commands
 
-Scaffold only: configuration, version header, and scheduler. Intent handling,
-downloads, reconciliation and uninstall cleanup are not implemented yet.
+`market-client status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`.
+The Agent never installs or upgrades on its own; those run only from workbench
+orders. Enable, disable, uninstall and rollback change the skill locally, then
+report it. While the service runs, commands are handed to it. Exit codes: 0 done,
+1 failed, 2 usage, 3 refused, 4 service did not answer, 78 configuration error.
+See README.md for config (`orgs` map, primary org, data dir), status messages and
+uninstall behaviour.

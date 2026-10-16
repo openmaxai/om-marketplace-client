@@ -5,8 +5,10 @@ placed in the Agent Market workbench, installs the approved skills and expert
 templates into this Agent after sha256 verification, and reports the result
 back to the market.
 
-> Status: scaffold. Configuration and the service skeleton are in place;
-> install, download, and reconciliation logic is not implemented yet.
+Only a person decides what is installed or upgraded: install and upgrade run
+only from orders placed in the workbench. Enable, disable, uninstall and
+rollback can also be run locally with `market-client`; the change is made
+first and then reported to the market.
 
 ## Install
 
@@ -62,12 +64,73 @@ rewrites the whole `config.json`. Then unset the variables and run
 If the data directory already exists it must be mode 0700; the hook refuses to
 write into a directory that is accessible by group or other.
 
-## One instance per data directory
+## Configuration file
 
-A lock file under `state/` admits one running client per data directory. Do not
-share a data directory between containers: processes in different PID
-namespaces cannot see each other, so two containers that both run the client
-as PID 1 would each treat the other's lock as their own stale lock.
+`~/zylos/components/om-marketplace-client/config.json` (the data directory;
+`OM_MARKETPLACE_CLIENT_HOME` overrides it). Besides the post-install fields:
+
+| Field | Meaning |
+|---|---|
+| `org_id`, `member_id` | Primary org and this Agent's member id in it. Revocations are pulled through the primary org; state is kept per BFF origin, primary org and member id, so changing the primary org starts from empty state. |
+| `orgs` | `{"<org_id>": {"member_id": "<id>"}}`: further orgs whose orders this Agent executes. `member_id` may be left out; it is then read from the org-scoped token. Orders from an org not listed are not executed and are reported as `org_not_configured`. Edit by hand, then restart the service; post-install keeps the map. |
+| `log_level` | `debug`, `info` (default), `warn` or `error`. |
+| `storage_emulator_origin` | Development only; accepted only with a loopback `bff_url`. |
+
+## Commands
+
+`market-client` (linked into `~/zylos/bin` on install):
+
+| Command | Effect |
+|---|---|
+| `status [--json]` | Service state, each org's validity, client version gate, last pulls and reconcile, installed skills and templates, queue and outbox sizes, alerts. Reads files only. |
+| `sync` | Runs one poll round now: revocations, orders, outbox resend, reconcile. |
+| `rollback <slug>` | Swaps the version kept by the last upgrade back in (the replaced one is kept instead) and reports `local_rollback` through reconcile. Refused when that version is revoked or an order for the skill is in flight. |
+| `enable <slug>` / `disable <slug>` | Moves the skill into / out of the skills directory, then reports it. A skill disabled because of a revocation cannot be enabled. |
+| `uninstall <slug>` | Removes the skill and its kept versions, then reports it. |
+
+`<slug>` may also be the skill id. Exit codes: 0 done, 1 failed, 2 usage,
+3 refused or not installed, 4 the running service did not answer within
+`--wait <seconds>` (default 900), 78 configuration error. A report the market
+could not take yet is kept and resent; the command still exits 0.
+
+Only one process works on a data directory at a time. When the service is
+running, commands other than `status` are handed to it and run between poll
+rounds; otherwise the command takes the lock and runs itself. A service
+starting meanwhile waits for the lock.
+
+### Status messages
+
+- `suspended`: this Agent's membership in that org is suspended. Its orders
+  are not pulled; for the primary org nothing is pulled at all. Retried hourly
+  and resumed automatically.
+- `invalid`: the Agent has left that org. Ask the org admin to re-add it, or
+  change the primary org. Installed content is left as it is.
+- `client version: TOO OLD`: the market requires a newer client (or its skill
+  policy differs from the pinned one). New orders are not executed; revocations
+  and reconcile continue. Run `zylos upgrade om-marketplace-client`.
+- `revocations ... STALE`: no successful revocation pull for over 24 hours.
+- Alerts stay listed until the condition clears.
+
+## Operational notes
+
+- One container per data directory. A lock file under `state/` admits one
+  process per data directory, but processes in different PID namespaces cannot
+  see each other, so two containers that both run the client as PID 1 would
+  each treat the other's lock as their own stale lock.
+- Installing or upgrading a skill or template may cause the Agent to restart
+  or to pick up the change only in its next session.
+- Revoked versions are moved to `quarantine/` and never deleted; the revoked
+  set is never cleared.
+
+## Uninstall
+
+`zylos uninstall om-marketplace-client` runs the pre-uninstall hook, which
+stops the service, moves every market-managed skill and template into
+`quarantine/` in the data directory, clears the template slots, removes the
+four `market-template-*` shard declarations and runs the zylos hook sync, and
+reports `client_uninstalled` to each configured org (at most 10 seconds). It
+never blocks the uninstall. Keep the data directory (no `--purge`) to keep the
+quarantined content and the revoked set.
 
 ## Upgrade
 
