@@ -23,9 +23,8 @@ const U32_MAX = 0xffffffff;
 // Metadata-only extra fields (timestamps, ownership). Anything else, notably 0x7075 (Unicode path) and 0x0001 (zip64), is rejected.
 const ALLOWED_EXTRA = new Set([0x5455, 0x7875, 0x000a]);
 
-// "Version made by" hosts whose attributes a reader may interpret as MS-DOS (0x10 = directory) or Unix mode bits.
+// "Version made by" hosts whose attributes a reader interprets as MS-DOS (0x10 = directory).
 const HOSTS_MSDOS = new Set([0, 11, 14]);
-const HOSTS_UNIX = new Set([3, 19]);
 const S_IFMT = 0xf000;
 const S_IFDIR = 0x4000;
 const S_IFREG = 0x8000;
@@ -61,8 +60,9 @@ export function crc32(buf) {
 function checkLayout(buf) {
   if (buf.length < EOCD_LEN) throw invalid('too short for a zip');
   const lo = Math.max(0, buf.length - EOCD_LEN - 0xffff);
-  const pos = buf.lastIndexOf(SIG_EOCD);
-  if (pos < lo) throw invalid('no end of central directory');
+  const rel = buf.subarray(lo).lastIndexOf(SIG_EOCD);
+  if (rel < 0) throw invalid('no end of central directory');
+  const pos = lo + rel;
   if (pos + EOCD_LEN > buf.length) throw invalid('truncated end of central directory');
   const disk = buf.readUInt16LE(pos + 4);
   const cdDisk = buf.readUInt16LE(pos + 6);
@@ -130,7 +130,7 @@ function readCentral(buf, { cdStart, cdEnd, count }) {
   return entries;
 }
 
-// Per-entry central directory checks: encryption, extra fields, method, descriptors, file type, directory data.
+// Per-entry central directory checks: encryption, extra fields, method, descriptors, file type.
 export function checkEntry(e) {
   if (e.flags & FLAG_ENCRYPTED) throw invalid(`encrypted entry ${e.name}`);
   checkExtra(e.name, 'central', e.extra);
@@ -146,6 +146,9 @@ export function checkEntry(e) {
   if (!e.isDir && HOSTS_MSDOS.has(e.madeBy >>> 8) && e.externalAttrs & 0x10) {
     throw invalid(`${e.name}: directory flag and name disagree`);
   }
+}
+
+export function checkDirectoryData(e) {
   if (e.isDir && (e.method !== METHOD_STORE || e.compressedSize !== 0 || e.size !== 0 || e.crc32 !== 0)) {
     throw invalid(`directory entry ${e.name} has data`);
   }
@@ -199,9 +202,13 @@ export function checkLocalHeaders(buf, entries, cdStart) {
   if (cur !== cdStart) throw invalid('unaccounted bytes before the central directory');
 }
 
-// Validates the whole archive structure without inflating anything. `onEntry` runs first for every entry in central
-// directory order (path checks); `onCentral` runs after all entries passed, before the file count and size caps.
-export function readZip(buf, { onEntry, onCentral } = {}) {
+// Validates the whole archive structure without inflating anything. Check order, which fixes the reported reason when
+// several rules are violated:
+//   entry count; per entry in central directory order: onEntry, checkEntry, onChecked, checkDirectoryData;
+//   then onCentral, file count, onCounted, declared size, local headers.
+// Hooks throw PackageError to reject.
+export function readZip(buf, { onEntry, onChecked, onCentral, onCounted } = {}) {
+  if (!Buffer.isBuffer(buf)) throw new TypeError('readZip expects a Buffer');
   if (buf.length > MAX_PACKAGE_BYTES) throw new PackageError('too_large', `zip is ${buf.length} bytes`);
   if (buf.length === 0) throw invalid('empty body');
   const layout = checkLayout(buf);
@@ -211,6 +218,8 @@ export function readZip(buf, { onEntry, onCentral } = {}) {
   for (const e of entries) {
     if (onEntry) onEntry(e);
     checkEntry(e);
+    if (onChecked) onChecked(e);
+    checkDirectoryData(e);
     if (!e.isDir) {
       files.push(e);
       declared += e.size;
@@ -218,6 +227,7 @@ export function readZip(buf, { onEntry, onCentral } = {}) {
   }
   if (onCentral) onCentral(entries, files);
   if (files.length > MAX_PACKAGE_FILES) throw new PackageError('too_many_files', `${files.length} files`);
+  if (onCounted) onCounted(entries, files);
   if (declared > MAX_PACKAGE_BYTES) throw new PackageError('too_large', `declared uncompressed size ${declared}`);
   checkLocalHeaders(buf, entries, layout.cdStart);
   return { entries, files };
@@ -253,6 +263,7 @@ export function readEntry(buf, e, budget = MAX_PACKAGE_BYTES) {
 }
 
 // Yields [entry, content] for every file in central directory order, counting actual output against the total cap.
+// Lazy: size, crc32 and deflate errors surface only while iterating, so read every file before writing any.
 export function* readFiles(buf, files) {
   let total = 0;
   for (const e of files) {

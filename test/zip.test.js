@@ -145,13 +145,21 @@ test('layout: EOCD position, leading/trailing data, zip64, multi-disk, central d
   const cd = z.indexOf('PK\x01\x02', z.indexOf('a.txt') + 6);
   z.writeUInt32LE(0xffffffff, cd + 20);
   rejects(z, 'archive_invalid', 'zip64 central compressed size');
+  // Last central record's comment length runs past the directory into the end record.
+  for (const len of [1, 21]) {
+    const c = buildZip(ok);
+    c.writeUInt16LE(len, c.lastIndexOf('PK\x01\x02') + 32);
+    rejects(c, 'archive_invalid', `central comment crosses the end record by ${len}`);
+  }
 });
 
 test('entry features: encryption, methods, data descriptors on Store', () => {
   const cases = {
     'encrypted': { name: 'e', data: 'x', flags: 1 },
     'encrypted in local header only': { name: 'e', data: 'x', localFlags: 1 },
-    'bzip2': { name: 'b', data: 'x', method: 12 },
+    'bzip2 label, readable deflate data': { name: 'b', data: notes, deflate: true, method: 12 },
+    'method 9 label, readable deflate data': { name: 'b', data: notes, deflate: true, method: 9 },
+    'unknown method, stored data': { name: 'b', data: notes, method: 99 },
     'stored with descriptor': { name: 'n', data: 'PK\x07\x08 fake\n', flags: 0x8, descriptor: true },
     'stored, 0x8 only in local header': { name: 'n', data: notes, localFlags: 0x8, descriptor: true },
     'flag 0x800 only in local header': { name: 'n', data: notes, localFlags: 0x800 },
@@ -175,6 +183,10 @@ test('entry features: encryption, methods, data descriptors on Store', () => {
     'deflate yields less': { name: 'n', data: notes, deflate: true, declSize: notes.length + 1 },
   };
   for (const [name, e] of Object.entries(cases)) rejects(buildZip([SKILL, e]), 'archive_invalid', name);
+  for (const method of [9, 12, 99]) {
+    assert.throws(() => readZip(buildZip([SKILL, { name: 'b', data: notes, deflate: true, method }])),
+      (err) => err.reason === 'archive_invalid' && /compression method/.test(err.detail), `method ${method}`);
+  }
 });
 
 test('extra fields: strict allowlist, local and central', () => {
@@ -245,4 +257,54 @@ test('error messages never carry names from the package', () => {
     assert.equal(err.message, 'package unsafe: link');
     assert.match(err.detail, /secret-name/);
   }
+});
+
+// Each hook throws its own reason, so the reported reason shows which check ran first.
+const hookReasons = {
+  onEntry: 'path_traversal', onChecked: 'invalid_path', onCentral: 'forbidden_path', onCounted: 'npm_dependencies',
+};
+function firstReason(z, hooks) {
+  const opts = {};
+  for (const h of hooks) opts[h] = () => { throw new PackageError(hookReasons[h], h); };
+  try {
+    readZip(z, opts);
+  } catch (err) {
+    assert.ok(err instanceof PackageError, String(err));
+    return err.reason;
+  }
+  return 'ok';
+}
+
+test('check order when several rules are violated', () => {
+  const files = (n) => Array.from({ length: n }, (_, i) => ({ name: `f/${i}.txt`, data: 'x' }));
+  // The faulty entry comes first so per-entry hooks have not yet fired for a clean one.
+  const encrypted = buildZip([{ name: 'e', data: 'x', flags: 1 }, SKILL]);
+  const dirData = buildZip([{ name: 'lib/', payload: [0, 0] }, SKILL]);
+  const tooMany = buildZip([SKILL, ...files(MAX_PACKAGE_FILES)]);
+  const declared = buildZip([SKILL, { name: 'big', data: 'x', declSize: MAX_PACKAGE_BYTES, payload: 'x' }]);
+  const declaredBadLocal = buildZip([SKILL, { name: 'big', data: 'x', declSize: MAX_PACKAGE_BYTES, payload: 'x', localCRC: 1 }]);
+  const dirs = (n) => Array.from({ length: n }, (_, i) => ({ name: `d${i}/`, flags: 1 }));
+  const cases = [
+    ['entry count before onEntry', buildZip([SKILL, ...dirs(MAX_PACKAGE_ENTRIES)]), ['onEntry'], 'too_many_files'],
+    ['onEntry before entry checks', encrypted, ['onEntry', 'onChecked'], 'path_traversal'],
+    ['entry checks before onChecked', encrypted, ['onChecked', 'onCentral'], 'archive_invalid'],
+    ['onChecked before directory data', dirData, ['onChecked'], 'invalid_path'],
+    ['directory data before onCentral', dirData, ['onCentral'], 'archive_invalid'],
+    ['onCentral before file count', tooMany, ['onCentral', 'onCounted'], 'forbidden_path'],
+    ['file count before onCounted', tooMany, ['onCounted'], 'too_many_files'],
+    ['onCounted before declared size', declared, ['onCounted'], 'npm_dependencies'],
+    ['declared size before local headers', declaredBadLocal, [], 'too_large'],
+    ['entry checks before a later entry', buildZip([SKILL, { name: 'e', data: 'x', flags: 1 }, { name: 'b', data: 'x', method: 9 }]), [], 'archive_invalid'],
+  ];
+  for (const [name, z, hooks, want] of cases) assert.equal(firstReason(z, hooks), want, name);
+  const order = [];
+  readZip(buildZip([SKILL, { name: 'lib/' }]), {
+    onEntry: (e) => order.push(`entry ${e.name}`), onChecked: (e) => order.push(`checked ${e.name}`),
+    onCentral: () => order.push('central'), onCounted: () => order.push('counted'),
+  });
+  assert.deepEqual(order, ['entry SKILL.md', 'checked SKILL.md', 'entry lib/', 'checked lib/', 'central', 'counted']);
+});
+
+test('readZip rejects a non-Buffer', () => {
+  assert.throws(() => readZip('PK\x05\x06'), TypeError);
 });
