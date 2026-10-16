@@ -6,7 +6,8 @@
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:crash": "node crash/sweep.mjs"
   },
   "repository": {
     "type": "git",
