@@ -12,11 +12,14 @@ import { createOrgs } from './orgs.js';
 import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
 import { createSkills } from './skills.js';
+import { createTemplates } from './templates.js';
+import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
 
 // Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
-// queued skill intents run. A round is skipped while the token's member id contradicts the configured one.
-export function buildTasks(logger, { revocations, intents, skills, identity, now = Date.now } = {}) {
+// queued skill intents run, then at most one template intent. A round is skipped while the token's member id
+// contradicts the configured one.
+export function buildTasks(logger, { revocations, intents, skills, templates, identity, now = Date.now } = {}) {
   return [
     {
       name: 'poll',
@@ -29,16 +32,32 @@ export function buildTasks(logger, { revocations, intents, skills, identity, now
         } finally {
           await intents.pull();
         }
-        await skills?.runRound();
+        try {
+          await skills?.runRound();
+        } finally {
+          await templates?.runNext();
+        }
         return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
     },
     {
       name: 'reconcile',
       baseMs: RECONCILE_INTERVAL_MS,
-      run: async () => logger.debug('reconcile: not implemented'),
+      run: async () => logger.debug(`reconcile: ${templates?.reconcile().length ?? 0} template discrepancies`),
     },
   ];
+}
+
+// New revocations quarantine installed skills first, then template adoptions. Both always run; a failure is rethrown
+// afterwards so the revocation cursor stays put and the page is enforced again.
+export function revocationEnforcer({ skills, templates }) {
+  return async () => {
+    let failure = null;
+    for (const step of [() => skills?.enforceRevocations(), () => templates()?.sweepRevoked()]) {
+      try { step(); } catch (err) { failure ??= err; }
+    }
+    if (failure) throw failure;
+  };
 }
 
 // Install-time variables must not linger in the service env; only names are logged.
@@ -77,6 +96,7 @@ function identityCheck({ config, auth, state, logger }) {
 // Opens the state store (single-instance lock) and builds the pull loops; aborting `signal` cancels in-flight requests.
 export function createRuntime({
   config, dataDir, logger, fetchImpl, signal = null, skillsDir = path.join(process.env.HOME || os.homedir(), 'zylos', '.claude', 'skills'),
+  zylosDir = defaultZylosDir(),
 }) {
   const state = openState(dataDir, { bffUrl: config.bff_url, orgId: config.org_id, memberId: config.member_id });
   try {
@@ -94,13 +114,19 @@ export function createRuntime({
       api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
       installsAllowed: pinned,
     });
+    let templates = null;
+    const revocations = createRevocationPuller({ api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates }) });
+    templates = createTemplates({
+      api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
+    });
     return {
       state,
       orgs,
       skills,
       identity: identityCheck({ config, auth, state, logger }),
       intents: createIntentPuller({ api, state, orgs, logger }),
-      revocations: createRevocationPuller({ api, state, orgs, logger, enforce: async () => skills.enforceRevocations() }),
+      revocations,
+      templates,
     };
   } catch (err) {
     state.close();

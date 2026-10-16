@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { InstallFailure } from './failure.js';
 import { MarketError, backoffMs } from './http.js';
+import { MAX_PACKAGE_BYTES } from './pkg/zip.js';
 
 export const GCS_HOST = 'storage.googleapis.com';
 export const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
@@ -69,9 +70,10 @@ async function fetchExact({ fetchImpl, url, size, sha, signal, timeoutMs }) {
   return { bytes: Buffer.concat(chunks, total) };
 }
 
-// C-03 then a direct storage download. Storage 403 or an expired URL gets one fresh URL; transient failures are retried
-// a few times and then rethrown. deadlineMs bounds the whole call: every C-03 call, storage fetch and retry wait; running
-// past it throws a transient error. Throws InstallFailure for anything that must be reported.
+// C-03 (or C-04) then a direct storage download. size null takes the size from the signed link, capped at 20 MiB.
+// Storage 403 or an expired URL gets one fresh URL; transient failures are retried a few times and then rethrown.
+// deadlineMs bounds the whole call: every C-03/C-04 call, storage fetch and retry wait; running past it throws a
+// transient error. Throws InstallFailure for anything that must be reported.
 export async function downloadPackage({
   api, orgId, subPath, sha, size, emulatorOrigin = null, fetchImpl = globalThis.fetch, now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)), signal = null, timeoutMs = DOWNLOAD_TIMEOUT_MS,
@@ -121,11 +123,14 @@ export async function downloadPackage({
         continue;
       }
       urls++;
-      if (link.sha256 !== sha || link.size !== size) throw internal('download_metadata_mismatch');
+      if (link.sha256 !== sha || (size !== null && link.size !== size)) throw internal('download_metadata_mismatch');
+      if (link.size > MAX_PACKAGE_BYTES) throw new InstallFailure('PACKAGE_UNSAFE', 'too_large');
       if (!downloadUrlAllowed(link.download_url, emulatorOrigin)) throw internal('download_host_refused');
       continue;
     }
-    const r = await fetchExact({ fetchImpl, url: link.download_url, size, sha, signal, timeoutMs: Math.ceil(Math.min(timeoutMs, left())) });
+    const r = await fetchExact({
+      fetchImpl, url: link.download_url, size: size ?? link.size, sha, signal, timeoutMs: Math.ceil(Math.min(timeoutMs, left())),
+    });
     if (r instanceof InstallFailure) throw r;
     if (r.bytes) return r.bytes;
     if (r.expired) link = null;

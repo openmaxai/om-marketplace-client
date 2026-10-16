@@ -190,6 +190,19 @@ export function createMarketApi({ http }) {
       });
     },
 
+    // C-15; body is sent as given so a resend is identical.
+    async reportTemplateResult({ orgId, agentId, adoptionId, body }) {
+      if (!isOrgOrMemberId(agentId) || !isCanonicalUuid(adoptionId)) throw new TypeError('invalid agentId or adoptionId');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/adoptions/${adoptionId}/write-results`, body);
+      return validated('write-results', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const out = pick(object(data, 'body'), 'body', { adoption_id: uuid, status: text(64), outcome: oneOf(new Set(['applied', 'stale'])) });
+        if (out.adoption_id !== adoptionId) fail('body.adoption_id', 'does not match the request');
+        out.error_code = typeof data.error_code === 'string' ? data.error_code : null;
+        return out;
+      });
+    },
+
     async pullRevocations({ orgId, cursor: from = null }) {
       if (from !== null && !isRevocationCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
       const r = await http.request('POST', orgId, '/revocations:query', from === null ? {} : { cursor: from });

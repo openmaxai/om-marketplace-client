@@ -121,7 +121,7 @@ function checkNames(skillsDir, slug, own) {
   }
 }
 
-function writeConfined(root, rel, data) {
+export function writeConfined(root, rel, data) {
   const segs = rel.split('/');
   if (segs.some((s) => s === '' || s === '.' || s === '..')) throw new InstallFailure('CLIENT_INTERNAL', 'client internal error');
   let dir = root;
@@ -142,7 +142,7 @@ function writeConfined(root, rel, data) {
 }
 
 // Manifest of what is on disk under root; any link or special file fails.
-function scan(root, rel = '', out = []) {
+export function scan(root, rel = '', out = []) {
   for (const ent of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
     const p = rel ? `${rel}/${ent.name}` : ent.name;
     if (ent.isDirectory()) scan(root, p, out);

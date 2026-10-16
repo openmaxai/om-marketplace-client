@@ -131,12 +131,13 @@ function readCentral(buf, { cdStart, cdEnd, count }) {
   return entries;
 }
 
-// Per-entry central directory checks: encryption, extra fields, method, descriptors, file type.
-export function checkEntry(e) {
+// Per-entry central directory checks: encryption, extra fields, method, descriptors, file type. Template bundles are
+// written by Go's archive/zip, which gives stored entries a data descriptor; storedDescriptor admits that.
+export function checkEntry(e, { storedDescriptor = false } = {}) {
   if (e.flags & FLAG_ENCRYPTED) throw invalid(`encrypted entry ${e.name}`);
   checkExtra(e.name, 'central', e.extra);
   if (e.method !== METHOD_STORE && e.method !== METHOD_DEFLATE) throw invalid(`unsupported compression method ${e.method}`);
-  if (e.method === METHOD_STORE && e.flags & FLAG_DESCRIPTOR) throw invalid(`stored entry ${e.name} uses a data descriptor`);
+  if (e.method === METHOD_STORE && e.flags & FLAG_DESCRIPTOR && !storedDescriptor) throw invalid(`stored entry ${e.name} uses a data descriptor`);
   // Unix file type in the upper 16 bits is honoured by common extractors regardless of the "made by" host.
   const unixType = (e.externalAttrs >>> 16) & S_IFMT;
   if (unixType !== 0 && unixType !== S_IFREG && unixType !== S_IFDIR) {
@@ -208,7 +209,7 @@ export function checkLocalHeaders(buf, entries, cdStart) {
 //   entry count; per entry in central directory order: onEntry, checkEntry, onChecked, checkDirectoryData;
 //   then onCentral, file count, onCounted, declared size, local headers.
 // Hooks throw PackageError to reject.
-export function readZip(buf, { onEntry, onChecked, onCentral, onCounted } = {}) {
+export function readZip(buf, { onEntry, onChecked, onCentral, onCounted, storedDescriptor = false } = {}) {
   if (!Buffer.isBuffer(buf)) throw new TypeError('readZip expects a Buffer');
   if (buf.length > MAX_PACKAGE_BYTES) throw new PackageError('too_large', `zip is ${buf.length} bytes`);
   if (buf.length === 0) throw invalid('empty body');
@@ -218,7 +219,7 @@ export function readZip(buf, { onEntry, onChecked, onCentral, onCounted } = {}) 
   let declared = 0;
   for (const e of entries) {
     if (onEntry) onEntry(e);
-    checkEntry(e);
+    checkEntry(e, { storedDescriptor });
     if (onChecked) onChecked(e);
     checkDirectoryData(e);
     if (!e.isDir) {
