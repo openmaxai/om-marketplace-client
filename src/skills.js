@@ -560,6 +560,39 @@ export function createSkills({
       return outcomes;
     },
 
+    // Read-only view for reconcile: the inventory, the recorded skills whose directory is in place, market-managed
+    // directories without a record, and skills with an intent or report still in flight.
+    localScan() {
+      const recs = installs();
+      const present = new Set(Object.keys(recs).filter((id) => readMarker(dirOf(recs[id].slug, recs[id].state))?.skill_id === id));
+      const orphans = [];
+      for (const where of ['enabled', 'disabled']) {
+        let names = [];
+        try { names = fs.readdirSync(areas[where]); } catch { /* none */ }
+        for (const n of names.filter((x) => x.startsWith(SKILL_DIR_PREFIX))) {
+          const m = readMarker(path.join(areas[where], n));
+          if (m && !Object.hasOwn(recs, m.skill_id)) orphans.push(m);
+        }
+      }
+      const busy = new Set(state.read('intents', EMPTY_INTENTS).queue
+        .filter((q) => q.skill_id && (q.status === 'queued' || q.status === 'running')).map((q) => q.skill_id));
+      for (const id of state.outbox.list()) {
+        const o = state.outbox.get(id);
+        const sid = o?.skill_id ?? state.journal.get(id)?.response?.skill_id;
+        if (sid) busy.add(sid);
+      }
+      return { recs, present, orphans, busy };
+    },
+
+    // Drops the kept previous version; reconcile calls it once the market matches the installed version.
+    releaseRollback(skillId) {
+      const rec = installs()[skillId];
+      if (!rec?.rollback) return false;
+      fs.rmSync(path.join(dataDir, 'rollback', rec.slug), { recursive: true, force: true });
+      putRec(skillId, { ...rec, rollback: null });
+      return true;
+    },
+
     setEnabled: (skillId, enabled) => local(enabled ? 'enable' : 'disable', skillId),
     uninstall: (skillId) => local('uninstall', skillId),
     installed: installs,

@@ -5,6 +5,8 @@ import { validSlug } from './pkg/frontmatter.js';
 export const INTENT_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall', 'write_template']);
 export const REVOCATION_KINDS = new Set(['version_revoke', 'template_revoke', 'shelf_revoke', 'sha_block']);
 export const MAX_INTENT_LIMIT = 100;
+const INSTALL_STATES = new Set(['installing', 'installed', 'failed']);
+const RECONCILE_OUTCOMES = new Set(['recorded', 'skipped']);
 // <revocation log epoch (canonical UUID)>:<seq as int64 decimal without leading zeros>, as the server writes it.
 const CURSOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:(0|[1-9]\d{0,18})$/;
 const INT64_MAX = 2n ** 63n - 1n;
@@ -200,6 +202,35 @@ export function createMarketApi({ http }) {
         if (out.adoption_id !== adoptionId) fail('body.adoption_id', 'does not match the request');
         out.error_code = typeof data.error_code === 'string' ? data.error_code : null;
         return out;
+      });
+    },
+
+    // C-12: the agent's installs in orgId.
+    async listInstalls({ orgId, agentId }) {
+      if (!isOrgOrMemberId(agentId)) throw new TypeError('invalid agentId');
+      const r = await http.request('GET', orgId, `/agents/${encodeURIComponent(agentId)}/skills`);
+      return validated('skills', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        return array(object(data, 'body').items, 'body.items').map((it, i) => pick(object(it, `body.items[${i}]`), `body.items[${i}]`, {
+          install_id: uuid, skill_id: uuid, slug, skill_version_id: uuid, version_no: posInt, source_market_id: uuid,
+          install_state: oneOf(INSTALL_STATES), enabled: bool,
+        }));
+      });
+    },
+
+    // C-10: resolves to one outcome per item, in item order.
+    async reportReconcile({ orgId, agentId, items }) {
+      if (!isOrgOrMemberId(agentId)) throw new TypeError('invalid agentId');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/reconcile`, { items });
+      return validated('reconcile', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const results = array(object(data, 'body').results, 'body.results');
+        if (results.length !== items.length) fail('body.results', 'does not match the items');
+        return results.map((x, i) => {
+          const o = pick(object(x, `body.results[${i}]`), `body.results[${i}]`, { index: uint, outcome: oneOf(RECONCILE_OUTCOMES) });
+          if (o.index !== i) fail(`body.results[${i}].index`, 'is out of order');
+          return o.outcome;
+        });
       });
     },
 
