@@ -219,8 +219,10 @@ test('a C-03 call still running at the deadline is aborted, not only abandoned',
       return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new MarketError('aborted', { code: 'NETWORK_ERROR', transient: true }))));
     },
   };
+  const t0 = Date.now();
   await within(assert.rejects(downloadPackage({ api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, deadlineMs: 200 }), overdue),
     5000, 'C-03 call');
+  assert.ok(Date.now() - t0 < 2000);
   assert.ok(seen?.aborted);
 });
 
