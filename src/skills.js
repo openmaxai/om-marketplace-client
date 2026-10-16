@@ -534,6 +534,40 @@ export function createSkills({
     return n;
   }
 
+  function busySkills() {
+    const busy = new Set(state.read('intents', EMPTY_INTENTS).queue
+      .filter((q) => q.skill_id && (q.status === 'queued' || q.status === 'running')).map((q) => q.skill_id));
+    const peek = (kind, id) => { try { return state[kind].get(id); } catch (err) { if (err instanceof StateError) return null; throw err; } };
+    for (const id of state.outbox.list()) {
+      const sid = peek('outbox', id)?.skill_id ?? peek('journal', id)?.response?.skill_id;
+      if (sid) busy.add(sid);
+    }
+    return busy;
+  }
+
+  // Swaps the version kept by the last upgrade back in; the replaced one takes its place in the rollback area. The
+  // market learns of it through reconcile (local_rollback). Returns 'done', 'none', 'revoked', 'busy' or 'quarantined'.
+  function rollback(skillId) {
+    const rec = installs()[skillId];
+    if (!rec) throw new Error(`skill ${skillId} is not installed`);
+    if (rec.state === 'revoked_disabled') return 'quarantined';
+    if (busySkills().has(skillId)) return 'busy';
+    const prev = rec.rollback;
+    const src = prev ? rollbackDir(rec.slug, prev.version_no) : null;
+    const m = src ? readMarker(src) : null;
+    if (m?.skill_id !== skillId || m.version_no !== prev.version_no) return 'none';
+    if (isRevoked({ skill_version_id: prev.skill_version_id, package_sha256: m.package_sha256 })) return 'revoked';
+    const cur = dirOf(rec.slug, rec.state);
+    if (!moveDir(cur, rollbackDir(rec.slug, rec.version_no), skillId)) return 'none';
+    fs.renameSync(src, cur);
+    putRec(skillId, {
+      ...rec, skill_version_id: prev.skill_version_id, version_no: prev.version_no, package_sha256: m.package_sha256, rolled_back_at: iso(),
+      rollback: { version_no: rec.version_no, skill_version_id: rec.skill_version_id },
+    });
+    logger.info(`skill ${rec.slug} rolled back from version ${rec.version_no} to ${prev.version_no}`);
+    return 'done';
+  }
+
   return {
     enforceRevocations,
 
@@ -574,14 +608,7 @@ export function createSkills({
           if (m && !Object.hasOwn(recs, m.skill_id)) orphans.push(m);
         }
       }
-      const busy = new Set(state.read('intents', EMPTY_INTENTS).queue
-        .filter((q) => q.skill_id && (q.status === 'queued' || q.status === 'running')).map((q) => q.skill_id));
-      const peek = (kind, id) => { try { return state[kind].get(id); } catch (err) { if (err instanceof StateError) return null; throw err; } };
-      for (const id of state.outbox.list()) {
-        const sid = peek('outbox', id)?.skill_id ?? peek('journal', id)?.response?.skill_id;
-        if (sid) busy.add(sid);
-      }
-      return { recs, present, orphans, busy };
+      return { recs, present, orphans, busy: busySkills() };
     },
 
     // Drops the kept previous version; reconcile calls it once the market matches the installed version skillVersionId.
@@ -597,6 +624,7 @@ export function createSkills({
       return true;
     },
 
+    rollback,
     setEnabled: (skillId, enabled) => local(enabled ? 'enable' : 'disable', skillId),
     uninstall: (skillId) => local('uninstall', skillId),
     installed: installs,
