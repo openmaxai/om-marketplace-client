@@ -40,6 +40,19 @@ function lstatOrNull(p) {
   try { return fs.lstatSync(p); } catch (err) { if (err.code === 'ENOENT') return null; throw err; }
 }
 
+// At most max bytes from fd, or null when there are more: the file may grow after fstat.
+function readCapped(fd, max) {
+  if (max === Infinity) return fs.readFileSync(fd);
+  const buf = Buffer.alloc(max + 1);
+  let n = 0;
+  while (n < buf.length) {
+    const got = fs.readSync(fd, buf, n, buf.length - n, null);
+    if (got === 0) break;
+    n += got;
+  }
+  return n > max ? null : buf.subarray(0, n);
+}
+
 // Reads a regular file without following a final symlink; null when absent, a link, not a regular file, or larger than
 // max. O_NONBLOCK keeps a FIFO from blocking the open.
 function readNoFollow(file, max) {
@@ -47,7 +60,7 @@ function readNoFollow(file, max) {
   try {
     fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     const st = fs.fstatSync(fd);
-    return st.isFile() && st.size <= max ? fs.readFileSync(fd) : null;
+    return st.isFile() && st.size <= max ? readCapped(fd, max) : null;
   } catch {
     return null;
   } finally {
@@ -80,22 +93,30 @@ function targetState(target, skillId) {
   return 'ours';
 }
 
-// A directory, or a link that resolves to one: local tools load linked skills, so their names count. Dangling and
-// unreadable links and links to anything else are compared by entry name only.
-function isSkillDir(dir, ent) {
-  if (ent.isDirectory()) return true;
-  if (!ent.isSymbolicLink()) return false;
-  try { return fs.statSync(dir).isDirectory(); } catch { return false; }
+// The stat of a directory, or of what a link resolves to when that is a directory: local tools load linked skills, so
+// their names count. null for dangling and unreadable links and links to anything else, compared by entry name only.
+function skillDirStat(dir, ent) {
+  if (!ent.isDirectory() && !ent.isSymbolicLink()) return null;
+  try {
+    const st = fs.statSync(dir);
+    return st.isDirectory() ? st : null;
+  } catch {
+    return null;
+  }
 }
 
 // The slug may not be the name of any other local skill directory or of any local SKILL.md. Linked skills are only read;
-// SKILL.md itself is opened without following a final link.
+// SKILL.md itself is opened without following a final link. A link that resolves to our own target is an alias of this
+// skill, not another one.
 function checkNames(skillsDir, slug, own) {
+  const ownSt = lstatOrNull(path.join(skillsDir, own));
   for (const ent of fs.readdirSync(skillsDir, { withFileTypes: true })) {
     if (ent.name === own) continue;
     if (ent.name.toLowerCase() === slug) throw conflict('name_taken');
     const dir = path.join(skillsDir, ent.name);
-    if (isSkillDir(dir, ent) && localSkillName(path.join(dir, 'SKILL.md')) === slug) throw conflict('name_taken');
+    const st = skillDirStat(dir, ent);
+    if (!st || (ownSt && st.dev === ownSt.dev && st.ino === ownSt.ino)) continue;
+    if (localSkillName(path.join(dir, 'SKILL.md')) === slug) throw conflict('name_taken');
   }
 }
 

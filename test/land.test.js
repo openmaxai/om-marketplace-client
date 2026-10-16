@@ -10,6 +10,7 @@ import { skillMd, skillPackage } from './fake/package.js';
 import { buildZip } from './fake/zip.js';
 import { U } from './fake/pull.js';
 import { MARKER, failureFor, landSkill, skillNameReserved } from '../src/land.js';
+import { MAX_SKILL_MD_BYTES } from '../src/pkg/frontmatter.js';
 import { inspectInWorker } from '../src/inspect.js';
 import { inspectPackage } from '../src/pkg/hygiene.js';
 import { PackageError } from '../src/pkg/zip.js';
@@ -315,4 +316,48 @@ test('a timed-out worker is terminated', async (t) => {
     t.mock.timers.reset();
     beats.close();
   }
+});
+
+test('a link aliasing our own target does not block an upgrade or a reinstall and is left as it is', () => {
+  const { home, skillsDir, land, target } = setup();
+  land();
+  const alias = path.join(skillsDir, 'alias');
+  fs.symlinkSync('market--demo-skill', alias);
+  const v2 = skillPackage('demo-skill', { 'docs/guide.md': 'v2\n' });
+  const r = land({ version_no: 2, package_sha256: v2.sha, file_manifest: v2.manifest }, inspectPackage(v2.zip));
+  assert.equal(r.previous, path.join(home, 'data', 'rollback', 'demo-skill', '1'));
+  assert.equal(fs.readFileSync(path.join(target, 'docs/guide.md'), 'utf8'), 'v2\n');
+  assert.equal(land({ version_no: 2, package_sha256: v2.sha, file_manifest: v2.manifest }, inspectPackage(v2.zip)).previous,
+    path.join(home, 'data', 'rollback', 'demo-skill', '2'));
+  assert.equal(fs.readlinkSync(alias), 'market--demo-skill');
+  assert.equal(fs.readFileSync(path.join(alias, 'docs/guide.md'), 'utf8'), 'v2\n');
+});
+
+test('a local SKILL.md over the size cap is not read; one at the cap is', () => {
+  const sized = (n) => {
+    const md = skillMd('demo-skill');
+    return md + 'x'.repeat(n - Buffer.byteLength(md));
+  };
+  for (const [size, conflict] of [[MAX_SKILL_MD_BYTES + 1, false], [MAX_SKILL_MD_BYTES, true]]) {
+    const { skillsDir, land } = setup();
+    fs.mkdirSync(path.join(skillsDir, 'other'));
+    fs.writeFileSync(path.join(skillsDir, 'other', 'SKILL.md'), sized(size));
+    if (conflict) assert.throws(() => land(), failsWith('INSTALL_TARGET_CONFLICT', 'name_taken'), String(size));
+    else assert.equal(land().previous, null, String(size));
+  }
+});
+
+test('a local SKILL.md is read only up to the cap, whatever fstat reported', (t) => {
+  const { skillsDir, land } = setup();
+  fs.mkdirSync(path.join(skillsDir, 'other'));
+  const md = path.join(skillsDir, 'other', 'SKILL.md');
+  fs.writeFileSync(md, skillMd('demo-skill') + 'x'.repeat(MAX_SKILL_MD_BYTES));
+  const opened = new Map();
+  const { openSync, fstatSync } = fs;
+  t.mock.method(fs, 'openSync', (...a) => { const fd = openSync(...a); opened.set(fd, String(a[0])); return fd; });
+  t.mock.method(fs, 'fstatSync', (fd, ...a) => {
+    const st = fstatSync(fd, ...a);
+    return opened.get(fd) === md ? Object.assign(Object.create(st), { size: 10 }) : st;
+  });
+  assert.equal(land().previous, null);
 });
