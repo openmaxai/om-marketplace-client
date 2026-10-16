@@ -21,20 +21,23 @@ export function tooOld(state) {
   return state.read('gate', EMPTY_GATE).too_old;
 }
 
+// Any version-gated call may answer CLIENT_VERSION_TOO_OLD.
+export function enterTooOldMode(state, logger, reason, minVersion, policySha = null, at = new Date().toISOString()) {
+  const gate = state.read('gate', EMPTY_GATE);
+  gate.too_old = { reason, min_version: minVersion, since: gate.too_old?.since ?? at };
+  if (policySha) gate.policy_sha256 = policySha;
+  state.write('gate', gate);
+  const msg = reason === POLICY_MISMATCH
+    ? `market skill policy ${policySha} differs from the pinned policy; this client must be upgraded`
+    : `market rejected this client version (${reason}${minVersion ? `, minimum ${minVersion}` : ''}); upgrade the client`;
+  if (state.setAlert('client_too_old', msg)) logger.warn(`${msg}; no new install intents will be executed`);
+}
+
 export function createIntentPuller({ api, state, orgs, logger, now = Date.now }) {
   const iso = () => new Date(now()).toISOString();
   let notBefore = 0;
 
-  function enterTooOld(reason, minVersion, policySha) {
-    const gate = state.read('gate', EMPTY_GATE);
-    gate.too_old = { reason, min_version: minVersion, since: gate.too_old?.since ?? iso() };
-    if (policySha) gate.policy_sha256 = policySha;
-    state.write('gate', gate);
-    const msg = reason === POLICY_MISMATCH
-      ? `market skill policy ${policySha} differs from the pinned policy; this client must be upgraded`
-      : `market rejected this client version (${reason}${minVersion ? `, minimum ${minVersion}` : ''}); upgrade the client`;
-    if (state.setAlert('client_too_old', msg)) logger.warn(`${msg}; no new install intents will be executed`);
-  }
+  const enterTooOld = (reason, minVersion, policySha) => enterTooOldMode(state, logger, reason, minVersion, policySha, iso());
 
   function leaveTooOld(policySha) {
     const gate = state.read('gate', EMPTY_GATE);

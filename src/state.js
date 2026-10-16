@@ -271,6 +271,15 @@ function collection(dir) {
       try { fs.unlinkSync(file(id)); } catch (err) { if (err.code !== 'ENOENT') throw err; }
       fsyncDir(dir);
     },
+    // Moves an unreadable entry to <state dir>/corrupt/ so it stops being read; it is kept for inspection.
+    quarantine(id) {
+      const aside = path.join(path.dirname(dir), 'corrupt');
+      ensureDir(aside);
+      const to = path.join(aside, `${path.basename(dir)}-${id}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
+      try { fs.renameSync(file(id), to); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      fsyncDir(dir);
+      fsyncDir(aside);
+    },
     list() {
       let names;
       try { names = fs.readdirSync(dir); } catch (err) { if (err.code === 'ENOENT') return []; throw err; }
