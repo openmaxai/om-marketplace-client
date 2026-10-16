@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { skillPackage } from './fake/package.js';
-import { C02, SKILL, crashingState, skillHarness } from './fake/skills.js';
+import { C02, Crash, SKILL, VID, crashingState, skillHarness } from './fake/skills.js';
 
 const phase = (p) => (kind, _id, rec) => (kind === 'journal' && rec?.phase === p ? 'after' : false);
 const write = (k, name, when) => (kind, n) => (kind === k && n === name ? when : false);
@@ -102,4 +102,67 @@ test('a crash after a refused success was rolled back but before the outbox entr
   assert.equal(h.marker().version_no, 1);
   assert.equal(h.state.read('installs', {})[SKILL].version_no, 1);
   assert.deepEqual([h.state.outbox.list(), h.state.read('intents', null).queue], [[], []]);
+});
+
+test('a version revoked while the process was down after landing is reported VERSION_REVOKED and the old one comes back', async (t) => {
+  const { h, rid } = await crashUpgrade(t, write('update', 'installs', 'before'));
+  assert.equal(h.marker().version_no, 2);
+  h.state.write('revoked', { skill_version_id: [VID(2)] });
+  assert.deepEqual(await h.make().runRound(), ['failed']);
+  assert.deepEqual(h.sent(`/install-requests/${rid}/result`).map((r) => r.json),
+    [{ status: 'failed', error_code: 'VERSION_REVOKED', error_message: 'version_revoked' }]);
+  assert.equal(h.marker().version_no, 1);
+  const rec = h.state.read('installs', {})[SKILL];
+  assert.deepEqual([rec.version_no, rec.state], [1, 'enabled']);
+  const q = path.join(h.dataDir, 'quarantine', 'market--demo-skill');
+  assert.deepEqual(fs.readdirSync(q), [`2-${VID(2)}`]);
+});
+
+// rmSync that deletes the marker first and then dies, like a recursive delete killed part way.
+function dyingRm(t) {
+  const real = fs.rmSync;
+  let dead = false;
+  t.mock.method(fs, 'rmSync', (p, opts) => {
+    if (dead || !fs.existsSync(path.join(p, '.market-managed'))) return real(p, opts);
+    dead = true;
+    fs.unlinkSync(path.join(p, '.market-managed'));
+    throw new Crash('rm');
+  });
+  return () => t.mock.restoreAll();
+}
+
+test('an uninstall dying inside the recursive delete leaves nothing in skills/ and finishes on restart', async (t) => {
+  const h = await skillHarness(t);
+  await h.queue(['install', 1]);
+  await h.make().runRound();
+  await h.queue(['uninstall']);
+  const restore = dyingRm(t);
+  assert.deepEqual(await h.make().runRound(), ['deferred']);
+  restore();
+  assert.equal(fs.existsSync(h.target), false);
+  assert.deepEqual(await h.make().runRound(), ['done']);
+  assert.equal(h.state.read('installs', {})[SKILL], undefined);
+  assert.deepEqual(fs.readdirSync(path.join(h.dataDir, 'trash')), []);
+});
+
+test('a rollback dying inside the delete of the refused version still restores the old one on restart', async (t) => {
+  const h = await skillHarness(t, { versions: { 1: skillPackage(), 2: skillPackage('demo-skill', { 'docs/guide.md': 'v2\n' }) } });
+  await h.queue(['install', 1]);
+  await h.make().runRound();
+  let restore = () => {};
+  h.over.c06.push((req) => {
+    const r = h.reqs.get(req.path.split('/')[6]);
+    Object.assign(r, { status: 'failed', result: req.body, reply: { request_id: req.path.split('/')[6], status: 'failed', error_code: 'PACKAGE_MISMATCH' } });
+    restore = dyingRm(t);
+    return { status: 200, json: r.reply };
+  });
+  await h.queue(['upgrade', 2]);
+  assert.deepEqual(await h.make().runRound(), ['deferred']);
+  restore();
+  assert.notEqual(h.marker()?.version_no, 2);
+  assert.deepEqual(await h.make().runRound(), []);
+  assert.equal(h.marker().version_no, 1);
+  assert.equal(fs.readFileSync(path.join(h.target, 'docs/guide.md'), 'utf8'), 'guide\n');
+  assert.equal(h.state.read('installs', {})[SKILL].version_no, 1);
+  assert.deepEqual(fs.readdirSync(path.join(h.dataDir, 'rollback', 'demo-skill')), []);
 });

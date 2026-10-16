@@ -9,6 +9,9 @@ import { checkPackageUrl, downloadPackage } from './download.js';
 import { inspectInWorker } from './inspect.js';
 import { MARKER, SKILL_DIR_PREFIX, failureFor, landSkill } from './land.js';
 import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
+import { InstallFailure } from './failure.js';
+import { StateError } from './state.js';
+import { discard, emptyTrash, fsyncDir } from './trash.js';
 
 export const MAX_INTENTS_PER_ROUND = 20;
 const SKILL_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall']);
@@ -18,6 +21,7 @@ const GONE = new Set(['INTENT_NOT_PENDING', 'INTENT_EXPIRED']);
 // Refused for good; shown to the human as is. The market closes the intent.
 const SHOWN = new Set(['VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED', 'SKILL_ALREADY_INSTALLED', 'INSTALLED_BY_OTHER_ORG']);
 const { O_RDONLY, O_NOFOLLOW } = fs.constants;
+const CORRUPT = Symbol('corrupt');
 
 function readMarker(dir) {
   let fd;
@@ -43,9 +47,16 @@ export function createSkills({
   installsAllowed = true, now = Date.now, sleep, signal = null,
 }) {
   const iso = () => new Date(now()).toISOString();
+  // Quarantine keeps one subdirectory per quarantined copy: quarantine/market--<slug>/<version_no>-<skill_version_id>[.n]/.
   const areas = { enabled: skillsDir, disabled: path.join(dataDir, 'disabled'), revoked_disabled: path.join(dataDir, 'quarantine') };
   const dirOf = (slug, where) => path.join(areas[where], `${SKILL_DIR_PREFIX}${slug}`);
   const rollbackDir = (slug, no) => path.join(dataDir, 'rollback', slug, String(no));
+  const trashRoot = path.join(dataDir, 'trash');
+  const stagingRoot = path.join(dataDir, 'staging');
+  const drop = (dir) => discard(dir, trashRoot);
+  // Nothing is in flight at startup: what a crash left in the trash or in staging goes first.
+  emptyTrash(trashRoot);
+  emptyTrash(stagingRoot);
   const journal = (id, patch) => {
     const j = { ...state.journal.get(id), ...patch, updated_at: iso() };
     state.journal.put(id, j);
@@ -58,17 +69,49 @@ export function createSkills({
   const putRec = (skillId, rec) => state.update('installs', {}, (d) => { if (rec) d[skillId] = rec; else delete d[skillId]; });
   const isRevoked = (rec, revoked = revokedSet(state)) => revoked.has('skill_version_id', rec.skill_version_id) || revoked.blocksSha(rec.package_sha256);
 
-  // Moves a skill directory carrying this skill's marker; false when src is absent or not ours.
+  // Moves a skill directory carrying this skill's marker; false when src is absent or not ours. dst must be absent or a
+  // real directory carrying this skill's marker (that one is discarded); anything else there is INSTALL_TARGET_CONFLICT
+  // and nothing moves.
   function moveDir(src, dst, skillId) {
     if (readMarker(src)?.skill_id !== skillId) return false;
+    if (exists(dst)) {
+      if (readMarker(dst)?.skill_id !== skillId) throw new InstallFailure('INSTALL_TARGET_CONFLICT', 'target_exists');
+      drop(dst);
+    }
     fs.mkdirSync(path.dirname(dst), { recursive: true, mode: 0o700 });
-    fs.rmSync(dst, { recursive: true, force: true });
     fs.renameSync(src, dst);
+    fsyncDir(path.dirname(src));
+    fsyncDir(path.dirname(dst));
     return true;
   }
 
+  const isConflict = (err) => err instanceof InstallFailure && err.code === 'INSTALL_TARGET_CONFLICT';
+
   function removeOurs(dir, skillId) {
-    if (readMarker(dir)?.skill_id === skillId) fs.rmSync(dir, { recursive: true, force: true });
+    if (readMarker(dir)?.skill_id === skillId) drop(dir);
+  }
+
+  // Moves a revoked copy into its own quarantine subdirectory; an earlier copy is never replaced.
+  function quarantine(src, rec, skillId) {
+    const base = dirOf(rec.slug, 'revoked_disabled');
+    const name = `${rec.version_no}-${rec.skill_version_id}`;
+    let dst = path.join(base, name);
+    for (let n = 2; exists(dst); n++) dst = path.join(base, `${name}.${n}`);
+    return moveDir(src, dst, skillId);
+  }
+
+  // Reads a journal or outbox entry. An unreadable one is moved aside with an alert so it no longer holds anything back.
+  function readEntry(kind, id) {
+    try {
+      return state[kind].get(id);
+    } catch (err) {
+      if (!(err instanceof StateError)) throw err;
+      state[kind].quarantine(id);
+      const msg = `${kind} entry ${id} is unreadable; it was moved aside and its request is dropped`;
+      state.setAlert(`corrupt:${kind}:${id}`, msg);
+      logger.error(msg);
+      return CORRUPT;
+    }
   }
 
   // Market error -> 'defer' (retry later with the same id and body), 'gone', 'shown' or 'alert'.
@@ -103,18 +146,55 @@ export function createSkills({
     return m?.skill_id === res.skill_id && m.package_sha256 === res.package_sha256;
   });
 
-  // Puts the replaced version back where it was, when it is still in the rollback area.
-  function restorePrior(prior) {
-    if (!prior || prior.state === 'revoked_disabled' || exists(dirOf(prior.slug, prior.state))) return;
+  const revokedRec = (rec) => ({ ...rec, state: 'revoked_disabled', revoked_at: iso() });
+
+  function revokedAlert(skillId, rec) {
+    const msg = `skill ${rec.slug} version ${rec.version_no} was revoked; it is disabled and quarantined`;
+    state.setAlert(`revoked:${skillId}`, msg);
+    logger.warn(msg);
+  }
+
+  // Puts the version a landing replaced back where it was, unless it is still there; one revoked meanwhile goes to
+  // quarantine instead. Returns the record to keep. Idempotent.
+  function restorePrior(skillId, prior) {
+    if (!prior || prior.state === 'revoked_disabled') return prior;
     const src = rollbackDir(prior.slug, prior.version_no);
-    if (readMarker(src)) fs.renameSync(src, dirOf(prior.slug, prior.state));
+    const live = dirOf(prior.slug, prior.state);
+    const isPrior = (d) => readMarker(d)?.package_sha256 === prior.package_sha256;
+    if (isRevoked(prior)) {
+      for (const d of [live, src]) if (isPrior(d)) quarantine(d, prior, skillId);
+      revokedAlert(skillId, prior);
+      return revokedRec(prior);
+    }
+    if (isPrior(live)) return prior;
+    try {
+      moveDir(src, live, skillId);
+    } catch (err) {
+      if (!isConflict(err)) throw err;
+      const msg = `skill ${prior.slug} version ${prior.version_no} could not be put back: ${live} is not market-managed; it stays in ${src}`;
+      state.setAlert(`conflict:${skillId}`, msg);
+      logger.warn(msg);
+    }
+    return prior;
+  }
+
+  // Takes a landing back: the landed copy is discarded (quarantined when revoked) and the replaced version restored.
+  function undoLanding(j) {
+    const { response: res, prior } = j;
+    const revoked = isRevoked(res);
+    for (const w of ['enabled', 'disabled']) {
+      const d = dirOf(res.slug, w);
+      if (readMarker(d)?.package_sha256 !== res.package_sha256) continue;
+      if (revoked) quarantine(d, res, res.skill_id);
+      else removeOurs(d, res.skill_id);
+    }
+    putRec(res.skill_id, restorePrior(res.skill_id, prior));
   }
 
   // Records a landed version; a disabled skill stays disabled. Idempotent.
   function recordLanded(rid, j) {
     const { response: res, prior } = j;
     const where = prior?.state === 'disabled' ? 'disabled' : 'enabled';
-    if (where === 'disabled') moveDir(dirOf(res.slug, 'enabled'), dirOf(res.slug, 'disabled'), res.skill_id);
     putRec(res.skill_id, {
       org_id: j.org_id, install_id: res.install_id, slug: res.slug, skill_version_id: res.skill_version_id, version_no: res.version_no,
       package_sha256: res.package_sha256, source_market_id: res.source_market_id, state: where, installed_at: iso(), request_id: rid,
@@ -123,22 +203,12 @@ export function createSkills({
     return journal(rid, { phase: 'landed' });
   }
 
-  // The market refused a reported success: the landed version goes, the previous one comes back.
-  function rollBack(j) {
-    const { response: res, prior } = j;
-    for (const w of ['enabled', 'disabled']) {
-      if (readMarker(dirOf(res.slug, w))?.package_sha256 === res.package_sha256) fs.rmSync(dirOf(res.slug, w), { recursive: true, force: true });
-    }
-    restorePrior(prior);
-    putRec(res.skill_id, prior);
-  }
-
   // Keeps only the version replaced by the latest upgrade.
   function pruneRollback(rec) {
     const dir = path.join(dataDir, 'rollback', rec.slug);
     let names = [];
     try { names = fs.readdirSync(dir); } catch { /* none */ }
-    for (const n of names) if (n !== String(rec.rollback?.version_no)) fs.rmSync(path.join(dir, n), { recursive: true, force: true });
+    for (const n of names) if (n !== String(rec.rollback?.version_no)) drop(path.join(dir, n));
   }
 
   async function send(o) {
@@ -148,7 +218,8 @@ export function createSkills({
   }
 
   async function deliver(id) {
-    const o = state.outbox.get(id);
+    const o = readEntry('outbox', id);
+    if (o === CORRUPT || !o) return 'closed';
     let res = null;
     try {
       res = await send(o);
@@ -163,13 +234,13 @@ export function createSkills({
       logger.warn(msg);
     }
     // Idempotent, so it runs again when a crash comes before the outbox entry is gone.
-    const j = state.journal.get(id);
-    if (o.kind === 'result' && res && o.body.status === 'succeeded') {
+    const j = readEntry('journal', id);
+    if (o.kind === 'result' && res && o.body.status === 'succeeded' && j !== CORRUPT && j?.response) {
       if (res.status === 'succeeded') pruneRollback(installs()[j.response.skill_id] ?? { slug: j.response.slug });
       else if (res.error_code === 'INSTALL_TIMEOUT') logger.warn(`install ${id}: market timed it out; the landed version stays for reconcile`);
       else {
         logger.warn(`install ${id}: market refused the result (${res.error_code}); rolling back`);
-        rollBack(j);
+        undoLanding(j);
       }
     }
     state.outbox.remove(id);
@@ -202,15 +273,26 @@ export function createSkills({
   }
 
   // A request seen before this run: resolves what landed locally against C-07. Returns an outcome, or null to (re)send C-02.
+  // A version revoked while the process was down is taken back instead of being recorded or reported as installed.
   async function recover(it, rid, j) {
     const st = await statusOf(it, rid);
     if (st === 'deferred' || st === 'closed') return st;
-    const landed = j.response && j.phase !== 'accepted' && landedDir(j.response);
-    if (landed && j.phase === 'landing') j = recordLanded(rid, j);
-    if (!landed && j.phase === 'landing') restorePrior(j.prior);
+    let landed = false;
+    let revoked = false;
+    if (j.response && (j.phase === 'landing' || j.phase === 'landed')) {
+      landed = Boolean(landedDir(j.response));
+      if (!j.result && isRevoked(j.response)) {
+        undoLanding(j);
+        [landed, revoked] = [false, true];
+      } else if (j.phase === 'landing') {
+        if (landed) j = recordLanded(rid, j);
+        else putRec(j.response.skill_id, restorePrior(j.response.skill_id, j.prior));
+      }
+    }
     if (st === null) return j.response ? close(it, rid, 'unknown to the market') : null;
     if (st.status !== 'running') return close(it, rid, `market status ${st.status} ${st.error_code ?? ''}`.trim());
     if (j.result) return report(rid, it, j.result);
+    if (revoked) return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: 'version_revoked' });
     if (landed) return report(rid, it, { status: 'succeeded', installed_sha256: j.response.package_sha256 });
     return null;
   }
@@ -228,15 +310,21 @@ export function createSkills({
     return null;
   }
 
-  function upgradeRefused(op, res, prior) {
-    if (op !== 'upgrade' || !prior) return false;
-    return !(res.version_no > prior.version_no || (res.version_no < prior.version_no && (prior.state === 'revoked_disabled' || isRevoked(prior))));
+  // Only a higher version replaces a local one; a lower one only from the same source shelf when the local one is revoked.
+  function versionRefused(res, prior) {
+    if (!prior || res.version_no > prior.version_no) return false;
+    const revokedPrior = prior.state === 'revoked_disabled' || isRevoked(prior);
+    return !(res.version_no < prior.version_no && revokedPrior && res.source_market_id === prior.source_market_id);
   }
+
+  // The exact version is already in place (kept after INSTALL_TIMEOUT): nothing to land.
+  const alreadyLanded = (res, prior) => prior && prior.state !== 'revoked_disabled' && res.version_no === prior.version_no
+    && res.package_sha256 === prior.package_sha256 && Boolean(landedDir(res));
 
   async function runInstall(it, agentId) {
     const rid = it.request_id ?? uuidv7(now());
-    let j = state.journal.get(rid);
-    if (j?.phase === 'reported' || j?.phase === 'closed') return setIntent(it.id, null), 'closed';
+    let j = readEntry('journal', rid);
+    if (j === CORRUPT || j?.phase === 'reported' || j?.phase === 'closed') return setIntent(it.id, null), 'closed';
     if (j) {
       const r = await recover(it, rid, j);
       if (r) return r;
@@ -266,7 +354,12 @@ export function createSkills({
     const fail = (code, msg) => report(rid, it, { status: 'failed', error_code: code, error_message: msg });
     const refused = refusedBeforeDownload(res);
     if (refused) return fail(...refused);
-    if (upgradeRefused(it.op, res, prior)) return fail('INSTALL_TARGET_CONFLICT', 'not_higher');
+    if (alreadyLanded(res, prior)) {
+      putRec(res.skill_id, { ...prior, install_id: res.install_id, request_id: rid });
+      journal(rid, { phase: 'landed', prior });
+      return report(rid, it, { status: 'succeeded', installed_sha256: res.package_sha256 });
+    }
+    if (versionRefused(res, prior)) return fail('INSTALL_TARGET_CONFLICT', 'not_higher');
     const failure = (err) => {
       const f = failureFor(err);
       if (f.reason === 'client internal error') logger.error(`install ${rid}: ${err.message}`);
@@ -291,54 +384,73 @@ export function createSkills({
       }
       return failure(err);
     }
+    // A revocation may have arrived during the download.
+    const late = refusedBeforeDownload(res);
+    if (late) return fail(...late);
     j = journal(rid, { phase: 'landing', prior });
     try {
-      if (prior?.state === 'disabled') moveDir(dirOf(prior.slug, 'disabled'), rollbackDir(prior.slug, prior.version_no), res.skill_id);
+      // A disabled skill is upgraded in the disabled area, so the new version is never enabled on the way.
+      const targetRoot = prior?.state === 'disabled' ? areas.disabled : skillsDir;
+      fs.mkdirSync(targetRoot, { recursive: true, mode: 0o700 });
       landSkill({
-        skillsDir, stagingRoot: path.join(dataDir, 'staging'), rollbackRoot: path.join(dataDir, 'rollback'), requestId: rid, install: res, inspected,
+        skillsDir, targetRoot, stagingRoot, rollbackRoot: path.join(dataDir, 'rollback'), trashRoot, requestId: rid, install: res, inspected,
       });
     } catch (err) {
-      restorePrior(prior);
+      putRec(res.skill_id, restorePrior(res.skill_id, prior));
       return failure(err);
     }
     recordLanded(rid, j);
     return report(rid, it, { status: 'succeeded', installed_sha256: crypto.createHash('sha256').update(bytes).digest('hex') });
   }
 
-  // Local change first, then C-08 / C-09. Enabling revoked content is refused and not reported.
+  // Local change first, then C-08 / C-09. Enabling revoked content, or moving onto a directory that is not ours, is refused
+  // and not reported. The skill is looked for in both areas, so a move whose record update was lost is completed.
   function applyLocal(op, skillId) {
+    enforceRevocations();
     const rec = installs()[skillId];
     if (!rec) return 'absent';
     if (op === 'uninstall') {
-      for (const w of Object.keys(areas)) removeOurs(dirOf(rec.slug, w), skillId);
-      fs.rmSync(path.join(dataDir, 'rollback', rec.slug), { recursive: true, force: true });
+      for (const w of ['enabled', 'disabled']) removeOurs(dirOf(rec.slug, w), skillId);
+      const q = dirOf(rec.slug, 'revoked_disabled');
+      let names = [];
+      try { names = fs.readdirSync(q); } catch { /* none */ }
+      for (const n of names) removeOurs(path.join(q, n), skillId);
+      try { fs.rmdirSync(q); } catch { /* absent, or holds something that is not ours */ }
+      drop(path.join(dataDir, 'rollback', rec.slug));
       putRec(skillId, null);
       return 'done';
     }
-    if (rec.state === 'revoked_disabled') return op === 'enable' ? 'refused' : 'done';
+    if (rec.state === 'revoked_disabled') return op === 'enable' ? 'revoked' : 'done';
     const want = op === 'enable' ? 'enabled' : 'disabled';
-    if (rec.state !== want) {
-      moveDir(dirOf(rec.slug, rec.state), dirOf(rec.slug, want), skillId);
-      putRec(skillId, { ...rec, state: want });
+    try {
+      moveDir(dirOf(rec.slug, want === 'enabled' ? 'disabled' : 'enabled'), dirOf(rec.slug, want), skillId);
+    } catch (err) {
+      if (isConflict(err)) return 'conflict';
+      throw err;
     }
+    if (rec.state !== want) putRec(skillId, { ...rec, state: want });
     return 'done';
   }
 
   async function manage({ op, skillId, orgId, intentId = null, requestId = null }) {
     const rid = requestId ?? uuidv7(now());
-    let j = state.journal.get(rid);
-    if (j?.phase === 'reported' || j?.phase === 'closed') return setIntent(intentId, null), 'closed';
+    let j = readEntry('journal', rid);
+    if (j === CORRUPT || j?.phase === 'reported' || j?.phase === 'closed') return setIntent(intentId, null), 'closed';
     if (!j) {
       const body = { request_id: rid, ...(op === 'uninstall' ? {} : { enabled: op === 'enable' }), ...(intentId ? { intent_id: intentId } : {}) };
       j = journal(rid, { intent_id: intentId, org_id: orgId, op, skill_id: skillId, body, phase: 'requested' });
       setIntent(intentId, { status: 'running', request_id: rid });
     }
     const local = applyLocal(op, skillId);
-    if (local === 'refused') {
-      const msg = `skill ${skillId} is disabled because its version was revoked; enabling it was refused`;
-      state.setAlert(`revoked:${skillId}`, msg);
+    if (local === 'revoked' || local === 'conflict') {
+      // C-08 has no way to report a refusal, so the market's intent stays pending until it expires and may hold back
+      // later intents of this org until then.
+      const why = local === 'revoked' ? 'its version was revoked and it is quarantined'
+        : `the ${op === 'enable' ? 'skills' : 'disabled'} directory already holds a market--<slug> entry that is not market-managed`;
+      const msg = `${op} of skill ${skillId} was refused: ${why}${intentId ? `; intent ${intentId} stays pending at the market until it expires` : ''}`;
+      state.setAlert(`${local === 'revoked' ? 'revoked' : 'conflict'}:${skillId}`, msg);
       logger.warn(msg);
-      journal(rid, { phase: 'closed', closed: 'revoked' });
+      journal(rid, { phase: 'closed', closed: local });
       setIntent(intentId, null);
       return 'refused';
     }
@@ -350,8 +462,8 @@ export function createSkills({
 
   async function flushOutbox(blocked) {
     for (const id of state.outbox.list()) {
-      const o = state.outbox.get(id);
-      if (!o || blocked.has(o.org_id)) continue;
+      const o = readEntry('outbox', id);
+      if (o === CORRUPT || !o || blocked.has(o.org_id)) continue;
       let r;
       try {
         r = await deliver(id);
@@ -397,17 +509,21 @@ export function createSkills({
     return manage({ op, skillId, orgId: rec.org_id });
   };
 
-  // Revoked installed versions move to quarantine as revoked_disabled; never deleted. Idempotent.
+  // Revoked installed versions move to quarantine as revoked_disabled; never deleted. Both areas are checked, also for a
+  // record already quarantined, so a move lost in a crash is completed. Idempotent.
   function enforceRevocations() {
     const revoked = revokedSet(state);
     let n = 0;
     for (const [skillId, rec] of Object.entries(installs())) {
-      if (rec.state === 'revoked_disabled' || !isRevoked(rec, revoked)) continue;
-      moveDir(dirOf(rec.slug, rec.state), dirOf(rec.slug, 'revoked_disabled'), skillId);
-      putRec(skillId, { ...rec, state: 'revoked_disabled', revoked_at: iso() });
-      const msg = `skill ${rec.slug} version ${rec.version_no} was revoked; it is disabled and quarantined`;
-      state.setAlert(`revoked:${skillId}`, msg);
-      logger.warn(msg);
+      if (rec.state !== 'revoked_disabled' && !isRevoked(rec, revoked)) continue;
+      for (const w of ['enabled', 'disabled']) {
+        const d = dirOf(rec.slug, w);
+        const m = readMarker(d);
+        if (m?.skill_id === skillId && m.package_sha256 === rec.package_sha256) quarantine(d, rec, skillId);
+      }
+      if (rec.state === 'revoked_disabled') continue;
+      putRec(skillId, revokedRec(rec));
+      revokedAlert(skillId, rec);
       n += 1;
     }
     return n;

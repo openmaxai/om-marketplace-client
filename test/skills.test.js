@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { AGENT, ORG, ORG2 } from './fake/pull.js';
+import { AGENT, ORG, ORG2, U } from './fake/pull.js';
 import { fakeCursor } from './fake/market.js';
 import { skillMd, skillPackage } from './fake/package.js';
 import { buildZip } from './fake/zip.js';
@@ -17,6 +17,13 @@ const v3 = () => skillPackage('demo-skill', { 'docs/guide.md': 'guide v3\n' });
 const f503 = problem(503, 'DEPENDENCY_UNAVAILABLE');
 const c02s = (h) => h.sent('/install-requests');
 const queueOf = (h) => h.state.read('intents', null).queue;
+const qdir = (h) => path.join(h.dataDir, 'quarantine', 'market--demo-skill');
+// version_no of each quarantined copy, by subdirectory name.
+const quarantined = (h) => {
+  let names = [];
+  try { names = fs.readdirSync(qdir(h)).sort(); } catch { /* none */ }
+  return Object.fromEntries(names.map((n) => [n, h.marker(path.join(qdir(h), n))?.version_no]));
+};
 const alerts = (h) => Object.values(h.state.read('status', { alerts: {} }).alerts).map((a) => a.message).join('\n');
 
 async function installed(t, opts) {
@@ -65,7 +72,7 @@ test('upgrade monotonicity: not higher is refused; a lower version is allowed on
   await h.queue(['upgrade', 1]);
   assert.deepEqual(await s.runRound(), ['succeeded']);
   assert.equal(h.marker().version_no, 1);
-  assert.equal(h.marker(path.join(h.dataDir, 'quarantine', 'market--demo-skill')).version_no, 2);
+  assert.deepEqual(quarantined(h), { [`2-${VID(2)}`]: 2 });
 });
 
 test('C-02 201 with a bad shape is reported as CLIENT_INTERNAL', async (t) => {
@@ -426,9 +433,9 @@ test('a revocation pulled through C-11 quarantines the installed version; enabli
     package_sha256: null, manifest_sha256: null, revoked_at: '2026-10-16T00:00:00Z',
   }], next_cursor: fakeCursor(1), has_more: false } });
   await puller.pull();
-  const q = path.join(h.dataDir, 'quarantine', 'market--demo-skill');
+  const q = qdir(h);
   assert.equal(fs.existsSync(h.target), false);
-  assert.equal(h.marker(q).version_no, 1);
+  assert.deepEqual(quarantined(h), { [`1-${VID(1)}`]: 1 });
   assert.equal(h.state.read('installs', {})[SKILL].state, 'revoked_disabled');
   assert.equal(s.enforceRevocations(), 0);
   await h.queue(['enable']);
@@ -447,4 +454,181 @@ test('installs wait while the vendored policy does not match its pin', async (t)
   assert.deepEqual(await h.make(h.state, { installsAllowed: false }).runRound(), []);
   assert.equal(queueOf(h)[0].status, 'queued');
   assert.equal(h.sent(C02).length, 0);
+});
+
+const userDir = (dir) => {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'mine.txt'), 'user\n');
+};
+const userFile = (dir) => fs.readFileSync(path.join(dir, 'mine.txt'), 'utf8');
+const disabledDir = (h) => path.join(h.dataDir, 'disabled', 'market--demo-skill');
+const timeout = (req) => ({ status: 200, json: { request_id: req.path.split('/')[6], status: 'failed', error_code: 'INSTALL_TIMEOUT' } });
+
+test('the same version with another package is refused as not_higher', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  h.patch.c02 = () => ({ version_no: 1 });
+  await h.queue(['upgrade', 2]);
+  assert.deepEqual(await s.runRound(), ['failed']);
+  assert.deepEqual(h.results().at(-1).json, failure('INSTALL_TARGET_CONFLICT', 'not_higher'));
+  assert.equal(h.marker().package_sha256, h.versions[1].sha);
+});
+
+test('the same version and package kept after INSTALL_TIMEOUT is reported succeeded without a download', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  h.over.c06.push(timeout);
+  await h.queue(['upgrade', 2]);
+  assert.deepEqual(await s.runRound(), ['succeeded']);
+  assert.equal(h.marker().version_no, 2);
+  const before = downloads(h);
+  await h.queue(['upgrade', 2]);
+  assert.deepEqual(await s.runRound(), ['succeeded']);
+  assert.equal(downloads(h), before);
+  assert.deepEqual(h.results().at(-1).json, { status: 'succeeded', installed_sha256: h.versions[2].sha });
+  const rec = h.state.read('installs', {})[SKILL];
+  assert.deepEqual([rec.version_no, rec.rollback?.version_no], [2, 1]);
+  assert.equal(h.reqs.get(c02s(h).at(-1).json.request_id).status, 'succeeded');
+});
+
+test('a lower version is refused when it comes from another source shelf, even with the installed one revoked', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  await h.queue(['upgrade', 2]);
+  await s.runRound();
+  h.state.write('revoked', { skill_version_id: [VID(2)] });
+  h.patch.c02 = () => ({ source_market_id: U(4) });
+  await h.queue(['upgrade', 1]);
+  assert.deepEqual(await s.runRound(), ['failed']);
+  assert.deepEqual(h.results().at(-1).json, failure('INSTALL_TARGET_CONFLICT', 'not_higher'));
+});
+
+test('an install over a local version follows the same version rules', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  await h.queue(['upgrade', 2]);
+  await s.runRound();
+  await h.queue(['install', 1]);
+  assert.deepEqual(await s.runRound(), ['failed']);
+  assert.deepEqual(h.results().at(-1).json, failure('INSTALL_TARGET_CONFLICT', 'not_higher'));
+  assert.equal(h.marker().version_no, 2);
+});
+
+test('uninstall leaves a directory without our marker alone and clears the rollback area', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  await h.queue(['upgrade', 2], ['disable']);
+  assert.deepEqual(await s.runRound(), ['succeeded', 'done']);
+  userDir(h.target);
+  await h.queue(['uninstall']);
+  assert.deepEqual(await s.runRound(), ['done']);
+  assert.equal(userFile(h.target), 'user\n');
+  assert.equal(fs.existsSync(disabledDir(h)), false);
+  assert.equal(fs.existsSync(path.join(h.dataDir, 'rollback', 'demo-skill')), false);
+  assert.equal(h.state.read('installs', {})[SKILL], undefined);
+});
+
+test('enable onto a directory without our marker is refused with an alert; nothing moves and nothing is reported', async (t) => {
+  const { h, s } = await installed(t);
+  await h.queue(['disable']);
+  await s.runRound();
+  userDir(h.target);
+  const [en] = await h.queue(['enable']);
+  assert.deepEqual(await s.runRound(), ['refused']);
+  assert.equal(userFile(h.target), 'user\n');
+  assert.equal(h.marker(disabledDir(h)).version_no, 1);
+  assert.equal(h.state.read('installs', {})[SKILL].state, 'disabled');
+  assert.equal(h.sent(':set-enabled').filter((r) => r.json.enabled).length, 0);
+  assert.match(alerts(h), new RegExp(`not market-managed; intent ${en.id} stays pending`));
+  assert.deepEqual(queueOf(h), []);
+});
+
+test('disable never moves a directory that does not carry our marker', async (t) => {
+  const { h, s } = await installed(t);
+  fs.renameSync(h.target, path.join(h.dataDir, 'aside'));
+  userDir(h.target);
+  await h.queue(['disable']);
+  assert.deepEqual(await s.runRound(), ['done']);
+  assert.equal(userFile(h.target), 'user\n');
+  assert.equal(fs.existsSync(disabledDir(h)), false);
+});
+
+test('quarantine keeps every revoked copy: a second revoked version never replaces the first', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  await h.queue(['upgrade', 2]);
+  await s.runRound();
+  h.state.write('revoked', { skill_version_id: [VID(2)] });
+  await h.queue(['upgrade', 1]);
+  assert.deepEqual(await s.runRound(), ['succeeded']);
+  h.state.write('revoked', { skill_version_id: [VID(2), VID(1)] });
+  assert.equal(s.enforceRevocations(), 1);
+  assert.deepEqual(quarantined(h), { [`1-${VID(1)}`]: 1, [`2-${VID(2)}`]: 2 });
+  assert.equal(fs.existsSync(h.target), false);
+});
+
+test('a rollback after a refused success does not put back a version revoked meanwhile', async (t) => {
+  const { h, s } = await installed(t, { versions: { 1: skillPackage(), 2: v2() } });
+  h.over.c06.push((req) => {
+    h.state.write('revoked', { skill_version_id: [VID(1)] });
+    return { status: 200, json: { request_id: req.path.split('/')[6], status: 'failed', error_code: 'PACKAGE_MISMATCH' } };
+  });
+  await h.queue(['upgrade', 2]);
+  await s.runRound();
+  assert.equal(fs.existsSync(h.target), false);
+  assert.deepEqual(quarantined(h), { [`1-${VID(1)}`]: 1 });
+  const rec = h.state.read('installs', {})[SKILL];
+  assert.deepEqual([rec.version_no, rec.state], [1, 'revoked_disabled']);
+  assert.deepEqual(fs.readdirSync(path.join(h.dataDir, 'rollback', 'demo-skill')), []);
+});
+
+test('enabling outside a round a disabled skill whose version was revoked since is refused and quarantines it', async (t) => {
+  const { h, s } = await installed(t);
+  assert.equal(await s.setEnabled(SKILL, false), 'done');
+  h.state.write('revoked', { skill_version_id: [VID(1)] });
+  assert.equal(await s.setEnabled(SKILL, true), 'refused');
+  assert.equal(fs.existsSync(h.target), false);
+  assert.equal(h.state.read('installs', {})[SKILL].state, 'revoked_disabled');
+  assert.deepEqual(quarantined(h), { [`1-${VID(1)}`]: 1 });
+  assert.equal(h.sent(':set-enabled').filter((r) => r.json.enabled).length, 0);
+});
+
+test('an unreadable journal entry raises an alert, is moved aside and no longer holds the org back', async (t) => {
+  const h = await skillHarness(t);
+  h.over.c02.push(f503);
+  await h.queue(['install', 1]);
+  const s = h.make();
+  assert.deepEqual(await s.runRound(), ['deferred']);
+  const rid = queueOf(h)[0].request_id;
+  fs.writeFileSync(path.join(h.state.dir, 'requests', `${rid}.json`), '{not json');
+  await h.queue(['disable']);
+  assert.deepEqual(await s.runRound(), ['closed', 'done']);
+  assert.match(alerts(h), new RegExp(`journal entry ${rid} is unreadable`));
+  assert.equal(fs.readdirSync(path.join(h.state.dir, 'corrupt')).length, 1);
+  assert.deepEqual(await s.runRound(), []);
+});
+
+test('an unreadable outbox entry raises an alert and the request reports again from its journal', async (t) => {
+  const h = await skillHarness(t);
+  h.over.c06.push(f503);
+  await h.queue(['install', 1]);
+  const s = h.make();
+  assert.deepEqual(await s.runRound(), ['deferred']);
+  const [rid] = h.state.outbox.list();
+  fs.writeFileSync(path.join(h.state.dir, 'outbox', `${rid}.json`), '[');
+  assert.deepEqual(await s.runRound(), ['succeeded']);
+  assert.match(alerts(h), new RegExp(`outbox entry ${rid} is unreadable`));
+  assert.equal(h.reqs.get(rid).status, 'succeeded');
+  assert.deepEqual([h.state.outbox.list(), queueOf(h)], [[], []]);
+});
+
+test('what a crash left in the trash or in staging is removed at startup', async (t) => {
+  const h = await skillHarness(t);
+  for (const d of ['trash/x/docs', 'staging/y']) fs.mkdirSync(path.join(h.dataDir, d), { recursive: true });
+  fs.writeFileSync(path.join(h.dataDir, 'trash/x/docs/a.md'), 'a');
+  h.make();
+  assert.deepEqual([fs.readdirSync(path.join(h.dataDir, 'trash')), fs.readdirSync(path.join(h.dataDir, 'staging'))], [[], []]);
+});
+
+test('a second quarantined copy of the same version gets its own subdirectory', async (t) => {
+  const { h, s } = await installed(t);
+  fs.cpSync(h.target, disabledDir(h), { recursive: true });
+  h.state.write('revoked', { skill_version_id: [VID(1)] });
+  assert.equal(s.enforceRevocations(), 1);
+  assert.deepEqual(quarantined(h), { [`1-${VID(1)}`]: 1, [`1-${VID(1)}.2`]: 1 });
+  assert.deepEqual([fs.existsSync(h.target), fs.existsSync(disabledDir(h))], [false, false]);
 });

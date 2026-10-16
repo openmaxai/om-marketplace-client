@@ -5,6 +5,7 @@ import { InstallFailure } from './failure.js';
 import { PackageError } from './pkg/zip.js';
 import { SkillPolicyError } from './pkg/policy.js';
 import { MAX_SKILL_MD_BYTES } from './pkg/frontmatter.js';
+import { discard, fsyncDir } from './trash.js';
 
 export const MARKER = '.market-managed';
 export const SKILL_DIR_PREFIX = 'market--';
@@ -124,34 +125,33 @@ function scan(root, rel = '', out = []) {
   return out;
 }
 
-function fsyncDir(dir) {
-  const fd = fs.openSync(dir, 'r');
-  try { fs.fsyncSync(fd); } catch { /* not supported */ } finally { fs.closeSync(fd); }
-}
-
 function realDir(dir) {
   const st = lstatOrNull(dir);
   if (!st?.isDirectory()) throw new InstallFailure('CLIENT_INTERNAL', 'skills_dir_invalid');
   return st;
 }
 
-// Lands an inspected package as <skillsDir>/market--<slug>/. Every check that needs no disk write runs first; files are
-// then written to <stagingRoot>/<requestId>/, re-read and compared with the manifest, marked, and the directory is renamed
-// into place. A previous version of the same skill is moved to <rollbackRoot>/<slug>/<version_no>/.
-export function landSkill({ skillsDir, stagingRoot, rollbackRoot, requestId, install, inspected }) {
+// Lands an inspected package as <targetRoot>/market--<slug>/ (targetRoot is skillsDir, or the disabled area for a disabled
+// skill). Every check that needs no disk write runs first; files are then written to <stagingRoot>/<requestId>/, re-read and
+// compared with the manifest, marked, and the directory is renamed into place. A previous version of the same skill is moved
+// to <rollbackRoot>/<slug>/<version_no>/. Directories are only ever replaced by renames; what is removed goes through trashRoot.
+export function landSkill({ skillsDir, targetRoot = skillsDir, stagingRoot, rollbackRoot, trashRoot = path.join(path.dirname(stagingRoot), 'trash'), requestId, install, inspected }) {
   const { slug, skill_id: skillId, version_no: versionNo, package_sha256: packageSha, file_manifest: want } = install;
   if (skillNameReserved(slug) || skillNameReserved(inspected.meta.name)) throw new InstallFailure('PACKAGE_UNSAFE', 'SKILL_NAME_RESERVED');
   if (inspected.meta.name !== slug) throw new InstallFailure('PACKAGE_MISMATCH', 'skill_name_mismatch');
   if (!sameManifest(inspected.manifest, want)) throw new InstallFailure('PACKAGE_MISMATCH', 'file_manifest_mismatch');
   if (inspected.files.some((f) => f.path === MARKER)) throw new InstallFailure('PACKAGE_UNSAFE', 'reserved_path');
-  const skillsSt = realDir(skillsDir);
+  realDir(skillsDir);
+  const rootSt = realDir(targetRoot);
   const own = `${SKILL_DIR_PREFIX}${slug}`;
-  const target = path.join(skillsDir, own);
+  const target = path.join(targetRoot, own);
   const prior = targetState(target, skillId);
+  // A disabled skill is moved back to skillsDir when enabled, so its name there must be free or ours too.
+  if (targetRoot !== skillsDir) targetState(path.join(skillsDir, own), skillId);
   checkNames(skillsDir, slug, own);
 
   fs.mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
-  if (realDir(stagingRoot).dev !== skillsSt.dev) throw new InstallFailure('CLIENT_INTERNAL', 'staging_other_filesystem');
+  if (realDir(stagingRoot).dev !== rootSt.dev) throw new InstallFailure('CLIENT_INTERNAL', 'staging_other_filesystem');
   const stage = path.join(stagingRoot, requestId);
   fs.rmSync(stage, { recursive: true, force: true });
   fs.mkdirSync(stage, { mode: 0o700 });
@@ -168,11 +168,14 @@ export function landSkill({ skillsDir, stagingRoot, rollbackRoot, requestId, ins
       fs.mkdirSync(slot, { recursive: true, mode: 0o700 });
       realDir(slot);
       previous = path.join(slot, /^\d+$/.test(oldNo) ? oldNo : 'unknown');
-      fs.rmSync(previous, { recursive: true, force: true });
+      discard(previous, trashRoot);
     }
     // Last check, kept as close to the renames as possible.
     if (targetState(target, skillId) !== prior) throw conflict('target_changed');
-    if (previous) fs.renameSync(target, previous);
+    if (previous) {
+      fs.renameSync(target, previous);
+      fsyncDir(path.dirname(previous));
+    }
     try {
       // rename(2) has no no-replace mode here. On Linux it replaces only an empty directory; a non-empty one fails with
       // ENOTEMPTY and a file or symlink with ENOTDIR. Only the owner of skillsDir can create an entry there, so a racing
@@ -182,7 +185,7 @@ export function landSkill({ skillsDir, stagingRoot, rollbackRoot, requestId, ins
       if (previous) fs.renameSync(previous, target);
       throw err;
     }
-    fsyncDir(skillsDir);
+    fsyncDir(targetRoot);
     return { dir: target, previous };
   } finally {
     fs.rmSync(stage, { recursive: true, force: true });
