@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
-import { fakeCursor, marketHarness } from './fake/market.js';
+import { fakeCursor, marketHarness, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG } from './fake/pull.js';
 import { buildTasks, createRuntime } from '../src/app.js';
 import { StateLockedError } from '../src/state.js';
@@ -75,4 +75,26 @@ test('SIGTERM right after start-up always exits cleanly and releases the lock', 
     assert.deepEqual(await exited, { code: 0, signal: null });
     assert.equal(fs.existsSync(path.join(dataDir, 'state', 'lock')), false);
   }
+});
+
+test('SIGTERM during an in-flight pull aborts it and exits promptly', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: VALID_ENV.COCO_MEMBER_ID });
+  t.after(fake.close);
+  fake.script('POST', `/api/v1/orgs/${VALID_ENV.COCO_ORG_ID}/revocations:query`,
+    { status: 200, delayMs: 8000, json: { items: [], next_cursor: fakeCursor(0), has_more: false } });
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  const child = spawn(process.execPath, [path.join(ROOT, 'src/main.js')], { env: baseEnv(dataDir), stdio: 'ignore' });
+  t.after(() => child.kill('SIGKILL'));
+  const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  const deadline = Date.now() + 5000;
+  while (!fake.market().some((r) => r.path.endsWith('/revocations:query'))) {
+    assert.ok(Date.now() < deadline, 'pull started');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const sent = Date.now();
+  child.kill('SIGTERM');
+  assert.deepEqual(await exited, { code: 0, signal: null });
+  assert.ok(Date.now() - sent < 2000, 'in-flight pull aborted, not awaited');
+  assert.equal(fs.existsSync(path.join(dataDir, 'state', 'lock')), false);
 });

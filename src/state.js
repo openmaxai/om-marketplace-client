@@ -109,9 +109,11 @@ function parseLock(text) {
 }
 
 const heldLocks = new Map();
+const LOCK_WAIT_MS = 10000;
 
 // A lock is stale when its pid is not a live process, is this process (a previous incarnation with the same pid,
-// e.g. pid 1 in a container), or now belongs to a process with a different start time.
+// e.g. pid 1 in a container), or now belongs to a process with a different start time. Pids are only meaningful
+// within one PID namespace, so a data dir must not be shared between containers.
 function lockIsStale({ pid, start }) {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || !pidAlive(pid)) return true;
   const current = start ? processStartId(pid) : null;
@@ -122,11 +124,22 @@ function readLockFile(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch (err) { if (err.code === 'ENOENT') return null; throw err; }
 }
 
-// The lock is published complete via link(2), so it is never seen half-written. A stale lock is moved aside with
-// rename(2); if what was moved is not the lock judged stale, another instance just took it and it is put back.
-function acquireLock(file) {
-  if (heldLocks.has(file)) throw new StateLockedError(process.pid);
-  const content = JSON.stringify({ pid: process.pid, start: processStartId(process.pid), nonce: crypto.randomBytes(8).toString('hex') });
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Test-only: a random pause of up to this many ms at each critical step widens the race windows.
+function raceDelay() {
+  const max = Number(process.env.OM_MARKETPLACE_CLIENT_TEST_LOCK_DELAY_MS);
+  if (max > 0) sleepMs(Math.random() * max);
+}
+
+function ownerRecord() {
+  return JSON.stringify({ pid: process.pid, start: processStartId(process.pid), nonce: crypto.randomBytes(8).toString('hex') });
+}
+
+// Creates file with content only if it does not exist. Published via link(2), so it is never seen half-written.
+function createExclusive(file, content) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const fd = fs.openSync(tmp, 'wx', 0o600);
   try {
@@ -136,37 +149,93 @@ function acquireLock(file) {
     fs.closeSync(fd);
   }
   try {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    fs.linkSync(tmp, file);
+    return true;
+  } catch (err) {
+    if (err.code === 'EEXIST') return false;
+    throw err;
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+}
+
+// Only valid while no one else may replace file: the caller holds it, or holds the guard that serialises its removal.
+function unlinkIfContent(file, content) {
+  try {
+    if (readLockFile(file) === content) fs.unlinkSync(file);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+}
+
+const BUSY = Symbol('busy');
+const RETRY = Symbol('retry');
+
+// Runs fn while holding the exclusive guard file. A guard left by a dead process is removed under a second guard
+// (`<guard>.reap`) after re-checking it is unchanged; a reap guard is itself only left behind by a crash inside that
+// short removal step, and is then removed if unchanged.
+function withGuard(guard, fn) {
+  const mine = ownerRecord();
+  if (!createExclusive(guard, mine)) {
+    const seen = readLockFile(guard);
+    if (seen === null) return RETRY;
+    if (!lockIsStale(parseLock(seen))) return BUSY;
+    const reap = `${guard}.reap`;
+    const reaper = ownerRecord();
+    if (createExclusive(reap, reaper)) {
       try {
-        fs.linkSync(tmp, file);
-      } catch (err) {
-        if (err.code !== 'EEXIST') throw err;
-        const seen = readLockFile(file);
-        if (seen === null) continue;
-        const owner = parseLock(seen);
-        if (!lockIsStale(owner)) throw new StateLockedError(owner.pid);
-        const aside = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.stale`;
-        try {
-          fs.renameSync(file, aside);
-        } catch (e) {
-          if (e.code === 'ENOENT') continue;
-          throw e;
-        }
-        if (readLockFile(aside) !== seen) {
-          try { fs.linkSync(aside, file); } catch { /* a third instance holds it now */ }
-          fs.unlinkSync(aside);
-          throw new StateLockedError(parseLock(readLockFile(file) ?? '').pid);
-        }
-        fs.unlinkSync(aside);
-        continue;
+        raceDelay();
+        unlinkIfContent(guard, seen);
+      } finally {
+        unlinkIfContent(reap, reaper);
       }
-      if (readLockFile(file) !== content) throw new StateLockedError(parseLock(readLockFile(file) ?? '').pid);
+    } else {
+      const reapSeen = readLockFile(reap);
+      if (reapSeen !== null && lockIsStale(parseLock(reapSeen))) unlinkIfContent(reap, reapSeen);
+    }
+    return RETRY;
+  }
+  try {
+    return fn();
+  } finally {
+    unlinkIfContent(guard, mine);
+  }
+}
+
+// The lock is created atomically. A stale lock is replaced only under `<lock>.takeover`, and only if it still has
+// the exact content (and so the nonce) that was judged stale; another instance's file is never moved or put back.
+function acquireLock(file) {
+  if (heldLocks.has(file)) throw new StateLockedError(process.pid);
+  const content = ownerRecord();
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    if (createExclusive(file, content)) {
       heldLocks.set(file, content);
       return;
     }
-    throw new StateError('cannot acquire the state lock');
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+    const seen = readLockFile(file);
+    if (seen !== null) {
+      const owner = parseLock(seen);
+      if (!lockIsStale(owner)) throw new StateLockedError(owner.pid);
+      raceDelay();
+      const r = withGuard(`${file}.takeover`, () => {
+        raceDelay();
+        const current = readLockFile(file);
+        if (current !== null && current !== seen) return RETRY;
+        if (current !== null) {
+          raceDelay();
+          fs.unlinkSync(file);
+        }
+        raceDelay();
+        return createExclusive(file, content);
+      });
+      if (r === true) {
+        heldLocks.set(file, content);
+        return;
+      }
+      if (r === BUSY) sleepMs(5);
+    }
+    if (Date.now() > deadline) throw new StateError('cannot acquire the state lock');
   }
 }
 
@@ -174,9 +243,7 @@ function releaseLock(file) {
   const content = heldLocks.get(file);
   if (content === undefined) return;
   heldLocks.delete(file);
-  try {
-    if (readLockFile(file) === content) fs.unlinkSync(file);
-  } catch { /* already gone */ }
+  try { unlinkIfContent(file, content); } catch { /* already gone */ }
 }
 
 // One JSON document per id under <dir>/<id>.json; ids are client-generated canonical UUIDs.

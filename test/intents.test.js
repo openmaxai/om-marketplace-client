@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
 import fs from 'node:fs';
 import path from 'node:path';
-import { MAX_QUEUE, createIntentPuller, tooOld } from '../src/intents.js';
+import { MAX_QUEUE, MAX_UNREPORTED, createIntentPuller, tooOld } from '../src/intents.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
 
 const PATH = `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`;
@@ -142,6 +142,21 @@ test('a full queue stops the cursor at the last queued item and raises an alert 
   assert.deepEqual(sentSeqs(fake), [0, 1]);
   doc = state.read('intents', null);
   assert.equal(doc.after_seq, 9);
+  assert.equal(state.read('status', null).alerts.intents_queue_full, undefined);
+});
+
+test('intents for unconfigured orgs do not fill the queue and are capped separately, oldest dropped', async (t) => {
+  const { fake, puller, state, lines } = await setup(t);
+  const unknown = Array.from({ length: MAX_UNREPORTED }, (_, i) => ({ ...intent(0, { id: U(5000 + i), org_id: 'other:org@x' }), status: 'org_not_configured' }));
+  state.write('intents', { after_seq: 0, queue: unknown });
+  fake.script('POST', PATH, page([intent(1), intent(2, { org_id: 'other:org@x' })], 9));
+  assert.deepEqual(await puller.pull(), { outcome: 'ok', added: 2 });
+  const doc = state.read('intents', null);
+  assert.equal(doc.after_seq, 9);
+  assert.equal(doc.queue.filter((it) => it.status === 'org_not_configured').length, MAX_UNREPORTED);
+  assert.ok(!doc.queue.some((it) => it.id === U(5000)), 'oldest unreported dropped');
+  assert.ok(doc.queue.some((it) => it.id === U(102)) && doc.queue.some((it) => it.id === U(101)));
+  assert.equal(lines.filter((l) => l.includes('[warn]') && l.includes('dropped 1 unreported')).length, 1);
   assert.equal(state.read('status', null).alerts.intents_queue_full, undefined);
 });
 

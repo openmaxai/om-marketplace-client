@@ -3,6 +3,7 @@ import { POLICY_SHA256 } from './policy/pin.js';
 
 export const MAX_PAGES_PER_PULL = 50;
 export const MAX_QUEUE = 1000;
+export const MAX_UNREPORTED = 1000;
 export const EMPTY_INTENTS = Object.freeze({ after_seq: 0, queue: [] });
 export const EMPTY_GATE = Object.freeze({ too_old: null, policy_sha256: null });
 const POLICY_MISMATCH = 'policy_mismatch';
@@ -52,28 +53,40 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
     return queue.filter((it) => it.status === 'org_not_configured' || !(Date.parse(it.expires_at) <= t));
   }
 
+  const unreported = (it) => it.status === 'org_not_configured';
+  const runnableCount = (queue) => queue.filter((it) => !unreported(it)).length;
+
   // Queue and cursor are one document, so items are durable no later than the cursor that skips them. When the queue
-  // is full the cursor stops at the last queued item, so nothing unqueued is skipped.
+  // is full the cursor stops at the last queued item, so nothing unqueued is skipped. org_not_configured intents do
+  // not count toward MAX_QUEUE; beyond MAX_UNREPORTED of them the oldest are dropped.
   function persistPage(page) {
     const doc = state.read('intents', EMPTY_INTENTS);
     doc.queue = prune(doc.queue);
     const known = new Set(doc.queue.map((it) => it.id));
+    let runnable = runnableCount(doc.queue);
     let added = 0;
     let cursor = doc.after_seq;
     let full = false;
     for (const it of page.items) {
       if (!known.has(it.id)) {
-        if (doc.queue.length >= MAX_QUEUE) {
+        const status = intentStatus(orgs, it.org_id);
+        if (status !== 'org_not_configured' && runnable >= MAX_QUEUE) {
           full = true;
           break;
         }
-        const status = intentStatus(orgs, it.org_id);
         if (status === 'org_not_configured') logger.info(`intent ${it.id} is for org ${it.org_id}, which is not configured; it will not be executed`);
+        else runnable += 1;
         doc.queue.push({ ...it, status, received_at: iso() });
         known.add(it.id);
         added += 1;
       }
       cursor = it.seq;
+    }
+    const excess = doc.queue.filter(unreported).length - MAX_UNREPORTED;
+    if (excess > 0) {
+      const drop = new Set(doc.queue.filter(unreported).slice(0, excess));
+      doc.queue = doc.queue.filter((it) => !drop.has(it));
+      logger.warn(`dropped ${excess} unreported intents for unconfigured orgs (limit ${MAX_UNREPORTED})`);
     }
     doc.after_seq = full ? cursor : page.next_after_seq;
     state.write('intents', doc);
@@ -113,7 +126,7 @@ export function createIntentPuller({ api, state, orgs, logger, now = Date.now })
       const agentId = await orgs.agentId(orgId);
       for (let i = 0; i < MAX_PAGES_PER_PULL; i++) {
         const { after_seq: afterSeq, queue } = state.read('intents', EMPTY_INTENTS);
-        if (prune(queue).length >= MAX_QUEUE) {
+        if (runnableCount(prune(queue)) >= MAX_QUEUE) {
           queueFull(true);
           return { outcome: 'queue_full', added };
         }
