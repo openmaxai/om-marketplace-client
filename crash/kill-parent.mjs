@@ -3,13 +3,21 @@
 // MODE=count kills before the Nth write-like fs call, N = 1, 2, ... until a child completes without being killed.
 // MODE=timer kills at a random time in [0, MAXD) ms after the round starts.
 // SCEN: install, upgrade, disabled-upgrade, disable, enable, uninstall, refused (rollback after the market refuses),
-// rollback (local rollback to the kept version; the killed child runs it instead of a round).
+// rollback (local rollback to the kept version; the killed child runs it instead of a round), template (a template
+// adoption written at v1 is rewritten at v2; the killed child runs one template intent).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { skillPackage } from '../test/fake/package.js';
 import { SKILL, skillHarness } from '../test/fake/skills.js';
+import { AGENT, ORG, U } from '../test/fake/pull.js';
+import { templateBundle } from '../test/fake/bundle.js';
+import { fakeZylos } from '../test/fake/zylos.js';
+import { createIntentPuller } from '../src/intents.js';
+import { createTemplates } from '../src/templates.js';
+import { ensureDeclarations, readSlots } from '../src/shards.js';
+import { POLICY_SHA256 } from '../src/policy/pin.js';
 import { openState } from '../src/state.js';
 import { VALID_ENV } from '../test/helpers.js';
 
@@ -17,17 +25,22 @@ const MODE = process.env.MODE ?? 'timer';
 const ROUNDS = Number(process.env.ROUNDS ?? 20);
 const SCEN = process.env.SCEN ?? 'upgrade';
 const MAXD = Number(process.env.MAXD ?? 400);
-const SCENARIOS = ['install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused', 'rollback'];
+const SCENARIOS = ['install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused', 'rollback', 'template'];
 if (!SCENARIOS.includes(SCEN)) throw new Error(`unknown SCEN ${SCEN}`);
 
 const many = (tag) => Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`docs/f${i}.md`, `${tag} ${i}\n`.repeat(50)]));
 const V1 = skillPackage('demo-skill', many('v1'));
 const V2 = skillPackage('demo-skill', many('v2'));
 const CHILD = path.join(import.meta.dirname, 'kill-child.mjs');
+const ADOPTION = U(11);
+const tmany = (tag) => Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`knowledge/f${i}.md`, `${tag} ${i}\n`.repeat(50)]));
+const T1 = templateBundle({ files: tmany('t1') });
+const T2 = templateBundle({ inject: '# Demo v2\n', files: tmany('t2') });
+const TFILES = (tag) => ({ 'inject.md': tag === 't1' ? '# Demo\n\nHelp with demos.\n' : '# Demo v2\n', 'connectors.json': '[]', 'customizations.json': '{}', 'sop/triage.md': '# Triage\n', ...tmany(tag) });
 
 function runChild(h, killAfter, killAt = 0, action = 'round') {
   return new Promise((resolve) => {
-    const arg = JSON.stringify({ url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, origin: h.storage.origin, action, skillId: SKILL });
+    const arg = JSON.stringify({ url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, zylosDir: h.zylosDir, origin: h.storage.origin, action, skillId: SKILL });
     const c = spawn(process.execPath, [CHILD, arg], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, KILL_AT: String(killAt) } });
     let out = '';
     let err = '';
@@ -69,7 +82,48 @@ function same(dir, pkg) {
 }
 const ls = (d) => (fs.existsSync(d) ? fs.readdirSync(d) : []);
 
+// C-01, C-04 and C-15 for one adoption; `h.bundle` is what C-04 serves.
+async function templateSetup(h) {
+  h.zylosDir = fakeZylos({ hooks: true });
+  ensureDeclarations(h.zylosDir);
+  const B = `/api/v1/orgs/${ORG}/agents/${AGENT}`;
+  const c04 = () => {
+    h.fake.script('GET', `${B}/packages/templates/${ADOPTION}`, c04);
+    const url = h.storage.serve(`/t/${crypto.randomBytes(4).toString('hex')}`, { status: 200, body: h.bundle.zip });
+    return { status: 200, json: { download_url: url, expires_at: '2026-10-16T00:05:00Z', sha256: h.bundle.sha, size: h.bundle.size } };
+  };
+  const c15 = (req) => {
+    h.fake.script('POST', `${B}/adoptions/${ADOPTION}/write-results`, c15);
+    return { status: 200, json: { adoption_id: ADOPTION, status: 'active', outcome: 'applied' } };
+  };
+  h.fake.script('GET', `${B}/packages/templates/${ADOPTION}`, c04);
+  h.fake.script('POST', `${B}/adoptions/${ADOPTION}/write-results`, c15);
+  const write = async (seq, bundle) => {
+    h.bundle = bundle;
+    const it = {
+      id: U(1000 + seq), org_id: ORG, op: 'write_template', skill_id: null, skill_version_id: null, template_id: U(13), source_market_id: null,
+      adoption_id: ADOPTION, discard_local_changes: false, expires_at: '2026-10-17T00:00:00Z', seq: 100 + seq, bundle_sha256: bundle.sha,
+    };
+    h.fake.script('POST', `${B}/install-intents:query`, { status: 200, json: { items: [it], has_more: false, next_after_seq: it.seq, policy_sha256: POLICY_SHA256 } });
+    await createIntentPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now }).pull();
+  };
+  await write(1, T1);
+  const t = createTemplates({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir: h.zylosDir, emulatorOrigin: h.storage.origin, now: h.now, sleep: async () => {} });
+  if (await t.runNext() !== 'succeeded') throw new Error('template setup failed');
+  await write(2, T2);
+}
+
+// 'ok' when dir holds exactly the files of bundle tag (t1 / t2).
+function sameTemplate(dir, tag) {
+  if (!fs.existsSync(dir)) return 'missing';
+  const want = Object.fromEntries(Object.entries(TFILES(tag)).map(([p, c]) => [p, crypto.createHash('sha256').update(c).digest('hex').slice(0, 8)]));
+  const t = tree(dir);
+  delete t['bundle.json'];
+  return flat(t) === flat(want) ? 'ok' : `diff(${Object.keys(t).length} files)`;
+}
+
 async function setup(h) {
+  if (SCEN === 'template') return templateSetup(h);
   if (SCEN !== 'install') {
     await h.queue(['install', 1]);
     await h.make().runRound();
@@ -103,6 +157,10 @@ async function setup(h) {
 
 // What may be in skills/ at the instant of the kill: nothing, or a complete marked copy. A disabled skill never.
 function atKill(h) {
+  if (SCEN === 'template') {
+    const d = path.join(h.dataDir, 'templates', ADOPTION);
+    return !fs.existsSync(d) || ['t1', 't2'].some((x) => sameTemplate(d, x) === 'ok') ? [] : [`partial template dir at the kill: ${sameTemplate(d, 't2')}`];
+  }
   if (!fs.existsSync(h.target)) return [];
   if (['disabled-upgrade'].includes(SCEN)) return ['disabled skill present in skills/ at the kill'];
   const ok = [V1, V2].some((p) => same(h.target, p) === 'ok');
@@ -119,7 +177,19 @@ function finalIssues(h, st) {
   if (st.read('intents', { queue: [] }).queue.length) issues.push('queue not empty');
   if (ls(path.join(h.dataDir, 'staging')).length) issues.push('staging not empty');
   if (ls(path.join(h.dataDir, 'trash')).length) issues.push('trash not empty');
-  if (SCEN === 'install') {
+  if (SCEN === 'template') {
+    const s = sameTemplate(path.join(h.dataDir, 'templates', ADOPTION), 't2');
+    if (s !== 'ok') issues.push(`v2 template ${s}`);
+    if (JSON.stringify(ls(path.join(h.dataDir, 'templates'))) !== JSON.stringify([ADOPTION])) issues.push(`templates/ holds ${ls(path.join(h.dataDir, 'templates'))}`);
+    const a = st.read('adoptions', {})[ADOPTION];
+    const inject = crypto.createHash('sha256').update('# Demo v2\n').digest('hex');
+    if (a?.state !== 'active' || a.bundle_sha256 !== T2.sha || a.inject_sha256 !== inject) issues.push(`adoption ${a?.state}`);
+    const slot = readSlots(h.dataDir)?.['1'];
+    if (slot?.adoption_id !== ADOPTION || slot.inject_sha256 !== inject) issues.push('slot not on v2');
+    if (Object.keys(st.read('template_reports', {})).length) issues.push('template report not sent');
+    const sent = h.fake.requests.filter((r) => r.path.endsWith('/write-results') && r.json.intent_id === U(1002));
+    if (!sent.length || !sent.every((r) => r.body === sent[0].body) || sent[0].json.status !== 'succeeded') issues.push('C-15 bodies');
+  } else if (SCEN === 'install') {
     const req = [...h.reqs.values()].find((x) => x.op === 'install');
     if (req?.status !== 'succeeded') issues.push(`install req status ${req?.status}`);
     if (rec?.version_no !== 1 || rec?.state !== 'enabled') issues.push(`rec ${rec?.version_no}/${rec?.state}`);
@@ -178,7 +248,7 @@ for (let r = 0; r < ROUNDS; r++) {
   await setup(h);
   h.state.close();
   const at = MODE === 'count' ? r + 1 : Math.floor(Math.random() * MAXD);
-  const action = SCEN === 'rollback' ? 'rollback' : 'round';
+  const action = SCEN === 'rollback' ? 'rollback' : SCEN === 'template' ? 'template' : 'round';
   const k = MODE === 'count' ? await runChild(h, null, at, action) : await runChild(h, at, 0, action);
   const cleanup = async () => { for (const f of afters.reverse()) { try { await f(); } catch { /* best effort */ } } };
   if (MODE === 'count' && !k.sig) {
@@ -190,8 +260,9 @@ for (let r = 0; r < ROUNDS; r++) {
   if (k.sig === 'SIGKILL') results.killed++;
   else results.notKilled++;
   const issues = atKill(h);
-  const r2 = await runChild(h, null);
-  const r3 = await runChild(h, null);
+  const restart = SCEN === 'template' ? 'template' : 'round';
+  const r2 = await runChild(h, null, 0, restart);
+  const r3 = await runChild(h, null, 0, restart);
   if (r2.code !== 0 || r3.code !== 0) {
     results.bad.push({ r, at, why: 'restart failed', err: (r2.err + r3.err).slice(0, 500) });
     await cleanup();

@@ -65,7 +65,10 @@ async function harness(t, { orgs = { [ORG2]: {} } } = {}) {
     fs.mkdirSync(d, { recursive: true });
     fs.writeFileSync(path.join(d, 'inject.md'), '# T\n');
     h.state.update('adoptions', {}, (a) => {
-      a[id] = { adoption_id: id, org_id: org, state: 'active', inject_sha256: sha('# T\n'), files: [{ path: 'inject.md', size: 4, sha256: sha('# T\n') }] };
+      a[id] = {
+        adoption_id: id, org_id: org, state: 'active', bundle_sha256: sha(`bundle-${id}`), inject_sha256: sha('# T\n'),
+        files: [{ path: 'inject.md', size: 4, sha256: sha('# T\n') }],
+      };
     });
     if (slot) writeSlots(h.dataDir, { ...(fs.existsSync(path.join(h.dataDir, 'slots.json')) ? JSON.parse(fs.readFileSync(path.join(h.dataDir, 'slots.json'))) : emptySlots()), [slot]: { adoption_id: id, inject_sha256: sha('# T\n') } });
   }
@@ -128,7 +131,7 @@ test('every discrepancy kind is detected and reported through its org; only the 
   assert.deepEqual(items[`revoked_disabled:${SK(4)}`], { kind: 'revoked_disabled', skill_id: SK(4), skill_version_id: VER(4, 1), installed_sha256: sha(4) });
   assert.deepEqual(items[`local_extra:${SK(6)}`], { kind: 'local_extra', skill_id: SK(6), installed_sha256: sha(6) });
   assert.deepEqual(items[`org_not_configured:${U(900)}`], { kind: 'org_not_configured', intent_id: U(900), org_id: OTHER_ORG });
-  assert.deepEqual(items[`template_locally_modified:${U(21)}`], { kind: 'template_locally_modified', adoption_id: U(21), rendered_sha256: sha('edited') });
+  assert.deepEqual(items[`template_locally_modified:${U(21)}`], { kind: 'template_locally_modified', adoption_id: U(21), rendered_sha256: sha(`bundle-${U(21)}`) });
 
   const after = [...files(f.dataDir).filter((p) => !p.startsWith('state')), ...files(f.skillsDir)];
   assert.deepEqual(before.filter((p) => !after.includes(p)), ['rollback/s7/1/.market-managed', 'rollback/s7/1/SKILL.md']);

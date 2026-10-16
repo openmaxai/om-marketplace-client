@@ -33,7 +33,7 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const h = await pullHarness(t, { orgs: {} });
   const storage = await startFakeStorage();
   t.after(storage.close);
-  const zylosDir = fakeZylos();
+  const zylosDir = fakeZylos({ hooks: true });
   ensureDeclarations(zylosDir);
   h.fake.script('POST', C01, page(items ?? [intent({ bundle_sha256: bundle.sha })]));
   h.fake.script('GET', C04, ...(c04 ?? [{ status: 200, json: {
@@ -204,7 +204,7 @@ test('a new epoch clears the slot map and quarantines adoption dirs only when sl
 
 test('skill and template intents of one org run in seq order across both runners', async (t) => {
   const h = await skillHarness(t);
-  const zylosDir = fakeZylos();
+  const zylosDir = fakeZylos({ hooks: true });
   ensureDeclarations(zylosDir);
   const bundle = templateBundle();
   h.fake.script('GET', C04, { status: 200, json: {
@@ -240,4 +240,75 @@ test('a bundle over the size or file caps is PACKAGE_UNSAFE too_large / too_many
   assert.equal(await g.templates.runNext(), 'failed');
   assert.deepEqual([g.sent()[0].error_code, g.sent()[0].error_message], ['PACKAGE_UNSAFE', 'too_many_files']);
   for (const x of [f, g]) assert.equal(fs.existsSync(x.dir), false);
+});
+
+test('copies a crash left inside land() are cleaned up at start: a replaced copy comes back when the swap did not happen', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  const root = path.join(f.dataDir, 'templates');
+  const OTHER = U(30);
+  const put = (name, content) => { fs.mkdirSync(path.join(root, name), { recursive: true }); fs.writeFileSync(path.join(root, name, 'inject.md'), content); };
+  put(`${ADOPTION}.new-aaaaaaaaaaaa`, 'staged');
+  put(`${ADOPTION}.old-bbbbbbbbbbbb`, 'replaced');
+  put(`${OTHER}.old-cccccccccccc`, 'only copy');
+  put(`${OTHER}.new-dddddddddddd`, 'staged');
+  put('keep.new-eeeeeeeeeeee', 'not ours');
+  put(`${ADOPTION}.new-short`, 'not ours');
+  f.make();
+  assert.deepEqual(fs.readdirSync(root).sort(), [ADOPTION, `${ADOPTION}.new-short`, OTHER, 'keep.new-eeeeeeeeeeee'].sort());
+  assert.equal(fs.readFileSync(path.join(f.dir, 'inject.md'), 'utf8'), '# Demo\n\nHelp with demos.\n');
+  assert.equal(fs.readFileSync(path.join(root, OTHER, 'inject.md'), 'utf8'), 'only copy');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'trash')), []);
+});
+
+test('a template uninstall also removes the copies of that adoption a crash left behind', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  const root = path.join(f.dataDir, 'templates');
+  for (const n of [`${ADOPTION}.new-aaaaaaaaaaaa`, `${ADOPTION}.old-bbbbbbbbbbbb`, `${U(30)}.new-cccccccccccc`]) fs.mkdirSync(path.join(root, n));
+  f.state.update('intents', null, (d) => { d.queue.push({ ...intent({ id: U(14), op: 'uninstall', seq: 2 }), status: 'queued' }); });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.deepEqual(fs.readdirSync(root), [`${U(30)}.new-cccccccccccc`]);
+});
+
+test('without the slot hooks, or with a revoked bundle sha, nothing is written', async (t) => {
+  const f = await harness(t, { setup: () => {} });
+  fs.rmSync(path.join(f.zylosDir, '.claude', 'settings.json'));
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['CLIENT_INTERNAL', 'inject_unavailable']);
+  assert.equal(f.fake.requests.filter((r) => r.path === C04).length, 0);
+  assert.equal(fs.existsSync(f.dir), false);
+
+  for (const key of ['sha_block', 'package_sha256']) {
+    const g = await harness(t);
+    g.state.write('revoked', { ...EMPTY_REVOKED, [key]: [g.bundle.sha] });
+    assert.equal(await g.templates.runNext(), 'failed', key);
+    assert.deepEqual([g.sent()[0].error_code, g.sent()[0].error_message], ['CLIENT_INTERNAL', 'role_write_failed']);
+    assert.equal(fs.existsSync(g.dir), false);
+  }
+});
+
+test('reconcile frees slots of adoptions no longer active and reports a slot whose sha is not the landed one', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  const ghost = { adoption_id: U(31), inject_sha256: MANIFEST_SHA };
+  writeSlots(f.dataDir, { ...readSlots(f.dataDir), 2: ghost });
+  f.state.update('adoptions', {}, (d) => { d[U(31)] = { adoption_id: U(31), state: 'removed' }; });
+  assert.deepEqual(f.templates.reconcile(), []);
+  assert.equal(readSlots(f.dataDir)['2'], null);
+  writeSlots(f.dataDir, { 1: { adoption_id: ADOPTION, inject_sha256: MANIFEST_SHA } });
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_inject_missing', adoption_id: ADOPTION }]);
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  writeSlots(f.dataDir, { 1: { adoption_id: ADOPTION, inject_sha256: f.state.read('adoptions', {})[ADOPTION].inject_sha256 } });
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_locally_modified', adoption_id: ADOPTION, rendered_sha256: f.bundle.sha }]);
+});
+
+test('a revocation whose quarantine fails has already stopped the injection', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.writeFileSync(path.join(f.dataDir, 'quarantine'), '');
+  f.state.write('revoked', { ...EMPTY_REVOKED, manifest_sha256: [MANIFEST_SHA] });
+  assert.throws(() => f.templates.sweepRevoked());
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
 });

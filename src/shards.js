@@ -42,9 +42,26 @@ export function declaration(n) {
 
 const realOrNull = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
 
-// True when every declaration is in place and its emitter resolves to this client's entry file.
+// The hook file of the active zylos runtime: Codex reads .codex/hooks.json, Claude .claude/settings.json.
+export function hookFile(zylosDir) {
+  let runtime = 'claude';
+  try { runtime = JSON.parse(fs.readFileSync(path.join(zylosDir, '.zylos', 'config.json'), 'utf8')).runtime ?? 'claude'; } catch { /* default */ }
+  return runtime === 'codex' ? path.join(zylosDir, '.codex', 'hooks.json') : path.join(zylosDir, '.claude', 'settings.json');
+}
+
+// True when the hook sync has turned all four declarations into session-start hooks.
+export function hooksPresent(zylosDir) {
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(hookFile(zylosDir), 'utf8')); } catch { return false; }
+  const groups = cfg?.hooks?.SessionStart;
+  if (!Array.isArray(groups)) return false;
+  const commands = groups.flatMap((g) => (Array.isArray(g?.hooks) ? g.hooks : [])).map((h) => h?.command).filter((c) => typeof c === 'string');
+  return SLOTS.every((n) => commands.some((c) => c.includes('session-start-orchestrator.js') && c.trim().endsWith(` --shard ${shardName(n)}`)));
+}
+
+// True when every declaration is in place, its emitter resolves to this client's entry file, and its hook exists.
 export function declarationsReady(zylosDir) {
-  return SLOTS.every((n) => {
+  return hooksPresent(zylosDir) && SLOTS.every((n) => {
     let raw;
     try { raw = readJson(path.join(shardsDir(zylosDir), `${shardName(n)}.json`), null); } catch { return false; }
     const real = realOrNull(path.join(zylosDir, '.claude', emitterRel(n)));
