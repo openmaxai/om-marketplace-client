@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { ConfigError, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
 import { createLogger } from './logger.js';
-import { StateLockedError, readJson, stateScope } from './state.js';
+import { StateLockedError, readJson, stateScope, verifiedLockHolder } from './state.js';
 import { createRuntime, pollRound } from './app.js';
 import { EXIT, execute, spool } from './commands.js';
 import { membershipMessage } from './orgs.js';
@@ -26,12 +26,16 @@ const RELOCK_MS = 2000;
 
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
+// The service pid when the lock provably belongs to it; -1 when a live process whose identity cannot be checked holds
+// it; null when no process holds it.
 function lockHolder(dataDir) {
+  const pid = verifiedLockHolder(dataDir);
+  if (pid !== null) return pid;
   try {
-    const raw = fs.readFileSync(path.join(dataDir, 'state', 'lock'), 'utf8');
-    const pid = Number(JSON.parse(raw).pid);
-    process.kill(pid, 0);
-    return pid;
+    const other = Number(JSON.parse(fs.readFileSync(path.join(dataDir, 'state', 'lock'), 'utf8')).pid);
+    if (!Number.isSafeInteger(other) || other <= 0 || other === process.pid) return null;
+    process.kill(other, 0);
+    return -1;
   } catch (err) {
     return err.code === 'EPERM' ? -1 : null;
   }
@@ -79,7 +83,7 @@ export function readStatus(dataDir, config, now = Date.now()) {
 
 export function renderStatus(s) {
   const out = [`om-marketplace-client ${s.version}`];
-  out.push(`service: ${s.service === null ? 'not running' : `running${s.service > 0 ? ` (pid ${s.service})` : ''}`}`);
+  out.push(`service: ${s.service === null ? 'not running' : s.service > 0 ? `running (pid ${s.service})` : 'state lock held by a process that cannot be identified'}`);
   out.push('orgs:');
   for (const o of s.orgs) {
     out.push(`  ${o.org_id}${o.primary ? ' (primary)' : ''}: ${o.state}${o.since ? ` since ${o.since}` : ''}`);
@@ -106,51 +110,70 @@ export function renderStatus(s) {
   return out.join('\n');
 }
 
-// Runs the command with the state lock, or hands it to the lock holder (the service) and waits for its answer.
+// Runs the command with the state lock, or hands it to the lock holder (the service) and waits for its answer. A signal
+// while the command runs here aborts what can be aborted and exits once the current step has finished.
 async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) {
   const abort = new AbortController();
   const sp = spool(dataDir);
   let reqId = null;
+  let local = false;
+  let interrupted = false;
   const onSignal = () => {
     abort.abort();
+    if (local) {
+      if (!interrupted) print('interrupted; finishing the current step first');
+      interrupted = true;
+      return;
+    }
     if (reqId && sp.withdraw(reqId)) print('request withdrawn');
     else if (reqId) print('the service already started the request; see `market-client status`');
     process.exit(130);
   };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
-  const deadline = Date.now() + waitMs;
-  let nextLock = 0;
-  for (;;) {
-    if (Date.now() >= nextLock) {
-      nextLock = Date.now() + RELOCK_MS;
-      let runtime = null;
-      try {
-        runtime = createRuntime({ config, dataDir, logger, signal: abort.signal });
-      } catch (err) {
-        if (!(err instanceof StateLockedError)) throw err;
-      }
-      if (runtime) {
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  try {
+    const r = await commandLoop();
+    return interrupted ? { ...r, code: 130 } : r;
+  } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+
+  async function commandLoop() {
+    const deadline = Date.now() + waitMs;
+    let nextLock = 0;
+    for (;;) {
+      if (Date.now() >= nextLock) {
+        nextLock = Date.now() + RELOCK_MS;
+        let runtime = null;
         try {
-          if (reqId && !sp.withdraw(reqId)) return sp.take(reqId) ?? { code: EXIT.FAILED, message: 'the service stopped while running the request; check status' };
-          return await execute(runtime, { cmd, arg }, pollRound(logger, runtime));
-        } finally {
-          runtime.state.close();
+          runtime = createRuntime({ config, dataDir, logger, signal: abort.signal });
+        } catch (err) {
+          if (!(err instanceof StateLockedError)) throw err;
+        }
+        if (runtime) {
+          local = true;
+          try {
+            if (reqId && !sp.withdraw(reqId)) return sp.take(reqId) ?? { code: EXIT.FAILED, message: 'the service stopped while running the request; check status' };
+            return await execute(runtime, { cmd, arg }, pollRound(logger, runtime));
+          } finally {
+            runtime.state.close();
+          }
+        }
+        if (!reqId) {
+          reqId = sp.submit(cmd, arg);
+          print('the service holds the state lock; the request was handed to it');
         }
       }
-      if (!reqId) {
-        reqId = sp.submit(cmd, arg);
-        print('the service holds the state lock; the request was handed to it');
+      const r = sp.take(reqId);
+      if (r) return r;
+      if (Date.now() >= deadline) {
+        return sp.withdraw(reqId)
+          ? { code: EXIT.BUSY, message: 'the service did not take the request in time; nothing was done' }
+          : { code: EXIT.BUSY, message: 'the request is still running in the service; check `market-client status` later' };
       }
+      await sleep(POLL_MS);
     }
-    const r = sp.take(reqId);
-    if (r) return r;
-    if (Date.now() >= deadline) {
-      return sp.withdraw(reqId)
-        ? { code: EXIT.BUSY, message: 'the service did not take the request in time; nothing was done' }
-        : { code: EXIT.BUSY, message: 'the request is still running in the service; check `market-client status` later' };
-    }
-    await sleep(POLL_MS);
   }
 }
 

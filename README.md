@@ -83,15 +83,17 @@ write into a directory that is accessible by group or other.
 | Command | Effect |
 |---|---|
 | `status [--json]` | Service state, each org's validity, client version gate, last pulls and reconcile, installed skills and templates, queue and outbox sizes, alerts. Reads files only. |
-| `sync` | Runs one poll round now: revocations, orders, outbox resend, reconcile. |
-| `rollback <slug>` | Swaps the version kept by the last upgrade back in (the replaced one is kept instead) and reports `local_rollback` through reconcile. Refused when that version is revoked or an order for the skill is in flight. |
+| `sync` | Runs one poll round now: revocations, orders and outbox resend. Reconcile runs in it only when due (every 45 minutes). |
+| `rollback <slug>` | Swaps the version kept by the last upgrade back in (the replaced one is kept instead) and reports `local_rollback` through reconcile. Refused when the kept version is revoked, when the installed version is revoked and quarantined, or while an order or report for the skill is in flight. An interrupted rollback is completed at the next start. |
 | `enable <slug>` / `disable <slug>` | Moves the skill into / out of the skills directory, then reports it. A skill disabled because of a revocation cannot be enabled. |
 | `uninstall <slug>` | Removes the skill and its kept versions, then reports it. |
 
 `<slug>` may also be the skill id. Exit codes: 0 done, 1 failed, 2 usage,
 3 refused or not installed, 4 the running service did not answer within
 `--wait <seconds>` (default 900), 78 configuration error. A report the market
-could not take yet is kept and resent; the command still exits 0.
+could not take yet is kept and resent; the command still exits 0. Ctrl-C or
+SIGTERM while a command runs in the CLI itself aborts pending network calls,
+lets the current step finish and then exits 130.
 
 Only one process works on a data directory at a time. When the service is
 running, commands other than `status` are handed to it and run between poll
@@ -124,13 +126,23 @@ starting meanwhile waits for the lock.
 
 ## Uninstall
 
-`zylos uninstall om-marketplace-client` runs the pre-uninstall hook, which
-stops the service, moves every market-managed skill and template into
-`quarantine/` in the data directory, clears the template slots, removes the
-four `market-template-*` shard declarations and runs the zylos hook sync, and
-reports `client_uninstalled` to each configured org (at most 10 seconds). It
-never blocks the uninstall. Keep the data directory (no `--purge`) to keep the
-quarantined content and the revoked set.
+`zylos uninstall om-marketplace-client` runs the pre-uninstall hook, which:
+
+1. stops the service;
+2. removes the four `market-template-*` shard declarations (only those whose
+   JSON equals what this client declares) and runs the zylos hook sync. The
+   sync may restart the Agent once; memory and context are kept. A sync that
+   did not finish is redone by the next run of the hook;
+3. waits for the state lock (15 seconds, then one SIGTERM to the holder only
+   when its pid, start time and boot id match the lock, and up to 5 more
+   seconds). If the lock cannot be taken, skills and templates are left in
+   place and the hook ends here;
+4. moves every market-managed skill and template into `quarantine/` in the
+   data directory and clears the template slots;
+5. reports `client_uninstalled` to each configured org (at most 10 seconds).
+
+Failures are logged and never block the uninstall. Keep the data directory (no
+`--purge`) to keep the quarantined content and the revoked set.
 
 ## Upgrade
 

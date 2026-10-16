@@ -23,7 +23,7 @@ const SHOWN = new Set(['VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED', '
 const { O_RDONLY, O_NOFOLLOW } = fs.constants;
 const CORRUPT = Symbol('corrupt');
 
-function readMarker(dir) {
+export function readMarker(dir) {
   let fd;
   try {
     if (!fs.lstatSync(dir).isDirectory()) return null;
@@ -547,6 +547,7 @@ export function createSkills({
 
   // Swaps the version kept by the last upgrade back in; the replaced one takes its place in the rollback area. The
   // market learns of it through reconcile (local_rollback). Returns 'done', 'none', 'revoked', 'busy' or 'quarantined'.
+  // Journaled: a crash at any point is completed by resumeRollbacks at the next start.
   function rollback(skillId) {
     const rec = installs()[skillId];
     if (!rec) throw new Error(`skill ${skillId} is not installed`);
@@ -557,16 +558,59 @@ export function createSkills({
     const m = src ? readMarker(src) : null;
     if (m?.skill_id !== skillId || m.version_no !== prev.version_no) return 'none';
     if (isRevoked({ skill_version_id: prev.skill_version_id, package_sha256: m.package_sha256 })) return 'revoked';
-    const cur = dirOf(rec.slug, rec.state);
-    if (!moveDir(cur, rollbackDir(rec.slug, rec.version_no), skillId)) return 'none';
-    fs.renameSync(src, cur);
-    putRec(skillId, {
-      ...rec, skill_version_id: prev.skill_version_id, version_no: prev.version_no, package_sha256: m.package_sha256, rolled_back_at: iso(),
-      rollback: { version_no: rec.version_no, skill_version_id: rec.skill_version_id },
+    if (readMarker(dirOf(rec.slug, rec.state))?.package_sha256 !== rec.package_sha256) return 'none';
+    const rid = uuidv7(now());
+    const j = journal(rid, {
+      op: 'rollback', phase: 'rollback', skill_id: skillId, slug: rec.slug, where: rec.state,
+      from: { version_no: rec.version_no, skill_version_id: rec.skill_version_id, package_sha256: rec.package_sha256 },
+      to: { version_no: prev.version_no, skill_version_id: prev.skill_version_id, package_sha256: m.package_sha256 },
     });
-    logger.info(`skill ${rec.slug} rolled back from version ${rec.version_no} to ${prev.version_no}`);
-    return 'done';
+    return finishRollback(rid, j);
   }
+
+  // Idempotent: each step is taken only when the directories show it has not happened yet.
+  function finishRollback(rid, j) {
+    const { skill_id: skillId, slug, where, from, to } = j;
+    const live = dirOf(slug, where);
+    const fromDir = rollbackDir(slug, from.version_no);
+    const toDir = rollbackDir(slug, to.version_no);
+    const holds = (d, v) => {
+      const mk = readMarker(d);
+      return mk?.skill_id === skillId && mk.package_sha256 === v.package_sha256;
+    };
+    try {
+      if (holds(live, from) && holds(toDir, to)) moveDir(live, fromDir, skillId);
+      if (!exists(live) && holds(toDir, to)) moveDir(toDir, live, skillId);
+    } catch (err) {
+      if (!isConflict(err)) throw err;
+    }
+    const rec = installs()[skillId];
+    if (holds(live, to) && rec) {
+      if (rec.package_sha256 !== to.package_sha256 || rec.version_no !== to.version_no) {
+        putRec(skillId, {
+          ...rec, skill_version_id: to.skill_version_id, version_no: to.version_no, package_sha256: to.package_sha256, rolled_back_at: iso(),
+          rollback: { version_no: from.version_no, skill_version_id: from.skill_version_id },
+        });
+      }
+      journal(rid, { phase: 'closed', closed: 'done' });
+      logger.info(`skill ${slug} rolled back from version ${from.version_no} to ${to.version_no}`);
+      return 'done';
+    }
+    if (!exists(live) && holds(fromDir, from)) moveDir(fromDir, live, skillId);
+    journal(rid, { phase: 'closed', closed: 'failed' });
+    const msg = `rollback of skill ${slug} to version ${to.version_no} could not be completed; version ${from.version_no} is kept`;
+    state.setAlert(`rollback:${skillId}`, msg);
+    logger.warn(msg);
+    return 'none';
+  }
+
+  function resumeRollbacks() {
+    for (const id of state.journal.list()) {
+      const j = readEntry('journal', id);
+      if (j !== CORRUPT && j?.op === 'rollback' && j.phase === 'rollback') finishRollback(id, j);
+    }
+  }
+  resumeRollbacks();
 
   return {
     enforceRevocations,

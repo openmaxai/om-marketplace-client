@@ -169,3 +169,49 @@ test('with the service running, commands are handed to it; a holder that never a
   assert.match(r.stdout, /did not take the request in time; nothing was done/);
   assert.deepEqual(fs.readdirSync(path.join(s.dataDir, 'cli')), []);
 });
+
+function snapshot(root) {
+  const out = {};
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      const st = fs.lstatSync(p);
+      out[path.relative(root, p)] = [st.mtimeMs, st.mode, st.size];
+      if (e.isDirectory()) walk(p);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+test('status changes nothing in the data dir and does not call a lock of an unidentifiable process running', async (t) => {
+  const s = await setup(t);
+  const before = snapshot(s.dataDir);
+  assert.equal((await cli(['status'], s.env)).code, 0);
+  assert.deepEqual(snapshot(s.dataDir), before);
+  const other = spawn('sleep', ['30'], { stdio: 'ignore' });
+  t.after(() => other.kill('SIGKILL'));
+  fs.writeFileSync(path.join(s.dataDir, 'state', 'lock'), JSON.stringify({ pid: other.pid, start: 'another-boot:1' }));
+  const r = await cli(['status'], s.env);
+  assert.doesNotMatch(r.stdout, /service: running/);
+  assert.match(r.stdout, /cannot be identified/);
+});
+
+test('a signal during a local command lets it finish, releases the lock and exits 130', async (t) => {
+  const s = await setup(t);
+  s.fake.script('POST', `/api/v1/orgs/${ORG}/revocations:query`, { status: 200, delayMs: 1500, json: { items: [], next_cursor: null, has_more: false } });
+  const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), 'sync'], { env: s.env });
+  let stdout = '';
+  child.stdout.on('data', (c) => { stdout += c; });
+  const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  const lock = path.join(s.dataDir, 'state', 'lock');
+  for (const end = Date.now() + 5000; !fs.existsSync(lock);) {
+    assert.ok(Date.now() < end, 'cli took the lock');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  child.kill('SIGINT');
+  child.kill('SIGTERM');
+  assert.equal(await exited, 130);
+  assert.match(stdout, /finishing the current step/);
+  assert.ok(!fs.existsSync(lock), 'the lock was released, so the command ran to its end');
+});

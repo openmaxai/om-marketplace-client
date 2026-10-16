@@ -2,7 +2,8 @@
 // scenario's skills round and is SIGKILLed, then two clean children restart it, and the final state is checked.
 // MODE=count kills before the Nth write-like fs call, N = 1, 2, ... until a child completes without being killed.
 // MODE=timer kills at a random time in [0, MAXD) ms after the round starts.
-// SCEN: install, upgrade, disabled-upgrade, disable, enable, uninstall, refused (rollback after the market refuses).
+// SCEN: install, upgrade, disabled-upgrade, disable, enable, uninstall, refused (rollback after the market refuses),
+// rollback (local rollback to the kept version; the killed child runs it instead of a round).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -16,7 +17,7 @@ const MODE = process.env.MODE ?? 'timer';
 const ROUNDS = Number(process.env.ROUNDS ?? 20);
 const SCEN = process.env.SCEN ?? 'upgrade';
 const MAXD = Number(process.env.MAXD ?? 400);
-const SCENARIOS = ['install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused'];
+const SCENARIOS = ['install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused', 'rollback'];
 if (!SCENARIOS.includes(SCEN)) throw new Error(`unknown SCEN ${SCEN}`);
 
 const many = (tag) => Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`docs/f${i}.md`, `${tag} ${i}\n`.repeat(50)]));
@@ -24,9 +25,9 @@ const V1 = skillPackage('demo-skill', many('v1'));
 const V2 = skillPackage('demo-skill', many('v2'));
 const CHILD = path.join(import.meta.dirname, 'kill-child.mjs');
 
-function runChild(h, killAfter, killAt = 0) {
+function runChild(h, killAfter, killAt = 0, action = 'round') {
   return new Promise((resolve) => {
-    const arg = JSON.stringify({ url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, origin: h.storage.origin });
+    const arg = JSON.stringify({ url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, origin: h.storage.origin, action, skillId: SKILL });
     const c = spawn(process.execPath, [CHILD, arg], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, KILL_AT: String(killAt) } });
     let out = '';
     let err = '';
@@ -75,6 +76,10 @@ async function setup(h) {
   }
   if (SCEN === 'install') await h.queue(['install', 1]);
   else if (SCEN === 'upgrade') await h.queue(['upgrade', 2]);
+  else if (SCEN === 'rollback') {
+    await h.queue(['upgrade', 2]);
+    await h.make().runRound();
+  }
   else if (SCEN === 'uninstall') await h.queue(['uninstall']);
   else if (SCEN === 'disable') await h.queue(['disable']);
   else if (SCEN === 'enable') {
@@ -138,6 +143,16 @@ function finalIssues(h, st) {
     if (s !== 'ok') issues.push(`v1 tree ${s}`);
     if (ls(rb).length) issues.push(`rollback left ${ls(rb)}`);
     if (fs.existsSync(dis)) issues.push('stray disabled dir');
+  } else if (SCEN === 'rollback') {
+    // Either not started or complete, with the record matching the directories.
+    const done = rec?.version_no === 1;
+    const [live, kept, keptNo] = done ? [V1, V2, '2'] : [V2, V1, '1'];
+    if (rec?.state !== 'enabled' || rec.rollback?.version_no !== Number(keptNo) || rec.package_sha256 !== live.sha) issues.push(`rec ${rec?.version_no}/${rec?.state}/${rec?.rollback?.version_no}`);
+    const s = same(en, live);
+    if (s !== 'ok') issues.push(`live tree ${s} (rec v${rec?.version_no})`);
+    if (JSON.stringify(ls(rb)) !== JSON.stringify([keptNo]) || same(path.join(rb, keptNo), kept) !== 'ok') issues.push(`rollback ${ls(rb)}`);
+    if (fs.existsSync(dis)) issues.push('stray disabled dir');
+    if (st.journal.list().some((id) => st.journal.get(id)?.op === 'rollback' && st.journal.get(id).phase !== 'closed')) issues.push('rollback journal open');
   } else if (SCEN === 'uninstall') {
     if (rec) issues.push('rec still present');
     if (fs.existsSync(en)) issues.push(`skills dir left: ${Object.keys(tree(en)).length} files`);
@@ -163,7 +178,8 @@ for (let r = 0; r < ROUNDS; r++) {
   await setup(h);
   h.state.close();
   const at = MODE === 'count' ? r + 1 : Math.floor(Math.random() * MAXD);
-  const k = MODE === 'count' ? await runChild(h, null, at) : await runChild(h, at);
+  const action = SCEN === 'rollback' ? 'rollback' : 'round';
+  const k = MODE === 'count' ? await runChild(h, null, at, action) : await runChild(h, at, 0, action);
   const cleanup = async () => { for (const f of afters.reverse()) { try { await f(); } catch { /* best effort */ } } };
   if (MODE === 'count' && !k.sig) {
     if (k.code !== 0) results.bad.push({ r, at, why: 'unkilled child failed', err: k.err.slice(0, 500) });

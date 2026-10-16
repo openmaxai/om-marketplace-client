@@ -6,6 +6,12 @@ import { readJson, writeJsonAtomic } from './state.js';
 export const COMMANDS = new Set(['sync', 'rollback', 'enable', 'disable', 'uninstall']);
 export const EXIT = Object.freeze({ OK: 0, FAILED: 1, USAGE: 2, REFUSED: 3, BUSY: 4, CONFIG: 78 });
 const STALE_REQUEST_MS = 60 * 60 * 1000;
+export const MAX_ARG_LENGTH = 200;
+const MAX_REQUEST_BYTES = 4096;
+
+// sync takes no argument; the skill commands take a slug or skill id.
+export const validRequest = (cmd, arg) => typeof cmd === 'string' && COMMANDS.has(cmd)
+  && (cmd === 'sync' ? arg === null : typeof arg === 'string' && arg.length > 0 && arg.length <= MAX_ARG_LENGTH);
 
 const result = (code, message) => ({ code, message });
 
@@ -64,6 +70,7 @@ export function spool(dataDir) {
     pending: () => ids('json').length > 0,
 
     submit(cmd, arg) {
+      if (!validRequest(cmd, arg ?? null)) throw new TypeError('invalid command request');
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       const id = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
       writeJsonAtomic(file(id, 'json'), { cmd, arg: arg ?? null, at: new Date().toISOString() });
@@ -95,13 +102,15 @@ export function spool(dataDir) {
         let req;
         try {
           fs.renameSync(file(id, 'json'), file(id, 'run'));
-          req = readJson(file(id, 'run'), null);
+          req = fs.lstatSync(file(id, 'run')).size <= MAX_REQUEST_BYTES ? readJson(file(id, 'run'), null) : null;
         } catch { continue; }
-        if (!req || !COMMANDS.has(req.cmd) || !(now - Date.parse(req.at) < STALE_REQUEST_MS)) {
+        const age = now - Date.parse(req?.at);
+        if (!req || typeof req !== 'object' || !validRequest(req.cmd, req.arg) || !(age >= 0 && age < STALE_REQUEST_MS)) {
+          writeJsonAtomic(file(id, 'result.json'), result(EXIT.USAGE, 'request refused: malformed or expired'));
           fs.rmSync(file(id, 'run'), { force: true });
           continue;
         }
-        out.push({ id, ...req });
+        out.push({ id, cmd: req.cmd, arg: req.arg, at: req.at });
       }
       return out;
     },
