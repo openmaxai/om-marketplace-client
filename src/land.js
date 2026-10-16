@@ -80,12 +80,22 @@ function targetState(target, skillId) {
   return 'ours';
 }
 
-// The slug may not be the name of any other local skill directory or of any local SKILL.md. Links are not followed.
+// A directory, or a link that resolves to one: local tools load linked skills, so their names count. Dangling and
+// unreadable links and links to anything else are compared by entry name only.
+function isSkillDir(dir, ent) {
+  if (ent.isDirectory()) return true;
+  if (!ent.isSymbolicLink()) return false;
+  try { return fs.statSync(dir).isDirectory(); } catch { return false; }
+}
+
+// The slug may not be the name of any other local skill directory or of any local SKILL.md. Linked skills are only read;
+// SKILL.md itself is opened without following a final link.
 function checkNames(skillsDir, slug, own) {
   for (const ent of fs.readdirSync(skillsDir, { withFileTypes: true })) {
     if (ent.name === own) continue;
     if (ent.name.toLowerCase() === slug) throw conflict('name_taken');
-    if (ent.isDirectory() && localSkillName(path.join(skillsDir, ent.name, 'SKILL.md')) === slug) throw conflict('name_taken');
+    const dir = path.join(skillsDir, ent.name);
+    if (isSkillDir(dir, ent) && localSkillName(path.join(dir, 'SKILL.md')) === slug) throw conflict('name_taken');
   }
 }
 

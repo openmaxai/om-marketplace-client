@@ -76,6 +76,19 @@ test('a failed later page keeps earlier pages and does not count as success', as
   assert.equal(revokedSet(state).has('skill_version_id', U(5)), true);
 });
 
+test('when this round\'s pull fails, the set from earlier rounds still blocks installs', async (t) => {
+  const { fake, puller, state } = await setup(t);
+  const block = rev(0, { kind: 'sha_block', skill_id: null, skill_version_id: null, package_sha256: SHA('c') });
+  fake.script('POST', PATH, page([rev(5), block], C(2)), { status: 503, problem: { code: 'DEPENDENCY_UNAVAILABLE' } });
+  assert.deepEqual(await puller.pull(), { outcome: 'ok' });
+  assert.deepEqual(await puller.pull(), { outcome: 'transient' });
+  const set = revokedSet(state);
+  assert.equal(set.has('skill_version_id', U(5)), true);
+  assert.equal(set.blocksSha(SHA('a')), true);
+  assert.equal(set.blocksSha(SHA('c')), true);
+  assert.equal(set.blocksSha(SHA('d')), false);
+});
+
 test('no successful pull for 24 h writes a status alert and one warn log, and clears on success', async (t) => {
   const { fake, puller, state, clock, lines } = await setup(t);
   const stale = () => state.read('status', null).alerts.revocations_stale;
