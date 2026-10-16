@@ -5,6 +5,7 @@ import path from 'node:path';
 import { skillPackage } from './fake/package.js';
 import { SKILL, VID, skillHarness } from './fake/skills.js';
 import { emptyTrash } from '../src/trash.js';
+import { installed } from './fake/skill-cases.js';
 
 const v2 = () => skillPackage('demo-skill', { 'docs/guide.md': 'guide v2\n' });
 const rid = (req) => req.path.split('/')[6];
@@ -68,6 +69,23 @@ test('a local error that keeps an intent from running raises an alert, cleared o
   assert.equal(fs.existsSync(h.target), false);
 });
 
+test('an intent_failed alert is cleared once its intent leaves the queue without running', async (t) => {
+  const h = await skillHarness(t);
+  const s = h.make();
+  await h.queue(['install', 1]);
+  await s.runRound();
+  const trash = path.join(h.dataDir, 'trash');
+  fs.rmSync(trash, { recursive: true, force: true });
+  fs.writeFileSync(trash, '');
+  const [it] = await h.queue(['uninstall']);
+  assert.deepEqual(await s.runRound(), ['deferred']);
+  assert.ok(alerts(h)[`intent_failed:${it.id}`]);
+  h.state.update('intents', null, (d) => { d.queue = d.queue.filter((q) => q.id !== it.id); });
+  assert.deepEqual(await s.runRound(), []);
+  assert.equal(alerts(h)[`intent_failed:${it.id}`], undefined);
+  assert.ok(fs.existsSync(h.target));
+});
+
 test('startup cleanup never follows a linked trash or staging dir and survives entries it cannot remove', async (t) => {
   const h = await skillHarness(t);
   const outside = path.join(path.dirname(h.dataDir), 'outside');
@@ -86,4 +104,23 @@ test('startup cleanup never follows a linked trash or staging dir and survives e
   if (process.getuid?.() === 0) return;
   assert.equal(left, 1);
   assert.deepEqual(fs.readdirSync(dir), ['locked']);
+});
+
+test('an uninstall whose copy is in the trash but cannot be deleted succeeds with an alert, cleared once the trash is emptied', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const { h, s } = await installed(t);
+  const sub = fs.readdirSync(h.target, { withFileTypes: true }).find((e) => e.isDirectory()).name;
+  fs.chmodSync(path.join(h.target, sub), 0o500);
+  const trash = path.join(h.dataDir, 'trash');
+  const unlock = () => { for (const n of fs.readdirSync(trash)) fs.chmodSync(path.join(trash, n, sub), 0o700); };
+  t.after(() => { try { unlock(); } catch { /* emptied */ } });
+  await h.queue(['uninstall']);
+  assert.deepEqual(await s.runRound(), ['done']);
+  assert.equal(fs.existsSync(h.target), false);
+  assert.equal(rec(h), undefined);
+  assert.equal(fs.readdirSync(trash).length, 1);
+  assert.match(alerts(h).trash_left.message, /removed at the next start/);
+  unlock();
+  h.make();
+  assert.deepEqual(fs.readdirSync(trash), []);
+  assert.equal(alerts(h).trash_left, undefined);
 });

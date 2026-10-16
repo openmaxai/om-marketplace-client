@@ -182,3 +182,116 @@ test('one rollback that cannot be resumed does not stop the others', { skip: pro
   assert.equal(f.state.journal.get(U(49)).phase, 'rollback');
   assert.match(f.state.read('status', null).alerts[`rollback_open:${U(49)}`].message, new RegExp(`of skill ${SKILL}`));
 });
+
+const openEntry = (f, id, over = {}) => f.state.journal.put(id, {
+  op: 'rollback', phase: 'rollback', skill_id: SKILL, slug: 'demo', where: 'enabled',
+  from: { version_no: 2, skill_version_id: VID(2), package_sha256: SHA(2) }, to: { version_no: 1, skill_version_id: VID(1), package_sha256: SHA(1) },
+  ...over,
+});
+const alertsOf = (f) => f.state.read('status', null)?.alerts ?? {};
+
+test('an open-rollback alert raised before a restart is cleared once the rollback completes at startup', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  const slot = path.dirname(f.rb(1));
+  fs.chmodSync(slot, 0o500);
+  t.after(() => fs.chmodSync(slot, 0o700));
+  assert.throws(() => f.make().rollback(SKILL), { code: 'EACCES' });
+  assert.equal(Object.keys(alertsOf(f)).filter((k) => k.startsWith('rollback_open:')).length, 1);
+  fs.chmodSync(slot, 0o700);
+  const s = f.make();
+  rolledBack(f);
+  assert.deepEqual(Object.keys(alertsOf(f)).filter((k) => k.startsWith('rollback_open:')), []);
+  assert.deepEqual(s.localScan().busy, new Set());
+});
+
+test('a well-formed JSON rollback entry with unusable content is closed as failed with an alert, directories untouched', async (t) => {
+  const cases = [
+    { from: undefined }, { to: null }, { where: 'elsewhere' }, { where: 'revoked_disabled' }, { slug: '../demo' },
+    { from: { version_no: '2', package_sha256: SHA(2) } }, { to: { version_no: 1 } }, { skill_id: 7 },
+  ];
+  for (const over of cases) {
+    const f = await harness(t);
+    openEntry(f, U(50), over);
+    const s = f.make();
+    untouched(f);
+    assert.deepEqual([f.state.journal.get(U(50)).phase, f.state.journal.get(U(50)).closed], ['closed', 'failed'], JSON.stringify(over));
+    const key = typeof over.skill_id === 'number' ? `rollback:${U(50)}` : `rollback:${SKILL}`;
+    assert.match(alertsOf(f)[key].message, /closed as failed/, JSON.stringify(over));
+    assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
+    assert.deepEqual(s.localScan().busy, new Set());
+    assert.equal(s.rollback(SKILL), 'done');
+  }
+});
+
+test('a rollback entry failing for a non-filesystem reason is closed, not kept stuck', async (t) => {
+  const f = await harness(t);
+  openEntry(f, U(50));
+  const get = f.state.journal.get;
+  let thrown = false;
+  f.state.journal.get = (id) => {
+    const j = get(id);
+    if (id !== U(50) || thrown || j?.phase !== 'rollback') return j;
+    thrown = true;
+    return { ...j, get from() { throw new TypeError('bad entry'); } };
+  };
+  const s = f.make();
+  untouched(f);
+  assert.deepEqual([f.state.journal.get(U(50)).phase, f.state.journal.get(U(50)).closed], ['closed', 'failed']);
+  assert.match(alertsOf(f)[`rollback:${SKILL}`].message, /bad entry/);
+  assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
+  assert.deepEqual(s.localScan().busy, new Set());
+});
+
+test('startup survives a journal that cannot be listed; the rollback resumes and the alert clears once it can', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  openEntry(f, U(50));
+  const dir = path.join(f.state.dir, 'requests');
+  fs.chmodSync(dir, 0o000);
+  t.after(() => fs.chmodSync(dir, 0o700));
+  const s = f.make();
+  untouched(f);
+  assert.match(alertsOf(f).journal_unreadable.message, /cannot be listed/);
+  await s.runRound();
+  untouched(f);
+  assert.ok(alertsOf(f).journal_unreadable);
+  fs.chmodSync(dir, 0o700);
+  await s.runRound();
+  rolledBack(f);
+  assert.equal(alertsOf(f).journal_unreadable, undefined);
+});
+
+test('an unreadable (EACCES) rollback entry is kept, not moved aside, and retried', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  openEntry(f, U(50));
+  const file = path.join(f.state.dir, 'requests', `${U(50)}.json`);
+  fs.chmodSync(file, 0o000);
+  t.after(() => { try { fs.chmodSync(file, 0o600); } catch { /* moved */ } });
+  const s = f.make();
+  untouched(f);
+  assert.ok(fs.existsSync(file));
+  assert.equal(fs.existsSync(path.join(f.state.dir, 'corrupt')), false);
+  assert.ok(alertsOf(f)[`rollback_open:${U(50)}`]);
+  fs.chmodSync(file, 0o600);
+  await s.runRound();
+  rolledBack(f);
+  assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
+});
+
+test('a rollback whose directories moved but whose state file is corrupt stays open and is retried with an alert', async (t) => {
+  const f = await harness(t);
+  openEntry(f, U(50));
+  fs.renameSync(f.live, f.rb(2));
+  fs.renameSync(f.rb(1), f.live);
+  const file = path.join(f.state.dir, 'installs.json');
+  const good = fs.readFileSync(file);
+  fs.writeFileSync(file, '{');
+  const s = f.make();
+  assert.equal(f.state.journal.get(U(50)).phase, 'rollback');
+  assert.match(alertsOf(f)[`rollback_open:${U(50)}`].message, /retried every round/);
+  assert.equal(alertsOf(f)[`rollback:${SKILL}`], undefined);
+  fs.writeFileSync(file, good);
+  await s.runRound();
+  rolledBack(f);
+  assert.deepEqual([f.state.journal.get(U(50)).phase, f.state.journal.get(U(50)).closed], ['closed', 'done']);
+  assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
+});

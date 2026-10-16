@@ -10,6 +10,8 @@ import { createIntentPuller } from '../src/intents.js';
 import { EMPTY_REVOKED, createRevocationPuller } from '../src/revocations.js';
 import { createTemplates } from '../src/templates.js';
 import { ensureDeclarations, readSlots, shardsDir, writeSlots } from '../src/shards.js';
+import { HOOKS_REPORT_MARGIN_MS } from '../src/templates.js';
+import { writeSlotHooks } from './fake/zylos.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
 import { C02, SKILL, VID, skillHarness } from './fake/skills.js';
@@ -49,7 +51,11 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const templates = make();
   setup?.(h.dataDir, h.state);
   const sent = () => h.fake.requests.filter((r) => r.path === C15).map((r) => r.json);
-  return { ...h, bundle, zylosDir, make, templates, sent, dir: path.join(h.dataDir, 'templates', ADOPTION) };
+  // Queues one more C-04 answer serving bundle b.
+  const serveAgain = (b = bundle, expiresAt = '2026-10-16T00:05:00Z') => h.fake.script('GET', C04, { status: 200, json: {
+    download_url: storage.serve(`/t${h.fake.requests.length}`, { status: 200, body: b.zip }), expires_at: expiresAt, sha256: b.sha, size: b.size,
+  } });
+  return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, dir: path.join(h.dataDir, 'templates', ADOPTION) };
 }
 
 test('a write intent lands the bundle, takes a slot, is emitted and reported with C-15', async (t) => {
@@ -312,4 +318,246 @@ test('a revocation whose quarantine fails has already stopped the injection', as
   assert.throws(() => f.templates.sweepRevoked());
   assert.equal(readSlots(f.dataDir)['1'], null);
   assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+});
+
+const alertsOf = (f) => f.state.read('status', null)?.alerts ?? {};
+const rewrite = (f, over = {}) => f.state.update('intents', null, (d) => {
+  d.queue.push({ ...intent({ id: U(15), seq: 2, bundle_sha256: f.bundle.sha, discard_local_changes: true, ...over }), status: 'queued' });
+});
+// Makes fs.renameSync throw EIO when fn(src, dst) is true, until restored.
+function failRename(t, fn) {
+  const orig = fs.renameSync;
+  fs.renameSync = (a, b) => { if (fn(String(a), String(b))) throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' }); return orig(a, b); };
+  const restore = () => { fs.renameSync = orig; };
+  t.after(restore);
+  return restore;
+}
+
+test('a new epoch without slots.json raises an alert only when templates/ holds adoption dirs', async (t) => {
+  const fresh = await harness(t);
+  fresh.state.write('epoch', null);
+  fresh.make();
+  assert.equal(alertsOf(fresh).template_epoch, undefined);
+  fs.mkdirSync(path.join(fresh.dataDir, 'templates', 'not-an-adoption'), { recursive: true });
+  fresh.state.write('epoch', null);
+  fresh.make();
+  assert.equal(alertsOf(fresh).template_epoch, undefined);
+
+  const f = await harness(t);
+  await f.templates.runNext();
+  const slots = readSlots(f.dataDir);
+  fs.rmSync(path.join(f.dataDir, 'slots.json'));
+  f.state.write('epoch', null);
+  const g = f.make();
+  assert.match(alertsOf(f).template_epoch.message, /without slots\.json/);
+  assert.equal(fs.existsSync(path.join(f.dir, 'inject.md')), true);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'slots.json')), false);
+  assert.ok(f.state.read('epoch', null));
+  g.reconcile();
+  f.make();
+  assert.match(alertsOf(f).template_epoch.message, /without slots\.json/);
+  writeSlots(f.dataDir, slots);
+  g.reconcile();
+  assert.equal(alertsOf(f).template_epoch, undefined);
+
+  fs.writeFileSync(path.join(f.dataDir, 'slots.json'), '{');
+  f.state.write('epoch', null);
+  f.make();
+  assert.match(alertsOf(f).template_epoch.message, /unreadable/);
+  f.make();
+  assert.match(alertsOf(f).template_epoch.message, /unreadable/);
+  writeSlots(f.dataDir, slots);
+  f.make();
+  assert.equal(alertsOf(f).template_epoch, undefined);
+});
+
+test('a rewrite leaves only templates/<id>: no staged or replaced copy stays behind', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'templates')), [ADOPTION]);
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\n');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'trash')), []);
+});
+
+test('a failed swap puts the replaced copy back', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  const before = f.state.read('adoptions', null)[ADOPTION];
+  const restore = failRename(t, (a, b) => /\.new-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  assert.equal(await f.templates.runNext(), 'failed');
+  restore();
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\nedited\n');
+  assert.deepEqual(fs.readdirSync(path.join(f.dataDir, 'templates')), [ADOPTION]);
+  assert.deepEqual({ ...f.state.read('adoptions', null)[ADOPTION], updated_at: null }, { ...before, updated_at: null });
+  assert.equal(readSlots(f.dataDir)['1'].adoption_id, ADOPTION);
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_locally_modified', adoption_id: ADOPTION, rendered_sha256: f.bundle.sha }]);
+});
+
+test('a first write that fails to land leaves a failed record, quarantined when revoked, and a retry lands it', async (t) => {
+  const f = await harness(t);
+  const restore = failRename(t, (a, b) => /\.new-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  assert.equal(await f.templates.runNext(), 'failed');
+  restore();
+  assert.equal(f.state.read('adoptions', null)[ADOPTION].state, 'failed');
+  assert.deepEqual(f.templates.reconcile(), []);
+  fs.mkdirSync(f.dir, { recursive: true });
+  const g = await harness(t);
+  const undo = failRename(t, (a, b) => /\.new-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  await g.templates.runNext();
+  undo();
+  fs.mkdirSync(g.dir, { recursive: true });
+  g.state.write('revoked', { ...EMPTY_REVOKED, manifest_sha256: [MANIFEST_SHA] });
+  g.templates.sweepRevoked();
+  assert.equal(fs.existsSync(g.dir), false);
+  assert.equal(g.state.read('adoptions', null)[ADOPTION].state, 'quarantined');
+  f.serveAgain();
+  rewrite(f);
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.state.read('adoptions', null)[ADOPTION].state, 'active');
+  assert.deepEqual(f.templates.reconcile(), []);
+});
+
+test('when putting the replaced copy back fails too, it is kept and restored at the next start', async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  fs.appendFileSync(path.join(f.dir, 'sop/triage.md'), 'edited\n');
+  f.serveAgain();
+  rewrite(f);
+  const restore = failRename(t, (a, b) => /\.(new|old)-[0-9a-f]{12}$/.test(a) && b.endsWith(ADOPTION));
+  assert.equal(await f.templates.runNext(), 'failed');
+  restore();
+  const root = path.join(f.dataDir, 'templates');
+  const names = fs.readdirSync(root);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(names.map((n) => n.replace(/[0-9a-f]{12}$/, '')), [`${ADOPTION}.old-`]);
+  assert.equal(f.state.read('adoptions', null)[ADOPTION].state, 'active');
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_inject_missing', adoption_id: ADOPTION }]);
+  f.make();
+  assert.deepEqual(fs.readdirSync(root), [ADOPTION]);
+  assert.equal(fs.readFileSync(path.join(f.dir, 'sop/triage.md'), 'utf8'), '# Triage\nedited\n');
+});
+
+test('a leftover .old that is not a directory is never put in place', async (t) => {
+  const f = await harness(t);
+  const root = path.join(f.dataDir, 'templates');
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, `${ADOPTION}.old-aaaaaaaaaaaa`), 'file');
+  fs.symlinkSync(path.dirname(f.dataDir), path.join(root, `${U(30)}.old-bbbbbbbbbbbb`));
+  f.make();
+  assert.deepEqual(fs.readdirSync(root), []);
+  assert.ok(fs.existsSync(path.dirname(f.dataDir)));
+});
+
+test('a template uninstall moves the content out whole even when it cannot be deleted', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const f = await harness(t);
+  await f.templates.runNext();
+  const locked = path.join(f.dir, 'sop');
+  fs.chmodSync(locked, 0o500);
+  t.after(() => {
+    for (const n of fs.readdirSync(path.join(f.dataDir, 'trash'))) fs.chmodSync(path.join(f.dataDir, 'trash', n, 'sop'), 0o700);
+  });
+  f.state.update('intents', null, (d) => { d.queue.push({ ...intent({ id: U(14), op: 'uninstall', seq: 2 }), status: 'queued' }); });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.sent()[1].status, 'succeeded');
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(fs.readdirSync(path.join(f.dataDir, 'trash')).length, 1);
+  assert.equal(f.state.read('adoptions', null)[ADOPTION].state, 'removed');
+  assert.match(alertsOf(f).trash_left.message, /removed at the next start/);
+  assert.deepEqual(f.templates.reconcile(), []);
+});
+
+const codex = (f) => {
+  fs.mkdirSync(path.join(f.zylosDir, '.zylos'), { recursive: true });
+  fs.writeFileSync(path.join(f.zylosDir, '.zylos', 'config.json'), '{"runtime":"codex"}');
+};
+
+const MIN = 60 * 1000;
+
+test('on Codex a write waits for the slot hooks with an alert at once; it lands once they appear', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-20T00:00:00Z' })] });
+  codex(f);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session, then adopt the template again/);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.deepEqual(f.sent(), []);
+  assert.equal(f.fake.requests.filter((r) => r.path === C04).length, 0);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(f.state.read('intents', null).queue.map((q) => q.status), ['running']);
+  assert.equal(f.lines.filter((l) => /waits for the slot hooks/.test(l)).length, 1);
+
+  writeSlotHooks(f.zylosDir, { runtime: 'codex' });
+  f.serveAgain(bundle, '2026-10-18T00:00:00Z');
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.sent()[0].status, 'succeeded');
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  assert.equal(f.state.read('template_hooks', null), null);
+});
+
+test('on Codex a write with the market\'s 10 min expiry is reported as inject_unavailable at least 2 min before it expires', async (t) => {
+  const bundle = templateBundle();
+  const pending = (f) => assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session/);
+  const unavailable = (f) => assert.deepEqual(
+    f.sent().map((b) => [b.status, b.error_code, b.error_message, b.rendered_sha256]), [['failed', 'CLIENT_INTERNAL', 'inject_unavailable', bundle.sha]],
+  );
+  const early = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-16T00:10:00Z' })] });
+  codex(early);
+  assert.equal(await early.templates.runNext(), 'deferred');
+  pending(early);
+  let left = Date.parse('2026-10-16T00:10:00Z') - early.clock.t;
+  while ((await early.templates.runNext()) === 'deferred') {
+    early.clock.t += MIN;
+    left -= MIN;
+  }
+  assert.ok(left >= HOOKS_REPORT_MARGIN_MS - MIN && left > 2 * MIN, `reported with ${left} ms left`);
+  unavailable(early);
+  pending(early);
+  assert.deepEqual(early.state.read('intents', null).queue, []);
+  assert.equal(early.fake.requests.filter((r) => r.path === C04).length, 0);
+
+  // Pulled with less than the margin left: reported in its first round.
+  const late = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-16T00:07:00Z' })] });
+  codex(late);
+  assert.equal(await late.templates.runNext(), 'failed');
+  unavailable(late);
+  pending(late);
+  late.clock.t += 25 * 60 * MIN;
+  assert.equal(await late.templates.runNext(), null);
+  pending(late);
+});
+
+test('on Codex a write with no known expiry waits one round, and an expired one is never dropped without an alert', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha })] });
+  f.state.update('intents', null, (d) => { delete d.queue[0].expires_at; });
+  codex(f);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.equal(f.sent()[0].error_message, 'inject_unavailable');
+  assert.deepEqual(f.state.read('template_hooks', null).deferred, []);
+
+  const g = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-16T00:10:00Z' })] });
+  codex(g);
+  g.clock.t += 11 * MIN;
+  assert.equal(await g.templates.runNext(), null);
+  assert.match(alertsOf(g).template_hooks_pending.message, /restart the Codex session/);
+  assert.ok(g.lines.some((l) => /expired before it was run; dropped/.test(l)));
+  assert.deepEqual(g.state.read('intents', null).queue, []);
+});
+
+test('on Claude missing slot hooks still fail the write at once', async (t) => {
+  const f = await harness(t);
+  fs.rmSync(path.join(f.zylosDir, '.claude', 'settings.json'));
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['CLIENT_INTERNAL', 'inject_unavailable']);
+  assert.equal(f.state.read('template_hooks', null), null);
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
 });

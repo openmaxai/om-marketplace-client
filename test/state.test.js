@@ -504,3 +504,21 @@ test('an unusable status.json is moved aside and replaced; alerts and runs never
   assert.deepEqual(Object.keys(s.read('status', null).alerts), ['a']);
   s.close();
 });
+
+test('a status.json that cannot be read (EACCES) is not moved aside; its alerts are kept and new ones reported', { skip: process.getuid?.() === 0 && 'root ignores modes' }, (t) => {
+  const s = openState(path.join(tmpHome(), 'd'), { bffUrl: BFF, now: () => 0 });
+  s.setAlert('a', 'kept');
+  const file = path.join(s.dir, 'status.json');
+  fs.chmodSync(file, 0o000);
+  t.after(() => fs.chmodSync(file, 0o600));
+  assert.throws(() => s.read('status', null), (err) => err.code === 'EACCES' && !(err instanceof StateError));
+  assert.equal(s.setAlert('b', 'not stored'), true);
+  s.clearAlert('a');
+  s.recordRun('r', 'ok');
+  assert.deepEqual(s.alertKeys(''), []);
+  assert.equal(fs.existsSync(path.join(s.dir, 'corrupt')), false);
+  fs.chmodSync(file, 0o600);
+  assert.deepEqual(Object.keys(s.read('status', null).alerts), ['a']);
+  assert.deepEqual(s.alertKeys('a'), ['a']);
+  s.close();
+});

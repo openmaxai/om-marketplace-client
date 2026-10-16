@@ -456,11 +456,35 @@ test('a budget read failing with any error, or a broken status.json, still does 
   assert.ok(st.alerts['corrupt:status']);
 });
 
-test('a budget that cannot be stored is not spent: nothing is sent', async (t) => {
+test('a budget that cannot be stored is not spent: nothing is sent, an alert is raised and the round is not rate_limited', async (t) => {
   const f = await harness(t, { orgs: {} });
-  const state = { ...f.state, write: (n, v) => { if (n === 'reconcile') throw new Error('ENOSPC'); return f.state.write(n, v); } };
+  let failing = true;
+  const state = { ...f.state, write: (n, v) => { if (n === 'reconcile' && failing) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }); return f.state.write(n, v); } };
   const r = createReconciler({ api: f.api, state, orgs: f.orgs, skills: f.skills, templates: f.templates, logger: f.logger, now: f.now });
   f.queue({});
-  assert.equal((await r.run()).outcome, 'rate_limited');
+  assert.equal((await r.run()).outcome, 'budget_unsaved');
   assert.equal(f.reports().length, 0);
+  let st = f.state.read('status', null);
+  assert.match(st.alerts['reconcile:budget_write'].message, /cannot be written \(ENOSPC\)/);
+  assert.equal(st.runs.reconcile.outcome, 'budget_unsaved');
+  failing = false;
+  assert.equal((await r.run()).outcome, 'ok');
+  assert.equal(f.reports().length, 1);
+  st = f.state.read('status', null);
+  assert.equal(st.alerts['reconcile:budget_write'], undefined);
+});
+
+test('the budget alert is cleared only after the run was stored', async (t) => {
+  const f = await harness(t, { orgs: {} });
+  let writes = 0;
+  const state = { ...f.state, write: (n, v) => { if (n === 'reconcile' && ++writes === 2) throw new Error('EIO'); return f.state.write(n, v); } };
+  const r = createReconciler({ api: f.api, state, orgs: f.orgs, skills: f.skills, templates: f.templates, logger: f.logger, now: f.now });
+  const old = new Date(f.clock.t - 25 * 60 * 60 * 1000).toISOString();
+  f.state.write('status', { alerts: { 'reconcile:budget': { message: 'm', since: old, updated_at: old } }, runs: {} });
+  f.queue({});
+  assert.equal((await r.run()).outcome, 'ok');
+  assert.equal(f.reports().length, 1);
+  assert.ok(f.state.read('status', null).alerts['reconcile:budget'], 'run not stored: alert kept');
+  await r.run();
+  assert.equal(f.state.read('status', null).alerts['reconcile:budget'], undefined);
 });

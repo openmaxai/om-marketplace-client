@@ -11,7 +11,8 @@ import { MARKER, SKILL_DIR_PREFIX, failureFor, landSkill } from './land.js';
 import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
 import { InstallFailure } from './failure.js';
 import { StateError } from './state.js';
-import { discard, emptyTrash, fsyncDir } from './trash.js';
+import { validSlug } from './pkg/frontmatter.js';
+import { TRASH_ALERT, discard, emptyTrash, fsyncDir, leftInTrash } from './trash.js';
 
 export const MAX_INTENTS_PER_ROUND = 20;
 const SKILL_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall']);
@@ -22,6 +23,12 @@ const GONE = new Set(['INTENT_NOT_PENDING', 'INTENT_EXPIRED']);
 const SHOWN = new Set(['VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED', 'SKILL_ALREADY_INSTALLED', 'INSTALLED_BY_OTHER_ORG']);
 const { O_RDONLY, O_NOFOLLOW } = fs.constants;
 const CORRUPT = Symbol('corrupt');
+// Node system errors (EACCES, EIO, ENOSPC...) carry a syscall; anything else thrown on a journal entry means its content is bad.
+const isFsError = (err) => typeof err?.syscall === 'string';
+const isVersion = (v) => v !== null && typeof v === 'object' && Number.isSafeInteger(v.version_no) && v.version_no >= 0
+  && typeof v.package_sha256 === 'string';
+const validRollbackEntry = (j) => typeof j.skill_id === 'string' && typeof j.slug === 'string' && validSlug(j.slug)
+  && (j.where === 'enabled' || j.where === 'disabled') && isVersion(j.from) && isVersion(j.to);
 
 export function readMarker(dir) {
   let fd;
@@ -53,11 +60,12 @@ export function createSkills({
   const rollbackDir = (slug, no) => path.join(dataDir, 'rollback', slug, String(no));
   const trashRoot = path.join(dataDir, 'trash');
   const stagingRoot = path.join(dataDir, 'staging');
-  const drop = (dir) => discard(dir, trashRoot);
+  const drop = (dir) => discard(dir, trashRoot, leftInTrash(state, logger));
   // Nothing is in flight at startup: what a crash left in the trash or in staging goes first.
   for (const d of [trashRoot, stagingRoot]) {
     const left = emptyTrash(d);
     if (left) logger.warn(`${left} entries under ${d} could not be removed; retried at the next start`);
+    else if (d === trashRoot) state.clearAlert(TRASH_ALERT);
   }
   const journal = (id, patch) => {
     const j = { ...state.journal.get(id), ...patch, updated_at: iso() };
@@ -465,7 +473,13 @@ export function createSkills({
 
   async function flushOutbox(blocked) {
     for (const id of state.outbox.list()) {
-      const o = readEntry('outbox', id);
+      let o;
+      try {
+        o = readEntry('outbox', id);
+      } catch (err) {
+        logger.error(`report ${id} cannot be read (${err.code ?? err.message}); retried next round`);
+        continue;
+      }
       if (o === CORRUPT || !o || blocked.has(o.org_id)) continue;
       let r;
       try {
@@ -540,7 +554,7 @@ export function createSkills({
   function busySkills() {
     const busy = new Set(state.read('intents', EMPTY_INTENTS).queue
       .filter((q) => q.skill_id && (q.status === 'queued' || q.status === 'running')).map((q) => q.skill_id));
-    const peek = (kind, id) => { try { return state[kind].get(id); } catch (err) { if (err instanceof StateError) return null; throw err; } };
+    const peek = (kind, id) => { try { return state[kind].get(id); } catch { return null; } };
     for (const id of state.outbox.list()) {
       const sid = peek('outbox', id)?.skill_id ?? peek('journal', id)?.response?.skill_id;
       if (sid) busy.add(sid);
@@ -622,27 +636,61 @@ export function createSkills({
     if (state.setAlert(`rollback_open:${id}`, msg)) logger.error(msg);
   }
 
-  // One failing entry never stops the others or the caller.
+  // An open rollback entry that is unusable, or fails for a reason other than the filesystem, is closed as failed; the
+  // directories are left as they are.
+  function closeBroken(id, j, why) {
+    journal(id, { phase: 'closed', closed: 'failed' });
+    const skillId = typeof j?.skill_id === 'string' ? j.skill_id : null;
+    const msg = `rollback ${id}${skillId ? ` of skill ${skillId}` : ''} could not be completed (${why}); its journal entry was closed as failed`;
+    state.setAlert(`rollback:${skillId ?? id}`, msg);
+    logger.error(msg);
+  }
+
+  // One failing entry never stops the others or the caller. Only filesystem and state errors keep an entry open for a
+  // retry; a malformed entry is closed as failed. An open-rollback alert of an entry that is not stuck any more is
+  // cleared, also when it was raised before a restart.
   function resumeRollbacks(ids) {
     for (const id of ids) {
       let j;
       try {
         j = readEntry('journal', id);
-        if (j !== CORRUPT && j?.op === 'rollback' && j.phase === 'rollback') finishRollback(id, j);
+        if (j !== CORRUPT && j?.op === 'rollback' && j.phase === 'rollback') {
+          if (validRollbackEntry(j)) finishRollback(id, j);
+          else closeBroken(id, j, 'malformed journal entry');
+        }
       } catch (err) {
-        stuck(id, j?.skill_id ?? stuckRollbacks.get(id) ?? null, err);
-        continue;
+        if (isFsError(err) || err instanceof StateError) {
+          stuck(id, j?.skill_id ?? stuckRollbacks.get(id) ?? null, err);
+          continue;
+        }
+        try {
+          closeBroken(id, j, err.message);
+        } catch (e) {
+          stuck(id, j?.skill_id ?? stuckRollbacks.get(id) ?? null, e);
+          continue;
+        }
       }
-      if (stuckRollbacks.delete(id)) state.clearAlert(`rollback_open:${id}`);
+      stuckRollbacks.delete(id);
     }
+    for (const key of state.alertKeys('rollback_open:')) if (!stuckRollbacks.has(key.slice('rollback_open:'.length))) state.clearAlert(key);
   }
-  try {
-    resumeRollbacks(state.journal.list());
-  } catch (err) {
-    const msg = `the request journal cannot be listed (${err.code ?? err.message}); interrupted rollbacks are not resumed`;
-    state.setAlert('journal_unreadable', msg);
-    logger.error(msg);
+
+  // Resumes every open rollback; while the journal cannot be listed it is tried again every round.
+  let journalListed = false;
+  function resumeAll() {
+    let ids;
+    try {
+      ids = state.journal.list();
+    } catch (err) {
+      const msg = `the request journal cannot be listed (${err.code ?? err.message}); interrupted rollbacks are not resumed`;
+      if (state.setAlert('journal_unreadable', msg)) logger.error(msg);
+      return;
+    }
+    journalListed = true;
+    state.clearAlert('journal_unreadable');
+    resumeRollbacks(ids);
   }
+  resumeAll();
 
   return {
     enforceRevocations,
@@ -652,7 +700,10 @@ export function createSkills({
     async runRound({ limit = MAX_INTENTS_PER_ROUND } = {}) {
       const blocked = new Set();
       const outcomes = [];
-      if (stuckRollbacks.size) resumeRollbacks([...stuckRollbacks.keys()]);
+      if (!journalListed) resumeAll();
+      else if (stuckRollbacks.size) resumeRollbacks([...stuckRollbacks.keys()]);
+      const queued = new Set(state.read('intents', EMPTY_INTENTS).queue.map((q) => q.id));
+      for (const key of state.alertKeys('intent_failed:')) if (!queued.has(key.slice('intent_failed:'.length))) state.clearAlert(key);
       enforceRevocations();
       await flushOutbox(blocked);
       for (let n = 0; n < limit && !signal?.aborted && !tooOld(state); n++) {

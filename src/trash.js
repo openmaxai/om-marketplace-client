@@ -14,8 +14,9 @@ export function fsyncDir(dir) {
 }
 
 // Removes dir without ever leaving part of it in place: it is renamed into trashRoot (same filesystem, so the rename is
-// atomic) and only then deleted. A crash in between leaves it in the trash, which emptyTrash clears at startup.
-export function discard(dir, trashRoot) {
+// atomic) and only then deleted. A crash in between leaves it in the trash, which emptyTrash clears at startup. The
+// rename is the commit point: with onLeft, a delete failing with a filesystem error is passed to it instead of thrown.
+export function discard(dir, trashRoot, onLeft = null) {
   let st;
   try { st = fs.lstatSync(dir); } catch (err) { if (err.code === 'ENOENT') return false; throw err; }
   fs.mkdirSync(trashRoot, { recursive: true, mode: 0o700 });
@@ -25,9 +26,22 @@ export function discard(dir, trashRoot) {
   fs.renameSync(dir, bin);
   fsyncDir(path.dirname(dir));
   fsyncDir(trashRoot);
-  fs.rmSync(bin, { recursive: true, force: true });
+  try {
+    fs.rmSync(bin, { recursive: true, force: true });
+  } catch (err) {
+    if (!onLeft || typeof err?.code !== 'string') throw err;
+    onLeft(bin, err);
+  }
   return true;
 }
+
+export const TRASH_ALERT = 'trash_left';
+
+// An onLeft for discard: the copy stays in the trash until emptyTrash at the next start, with an alert meanwhile.
+export const leftInTrash = (state, logger) => (bin, err) => {
+  logger.warn(`${bin} could not be deleted (${err.code ?? err.message}); it is removed at the next start`);
+  state.setAlert(TRASH_ALERT, 'entries in the trash could not be deleted; they are removed at the next start');
+};
 
 // Deletes everything under dir; for areas nothing else can see (trash, staging). dir itself must be a real directory, so a
 // link is never followed. Returns how many entries could not be removed.

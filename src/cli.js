@@ -122,7 +122,7 @@ export function commandSignals(ctx, { abort, sp, print, exit = (code) => process
         exit(130);
         return;
       }
-      if (!ctx.interrupted) print('interrupted; finishing the current step first (Ctrl-C again to exit now)');
+      if (!ctx.interrupted) print(`interrupted; finishing the current step first${sig === 'SIGINT' ? ' (Ctrl-C again to exit now)' : ''}`);
       ctx.interrupted = true;
       return;
     }

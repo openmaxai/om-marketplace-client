@@ -78,8 +78,10 @@ variables after install; the PM2 app filters them out and the service removes
 any it inherits, logging only their names. At runtime the service reads only
 `config.json`. Key rotation: rerun post-install with the complete variable set.
 Post-install and post-upgrade declare the template session-start shards and run
-the zylos hook sync only when their hooks are missing: the agent restarts once
-when idle; memory and context are kept.
+the zylos hook sync only when their hooks are missing. On Claude the agent
+restarts once when idle; memory and context are kept. On Codex the templates
+take effect when the Codex session next starts; template writes wait until then
+(an alert is raised after 24 h).
 
 ## Commands
 

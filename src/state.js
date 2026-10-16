@@ -61,7 +61,8 @@ export function writeJsonAtomic(file, value) {
   fsyncDir(path.dirname(file));
 }
 
-// Missing file -> fallback; a symlink, non-file or unparsable file fails closed.
+// Missing file -> fallback; a symlink, non-file or unparsable file is a StateError. Read errors (EACCES, EIO) are
+// thrown as they are: the file may be fine.
 export function readJson(file, fallback) {
   let st;
   try {
@@ -71,8 +72,9 @@ export function readJson(file, fallback) {
     throw err;
   }
   if (!st.isFile()) throw new StateError(`${file} is not a regular file`);
+  const text = fs.readFileSync(file, 'utf8');
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    return JSON.parse(text);
   } catch {
     throw new StateError(`${file} is not valid JSON`);
   }
@@ -389,6 +391,12 @@ export function openState(dataDir, { bffUrl, orgId, memberId, now = Date.now }) 
         s.alerts[key] = { message, since: s.alerts[key]?.since ?? iso(), updated_at: iso() };
       });
       return added || !ok;
+    },
+    // Keys of the stored alerts starting with prefix; empty when status.json cannot be read.
+    alertKeys(prefix) {
+      let cur = null;
+      try { cur = read('status', EMPTY_STATUS); } catch { /* none readable */ }
+      return usable(cur) ? Object.keys(cur.alerts).filter((k) => k.startsWith(prefix)) : [];
     },
     clearAlert(key) {
       let cur = null;

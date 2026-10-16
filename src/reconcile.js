@@ -115,22 +115,26 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
     return null;
   }
 
-  // False when the document is unusable or the change cannot be stored.
+  // 'ok', 'unusable' (the document could not be used) or 'unsaved' (the change could not be stored, with an alert that
+  // clears at the next stored change).
   function updateDoc(fn) {
     const d = readDoc();
-    if (!d) return false;
+    if (!d) return 'unusable';
     fn(d);
     try {
       state.write('reconcile', d);
     } catch (err) {
-      logger.error(`reconcile budget file cannot be written: ${err.message}`);
-      return false;
+      const msg = `reconcile budget file cannot be written (${err.code ?? err.message}); reports are not sent`;
+      if (state.setAlert('reconcile:budget_write', msg)) logger.error(msg);
+      return 'unsaved';
     }
-    return true;
+    state.clearAlert('reconcile:budget_write');
+    return 'ok';
   }
 
   // Takes one report from the hourly budget, persisted before the request is sent. Stamps ahead of the clock (it was set
   // back) are dropped, and a stored block never lasts longer than the longest Retry-After honoured.
+  // Returns 'ok', 'spent' or 'unsaved'.
   function takeBudget() {
     const t = now();
     let ok = false;
@@ -141,7 +145,8 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
       d.sent.push(iso());
       ok = true;
     });
-    return stored && ok;
+    if (stored === 'unsaved') return 'unsaved';
+    return stored === 'ok' && ok ? 'ok' : 'spent';
   }
 
   // The alert for a reset budget file stays listed for a day after it was last raised, then goes with the next run.
@@ -169,14 +174,16 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
   }
 
   // Sends entries in batches; returns 'ok', 'dropped' (sent without items or batches the market refused), 'deferred',
-  // 'rate_limited' or 'rejected'. A batch refused with 400 is resent once without the items it names, or skipped.
+  // 'rate_limited', 'budget_unsaved' or 'rejected'. A batch refused with 400 is resent once without the items it names, or skipped.
   async function send(orgId, agentId, entries, tally) {
     const queue = batches(entries).map((b) => ({ batch: b, retried: false }));
     let dropped = false;
     let accepted = 0;
     while (queue.length) {
       const { batch, retried } = queue.shift();
-      if (!takeBudget()) return 'rate_limited';
+      const budget = takeBudget();
+      if (budget === 'unsaved') return 'budget_unsaved';
+      if (budget !== 'ok') return 'rate_limited';
       let outcomes;
       try {
         outcomes = await api.reportReconcile({ orgId, agentId, items: batch.map((e) => e.item) });
@@ -263,6 +270,7 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
 
     const tally = { recorded: 0, skipped: 0 };
     let limited = false;
+    let unsaved = false;
     let failed = false;
     for (const [orgId, all] of byOrg) {
       const r = report[orgId];
@@ -273,8 +281,10 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
         return false;
       });
       r.items = entries.length;
-      r.sent = entries.length && !limited ? await send(orgId, r.agentId, entries, tally) : entries.length ? 'rate_limited' : 'ok';
-      if (r.sent === 'rate_limited') limited = true;
+      if (!entries.length) r.sent = 'ok';
+      else r.sent = limited ? 'rate_limited' : await send(orgId, r.agentId, entries, tally);
+      if (r.sent === 'budget_unsaved') unsaved = true;
+      else if (r.sent === 'rate_limited') limited = true;
       else if (r.sent !== 'ok') failed = true;
       if (r.sent === 'ok' && r.status === 'ok') {
         state.clearAlert(`reconcile:${orgId}`);
@@ -289,13 +299,13 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
       delete r.agentId;
     }
 
-    const outcome = limited ? 'rate_limited' : failed || Object.values(report).some((r) => r.status !== 'ok') ? 'partial' : 'ok';
+    const outcome = unsaved ? 'budget_unsaved' : limited ? 'rate_limited' : failed || Object.values(report).some((r) => r.status !== 'ok') ? 'partial' : 'ok';
     const reported = Object.values(report).reduce((n, r) => n + (r.items ?? 0), 0);
     const stored = updateDoc((d) => {
       d.last_run_at = new Date(lastRun).toISOString();
       d.last = { at: iso(), outcome, orgs: report, ...tally };
     });
-    if (stored) clearBudgetAlert();
+    if (stored === 'ok') clearBudgetAlert();
     state.recordRun('reconcile', outcome);
     const line = `reconcile: ${outcome}, ${reported} discrepancies (${tally.recorded} recorded, ${tally.skipped} skipped)`;
     if (reported) logger.info(line);

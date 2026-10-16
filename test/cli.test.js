@@ -237,6 +237,7 @@ test('locally a first signal lets the step finish; a second SIGINT exits at once
   assert.deepEqual([r.exits, r.lines.length], [[], 1]);
   r = run(['SIGTERM', 'SIGINT'], local());
   assert.deepEqual(r.exits, [130]);
+  assert.equal(r.lines[0], 'interrupted; finishing the current step first');
   r = run(['SIGINT'], { reqId: 'x', local: false, interrupted: false });
   assert.deepEqual([r.exits, r.withdrawn, r.lines], [[130], ['x'], ['request withdrawn']]);
 });
