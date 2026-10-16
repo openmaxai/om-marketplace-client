@@ -1,6 +1,4 @@
 export const POLL_INTERVAL_MS = 5 * 60 * 1000;
-// Base 50 min so that +20% jitter still stays within the 60 min reconcile bound.
-export const RECONCILE_INTERVAL_MS = 50 * 60 * 1000;
 export const JITTER_RATIO = 0.2;
 
 // Returns baseMs scaled uniformly into [1 - JITTER_RATIO, 1 + JITTER_RATIO].

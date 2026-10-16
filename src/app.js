@@ -3,7 +3,7 @@ import path from 'node:path';
 import { EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
 import { createLogger } from './logger.js';
-import { createScheduler, POLL_INTERVAL_MS, RECONCILE_INTERVAL_MS } from './scheduler.js';
+import { createScheduler, POLL_INTERVAL_MS } from './scheduler.js';
 import { createAuth } from './auth.js';
 import { createMarketHttp } from './http.js';
 import { createMarketApi } from './market-api.js';
@@ -13,13 +13,14 @@ import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
 import { createSkills } from './skills.js';
 import { createTemplates } from './templates.js';
+import { createReconciler } from './reconcile.js';
 import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
 
 // Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
-// queued skill intents run, then at most one template intent. A round is skipped while the token's member id
-// contradicts the configured one.
-export function buildTasks(logger, { revocations, intents, skills, templates, identity, now = Date.now } = {}) {
+// queued skill intents run, then at most one template intent, then reconcile when it is due (reconcile.maybeRun), so
+// a scan never runs alongside an install. A round is skipped while the token's member id contradicts the configured one.
+export function buildTasks(logger, { revocations, intents, skills, templates, reconcile, identity, now = Date.now } = {}) {
   return [
     {
       name: 'poll',
@@ -33,17 +34,16 @@ export function buildTasks(logger, { revocations, intents, skills, templates, id
           await intents.pull();
         }
         try {
-          await skills?.runRound();
+          try {
+            await skills?.runRound();
+          } finally {
+            await templates?.runNext();
+          }
         } finally {
-          await templates?.runNext();
+          await reconcile?.maybeRun();
         }
         return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
-    },
-    {
-      name: 'reconcile',
-      baseMs: RECONCILE_INTERVAL_MS,
-      run: async () => logger.debug(`reconcile: ${templates?.reconcile().length ?? 0} template discrepancies`),
     },
   ];
 }
@@ -127,6 +127,7 @@ export function createRuntime({
       intents: createIntentPuller({ api, state, orgs, logger }),
       revocations,
       templates,
+      reconcile: createReconciler({ api, state, orgs, skills, templates, logger }),
     };
   } catch (err) {
     state.close();
