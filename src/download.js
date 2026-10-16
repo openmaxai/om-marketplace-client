@@ -83,10 +83,17 @@ export async function downloadPackage({
   let link = null;
   let urls = 0;
   let flaky = 0;
-  // A C-03 call has its own request timeout; a slow answer still may not run past the deadline.
-  const beforeDeadline = (p) => {
+  // A C-03 call has its own request timeout; a slow answer still may not run past the deadline, where it is aborted.
+  const beforeDeadline = (call) => {
+    const ctl = new AbortController();
     let timer;
-    const late = new Promise((_, reject) => { timer = setTimeout(() => reject(overdue()), Math.max(0, left())); });
+    const late = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(overdue());
+        ctl.abort();
+      }, Math.max(0, left()));
+    });
+    const p = (async () => call(ctl.signal))();
     p.catch(() => {});
     return Promise.race([p, late]).finally(() => clearTimeout(timer));
   };
@@ -101,7 +108,7 @@ export async function downloadPackage({
     if (!link || now() >= Date.parse(link.expires_at) - EXPIRY_MARGIN_MS) {
       if (urls === 2) throw internal('download_url_expired');
       try {
-        link = await beforeDeadline(api.packageDownload({ orgId, subPath }));
+        link = await beforeDeadline((cancel) => api.packageDownload({ orgId, subPath, signal: cancel }));
       } catch (err) {
         if (!(err instanceof MarketError)) throw err;
         if (left() <= 0) throw overdue();
