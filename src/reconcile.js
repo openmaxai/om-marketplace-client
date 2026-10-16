@@ -9,6 +9,7 @@ export const RATE_WINDOW_MS = 60 * 60 * 1000;
 export const RATE_BUDGET = 20;
 // Checked every poll round (5 min +/-20%), so a run starts 45 to 51 minutes after the previous one.
 export const RECONCILE_EVERY_MS = 45 * 60 * 1000;
+const BUDGET_ALERT_KEEP_MS = 24 * 60 * 60 * 1000;
 export const EMPTY_RECONCILE = Object.freeze({ last_run_at: null, sent: [], blocked_until: null, last: null });
 
 const SKILL = { required: ['skill_id'], optional: ['skill_version_id', 'installed_sha256'] };
@@ -140,9 +141,14 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
       d.sent.push(iso());
       ok = true;
     });
-    if (!stored) return false;
-    if (ok) state.clearAlert('reconcile:budget');
-    return ok;
+    return stored && ok;
+  }
+
+  // The alert for a reset budget file stays listed for a day after it was last raised, then goes with the next run.
+  function clearBudgetAlert() {
+    let a = null;
+    try { a = state.read('status', null)?.alerts?.['reconcile:budget']; } catch { /* status is repaired by setAlert */ }
+    if (a && !(now() - Date.parse(a.updated_at) < BUDGET_ALERT_KEEP_MS)) state.clearAlert('reconcile:budget');
   }
 
   async function listed(orgId, agentId) {
@@ -285,10 +291,11 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
 
     const outcome = limited ? 'rate_limited' : failed || Object.values(report).some((r) => r.status !== 'ok') ? 'partial' : 'ok';
     const reported = Object.values(report).reduce((n, r) => n + (r.items ?? 0), 0);
-    updateDoc((d) => {
+    const stored = updateDoc((d) => {
       d.last_run_at = new Date(lastRun).toISOString();
       d.last = { at: iso(), outcome, orgs: report, ...tally };
     });
+    if (stored) clearBudgetAlert();
     state.recordRun('reconcile', outcome);
     const line = `reconcile: ${outcome}, ${reported} discrepancies (${tally.recorded} recorded, ${tally.skipped} skipped)`;
     if (reported) logger.info(line);

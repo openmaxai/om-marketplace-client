@@ -312,7 +312,13 @@ test('an unusable budget file pauses reporting for one hour with an alert and ne
     f.clock.t += 1;
     assert.equal((await f.reconciler.run()).outcome, 'ok', bad);
     assert.equal(f.reports().length, 1);
-    assert.equal(f.state.read('status', null).alerts['reconcile:budget'], undefined);
+    assert.ok(f.state.read('status', null).alerts['reconcile:budget'], 'still listed after reporting resumed');
+    f.clock.t += 23 * 60 * 60 * 1000 - 1;
+    await f.reconciler.run();
+    assert.ok(f.state.read('status', null).alerts['reconcile:budget']);
+    f.clock.t += 1;
+    await f.reconciler.run();
+    assert.equal(f.state.read('status', null).alerts['reconcile:budget'], undefined, bad);
   }
 });
 
