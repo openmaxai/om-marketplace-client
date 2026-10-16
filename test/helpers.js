@@ -15,8 +15,15 @@ export const VALID_ENV = Object.freeze({
   COCO_IDENTITY_ID: '9a8b7c6d-3333-4d4e-bf5a-cccccccccccc',
 });
 
+const tmpDirs = [];
+process.on('exit', () => {
+  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+});
+
 export function tmpHome() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'om-mc-test-'));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'om-mc-test-'));
+  tmpDirs.push(d);
+  return d;
 }
 
 // Minimal env so the developer's own COCO_* vars never leak into tests.
