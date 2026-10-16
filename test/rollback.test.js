@@ -276,3 +276,22 @@ test('an unreadable (EACCES) rollback entry is kept, not moved aside, and retrie
   rolledBack(f);
   assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
 });
+
+test('a rollback whose directories moved but whose state file is corrupt stays open and is retried with an alert', async (t) => {
+  const f = await harness(t);
+  openEntry(f, U(50));
+  fs.renameSync(f.live, f.rb(2));
+  fs.renameSync(f.rb(1), f.live);
+  const file = path.join(f.state.dir, 'installs.json');
+  const good = fs.readFileSync(file);
+  fs.writeFileSync(file, '{');
+  const s = f.make();
+  assert.equal(f.state.journal.get(U(50)).phase, 'rollback');
+  assert.match(alertsOf(f)[`rollback_open:${U(50)}`].message, /retried every round/);
+  assert.equal(alertsOf(f)[`rollback:${SKILL}`], undefined);
+  fs.writeFileSync(file, good);
+  await s.runRound();
+  rolledBack(f);
+  assert.deepEqual([f.state.journal.get(U(50)).phase, f.state.journal.get(U(50)).closed], ['closed', 'done']);
+  assert.equal(alertsOf(f)[`rollback_open:${U(50)}`], undefined);
+});

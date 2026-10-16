@@ -8,12 +8,15 @@ import { EMPTY_INTENTS, tooOld } from './intents.js';
 import { revokedSet } from './revocations.js';
 import { downloadPackage } from './download.js';
 import { failureFor, scan, writeConfined } from './land.js';
-import { discard, fsyncDir } from './trash.js';
+import { discard, fsyncDir, leftInTrash } from './trash.js';
 import { INJECT, inspectBundle } from './pkg/bundle.js';
 import { declarationsReady, emptySlots, readSlots, runtimeOf, writeSlots } from './shards.js';
+import { JITTER_RATIO, POLL_INTERVAL_MS } from './scheduler.js';
 
 export const MAX_TOMBSTONES = 1000;
-export const HOOKS_PENDING_ALERT_MS = 24 * 60 * 60 * 1000;
+// A write waiting for the Codex slot hooks is reported while its intent still has at least 2 min left, even when the
+// next poll round comes as late as the jitter allows.
+export const HOOKS_REPORT_MARGIN_MS = 2 * 60 * 1000 + Math.ceil(POLL_INTERVAL_MS * (1 + JITTER_RATIO));
 const C15_CODES = new Set(['PACKAGE_MISMATCH', 'PACKAGE_UNSAFE', 'INSTALL_TARGET_CONFLICT', 'CLIENT_INTERNAL']);
 const RETRY_LATER = new Set(['INTENT_OUT_OF_ORDER', 'CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 const LIVE = new Set(['queued', 'running']);
@@ -143,6 +146,10 @@ export function createTemplates({
     if (state.setAlert(`template:${id}`, msg)) logger.warn(msg);
   }
 
+  function adoptionDirs() {
+    try { return fs.readdirSync(path.join(dataDir, 'templates')).filter(isCanonicalUuid); } catch { return []; }
+  }
+
   // A new install epoch (no epoch record in this state dir) clears the slot map and quarantines every template dir
   // named by a canonical adoption id; declarations are never touched. Missing or unreadable slots.json: nothing is
   // touched and nothing is written; that is an alert unless templates/ holds no adoption dir (a fresh install).
@@ -154,20 +161,24 @@ export function createTemplates({
       state.setAlert('template_epoch', 'slots.json is unreadable; template content was left untouched');
       logger.warn('slots.json is unreadable; template content was left untouched');
     } else if (slots === null) {
-      let names = [];
-      try { names = fs.readdirSync(path.join(dataDir, 'templates')); } catch { /* no templates dir */ }
-      if (names.some(isCanonicalUuid)) {
+      if (adoptionDirs().length) {
         const msg = 'new install epoch without slots.json while templates/ holds adoption content; it was left untouched';
         state.setAlert('template_epoch', msg);
         logger.warn(msg);
       }
     } else {
       writeSlots(dataDir, emptySlots());
-      let names = [];
-      try { names = fs.readdirSync(path.join(dataDir, 'templates')); } catch { /* no templates dir */ }
-      for (const name of names.filter(isCanonicalUuid)) quarantine(dataDir, name);
+      for (const name of adoptionDirs()) quarantine(dataDir, name);
     }
     state.write('epoch', { epoch: uuidv7(now()), created_at: iso(), tombstones: [] });
+  }
+
+  // The template_epoch alert holds while slots.json is unreadable, or missing with adoption dirs in templates/.
+  function epochResolved() {
+    let slots;
+    try { slots = readSlots(dataDir); } catch { return; }
+    if (slots === null && adoptionDirs().length) return;
+    state.clearAlert('template_epoch');
   }
 
   function failureOf(err) {
@@ -187,7 +198,7 @@ export function createTemplates({
     if (rec?.state === 'active' && rec.bundle_sha256 === it.bundle_sha256 && st?.isDirectory() && unchanged(rec)) {
       return assignSlot(id, rec.inject_sha256);
     }
-    if (st && (!st.isDirectory() || !(rec?.state === 'active' || rec?.state === 'writing'))) throw conflict('target_exists');
+    if (st && (!st.isDirectory() || !['active', 'writing', 'failed'].includes(rec?.state))) throw conflict('target_exists');
     if (st && rec.state === 'active' && !it.discard_local_changes && !unchanged(rec)) throw conflict('locally_modified');
     const slots = readSlots(dataDir) ?? emptySlots();
     if (!slotOf(slots, id) && !Object.values(slots).includes(null)) throw internal('slots_full');
@@ -208,7 +219,16 @@ export function createTemplates({
       template: bundle.index.template, version: bundle.index.version, inject_sha256: injectSha, state: 'writing',
       files: bundle.files.map((f) => ({ path: f.path, size: f.data.length, sha256: sha256(f.data) })),
     });
-    land(dataDir, id, bundle);
+    try {
+      land(dataDir, id, bundle);
+    } catch (err) {
+      // The previous active version is what the market still has: it is kept (reconcile reports it when its content is
+      // not in place); any other attempt ends as failed.
+      state.update('adoptions', {}, (d) => {
+        d[id] = rec?.state === 'active' ? { ...rec, updated_at: iso() } : { ...d[id], state: 'failed', updated_at: iso() };
+      });
+      throw err;
+    }
     putAdoption(id, { state: 'active' });
     assignSlot(id, injectSha);
   }
@@ -231,20 +251,31 @@ export function createTemplates({
     return 'closed';
   }
 
-  // Codex adds the slot hooks only when its session next starts, so a write waits for them instead of failing; the
-  // wait is an alert after HOOKS_PENDING_ALERT_MS.
-  function hooksPending(it) {
-    let since = state.read('template_hooks', null)?.pending_since;
-    if (!Number.isFinite(Date.parse(since))) {
-      since = iso();
-      state.write('template_hooks', { pending_since: since });
-      logger.info(`template intent ${it.id} waits for the slot hooks; it takes effect when the Codex session next starts`);
+  function hooksAlert() {
+    const msg = 'template slot hooks are missing from the Codex hook file; restart the Codex session, then adopt the template again';
+    if (state.setAlert('template_hooks_pending', msg)) logger.warn(msg);
+  }
+
+  // Codex adds the slot hooks only when its session next starts, so a write waits for them while its intent has more
+  // than HOOKS_REPORT_MARGIN_MS left (with no known expiry: for one round); later intents of its org wait too. Then it is
+  // reported as inject_unavailable, before the market times it out.
+  function hooksPending(it, body) {
+    const rec = state.read('template_hooks', null) ?? {};
+    const since = Number.isFinite(Date.parse(rec.pending_since)) ? rec.pending_since : iso();
+    const live = new Set(state.read('intents', EMPTY_INTENTS).queue.map((q) => q.id));
+    const waited = Array.isArray(rec.deferred) ? rec.deferred.filter((id) => live.has(id)) : [];
+    hooksAlert();
+    const exp = Date.parse(it.expires_at);
+    const wait = Number.isFinite(exp) ? exp - now() > HOOKS_REPORT_MARGIN_MS : !waited.includes(it.id);
+    const deferred = wait ? [...new Set([...waited, it.id])] : waited.filter((id) => id !== it.id);
+    const next = { pending_since: since, deferred };
+    if (JSON.stringify(next) !== JSON.stringify(rec)) state.write('template_hooks', next);
+    if (wait) {
+      if (!waited.includes(it.id)) logger.info(`template intent ${it.id} waits for the slot hooks; they are added when the Codex session next starts`);
+      return 'deferred';
     }
-    if (now() - Date.parse(since) >= HOOKS_PENDING_ALERT_MS) {
-      const msg = `template slot hooks are still missing from the Codex hook file since ${since}; expert templates are not written`;
-      if (state.setAlert('template_hooks_pending', msg)) logger.warn(msg);
-    }
-    return 'deferred';
+    logger.warn(`template intent ${it.id} reported as inject_unavailable: the slot hooks are still missing`);
+    return { ...body, status: 'failed', error_code: 'CLIENT_INTERNAL', error_message: 'inject_unavailable', rendered_sha256: it.bundle_sha256 };
   }
   function hooksReady() {
     if (state.read('template_hooks', null) === null) return;
@@ -254,7 +285,7 @@ export function createTemplates({
 
   async function write(it, body) {
     if (!declarationsReady(zylosDir)) {
-      if (runtimeOf(zylosDir) === 'codex') return hooksPending(it);
+      if (runtimeOf(zylosDir) === 'codex') return hooksPending(it, body);
     } else {
       hooksReady();
     }
@@ -293,8 +324,9 @@ export function createTemplates({
         return { ...body, status: 'succeeded' };
       }
       clearSlot(id);
-      discard(dir(id), trashOf(dataDir));
-      for (const [name] of leftovers(dataDir, id)) discard(path.join(dataDir, 'templates', name), trashOf(dataDir));
+      const left = leftInTrash(state, logger);
+      discard(dir(id), trashOf(dataDir), left);
+      for (const [name] of leftovers(dataDir, id)) discard(path.join(dataDir, 'templates', name), trashOf(dataDir), left);
       putAdoption(id, { state: 'removed' });
       return { ...body, status: 'succeeded' };
     } catch (err) {
@@ -330,7 +362,7 @@ export function createTemplates({
   function sweepRevoked() {
     const revoked = revokedSet(state);
     for (const [id, rec] of Object.entries(adoptions())) {
-      if (rec.state !== 'active' && rec.state !== 'writing') continue;
+      if (!['active', 'writing', 'failed'].includes(rec.state)) continue;
       if (revoked.has('manifest_sha256', rec.manifest_sha256) || revoked.blocksSha(rec.manifest_sha256) || revoked.blocksSha(rec.bundle_sha256)) {
         revoke(id, 'template version revoked');
       }
@@ -344,6 +376,7 @@ export function createTemplates({
   }
   try {
     startEpoch();
+    if (state.read('epoch', null)) epochResolved();
   } catch (err) {
     logger.error(`template epoch check failed: ${err.message}`);
   }
@@ -358,7 +391,8 @@ export function createTemplates({
       for (const it of queue) {
         if (!isTemplateIntent(it) || !LIVE.has(it.status)) continue;
         if (Date.parse(it.expires_at) <= t) {
-          logger.info(`template intent ${it.id} expired; dropped`);
+          if (it.op === 'write_template' && !declarationsReady(zylosDir) && runtimeOf(zylosDir) === 'codex') hooksAlert();
+          logger.warn(`template intent ${it.id} expired before it was run; dropped`);
           setIntent(it.id, null);
           continue;
         }
@@ -380,6 +414,7 @@ export function createTemplates({
     // Frees slots held by adoptions that are no longer active and returns the C-10 items for active adoptions whose
     // content or slot is gone or was changed locally.
     reconcile() {
+      epochResolved();
       sweepRevoked();
       const recs = adoptions();
       const slots = setSlots((s) => {

@@ -12,7 +12,7 @@ import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from './pkg/zip.js';
 import { InstallFailure } from './failure.js';
 import { StateError } from './state.js';
 import { validSlug } from './pkg/frontmatter.js';
-import { discard, emptyTrash, fsyncDir } from './trash.js';
+import { TRASH_ALERT, discard, emptyTrash, fsyncDir, leftInTrash } from './trash.js';
 
 export const MAX_INTENTS_PER_ROUND = 20;
 const SKILL_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall']);
@@ -60,11 +60,12 @@ export function createSkills({
   const rollbackDir = (slug, no) => path.join(dataDir, 'rollback', slug, String(no));
   const trashRoot = path.join(dataDir, 'trash');
   const stagingRoot = path.join(dataDir, 'staging');
-  const drop = (dir) => discard(dir, trashRoot);
+  const drop = (dir) => discard(dir, trashRoot, leftInTrash(state, logger));
   // Nothing is in flight at startup: what a crash left in the trash or in staging goes first.
   for (const d of [trashRoot, stagingRoot]) {
     const left = emptyTrash(d);
     if (left) logger.warn(`${left} entries under ${d} could not be removed; retried at the next start`);
+    else if (d === trashRoot) state.clearAlert(TRASH_ALERT);
   }
   const journal = (id, patch) => {
     const j = { ...state.journal.get(id), ...patch, updated_at: iso() };
@@ -645,8 +646,9 @@ export function createSkills({
     logger.error(msg);
   }
 
-  // One failing entry never stops the others or the caller. Only filesystem errors keep an entry open for a retry. An
-  // open-rollback alert of an entry that is not stuck any more is cleared, also when it was raised before a restart.
+  // One failing entry never stops the others or the caller. Only filesystem and state errors keep an entry open for a
+  // retry; a malformed entry is closed as failed. An open-rollback alert of an entry that is not stuck any more is
+  // cleared, also when it was raised before a restart.
   function resumeRollbacks(ids) {
     for (const id of ids) {
       let j;
@@ -657,7 +659,7 @@ export function createSkills({
           else closeBroken(id, j, 'malformed journal entry');
         }
       } catch (err) {
-        if (isFsError(err)) {
+        if (isFsError(err) || err instanceof StateError) {
           stuck(id, j?.skill_id ?? stuckRollbacks.get(id) ?? null, err);
           continue;
         }

@@ -302,6 +302,24 @@ test('an unreadable outbox entry raises an alert and the request reports again f
   assert.deepEqual([h.state.outbox.list(), queueOf(h)], [[], []]);
 });
 
+test('an outbox entry that cannot be read now is skipped, not moved aside, and the round goes on', { skip: process.getuid?.() === 0 && 'root ignores modes' }, async (t) => {
+  const h = await skillHarness(t);
+  h.over.c06.push(f503);
+  await h.queue(['install', 1]);
+  const s = h.make();
+  assert.deepEqual(await s.runRound(), ['deferred']);
+  const [rid] = h.state.outbox.list();
+  const file = path.join(h.state.dir, 'outbox', `${rid}.json`);
+  fs.chmodSync(file, 0o000);
+  t.after(() => { try { fs.chmodSync(file, 0o600); } catch { /* replaced */ } });
+  assert.deepEqual(await s.runRound(), ['succeeded']);
+  assert.ok(h.lines.some((l) => new RegExp(`report ${rid} cannot be read \\(EACCES\\); retried next round`).test(l)));
+  assert.doesNotMatch(alerts(h), /unreadable/);
+  assert.equal(fs.existsSync(path.join(h.state.dir, 'corrupt')), false);
+  assert.equal(h.reqs.get(rid).status, 'succeeded');
+  assert.deepEqual([h.state.outbox.list(), queueOf(h)], [[], []]);
+});
+
 test('what a crash left in the trash or in staging is removed at startup', async (t) => {
   const h = await skillHarness(t);
   for (const d of ['trash/x/docs', 'staging/y']) fs.mkdirSync(path.join(h.dataDir, d), { recursive: true });
