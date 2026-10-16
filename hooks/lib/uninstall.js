@@ -27,7 +27,7 @@ const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 // Calls open() until the stopped service has released the state lock. A holder still there after waitMs is sent
 // SIGTERM once, only when the lock provably belongs to it (pid, start time and boot id match), and then gets
 // termGraceMs to exit. Null when the lock stays held.
-async function whenUnlocked(open, dataDir, { waitMs, termGraceMs, log }) {
+export async function whenUnlocked(open, dataDir, { waitMs, termGraceMs, log, holder = verifiedLockHolder }) {
   let deadline = Date.now() + waitMs;
   let termed = false;
   for (;;) {
@@ -39,8 +39,10 @@ async function whenUnlocked(open, dataDir, { waitMs, termGraceMs, log }) {
     if (Date.now() >= deadline) {
       if (termed) return null;
       termed = true;
-      const pid = verifiedLockHolder(dataDir);
+      const pid = holder(dataDir);
       if (pid === null) {
+        // The holder may have let go between the last attempt and this check.
+        try { return open(); } catch (err) { if (!(err instanceof StateLockedError)) throw err; }
         log('the state lock holder cannot be identified, so it is not signalled');
         return null;
       }

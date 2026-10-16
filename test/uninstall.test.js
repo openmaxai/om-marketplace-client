@@ -8,9 +8,9 @@ import { startFakeMarket } from './fake/market.js';
 import { fakeZylos } from './fake/zylos.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
-import { openState, processStartId, setLockHooks, writeJsonAtomic } from '../src/state.js';
+import { StateLockedError, openState, processStartId, setLockHooks, writeJsonAtomic } from '../src/state.js';
 import { declaration, ensureDeclarations, readSlots, shardName, shardsDir, writeSlots } from '../src/shards.js';
-import { preUninstall } from '../hooks/lib/uninstall.js';
+import { preUninstall, whenUnlocked } from '../hooks/lib/uninstall.js';
 
 const ADOPTION = U(20);
 const C10 = `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`;
@@ -245,4 +245,17 @@ test('a verified lock holder gets one SIGTERM and a bounded grace period to exit
   assert.deepEqual(stubborn.signals(), ['SIGTERM'], 'signalled once');
   assert.ok(alive(stubborn.child.pid));
   assert.ok(fs.existsSync(path.join(g.skillsDir, 'market--demo')));
+});
+
+test('a lock released just as the wait runs out is still taken, once; a lock still held is not', async () => {
+  const quiet = { waitMs: 0, termGraceMs: 0, log: () => {} };
+  let released = false;
+  let opens = 0;
+  const open = () => { opens += 1; if (!released) throw new StateLockedError(4242); return 'opened'; };
+  const holder = () => { released = true; return null; };
+  assert.equal(await whenUnlocked(open, '/unused', { ...quiet, holder }), 'opened');
+  assert.equal(opens, 2);
+  opens = 0;
+  assert.equal(await whenUnlocked(() => { opens += 1; throw new StateLockedError(4242); }, '/unused', { ...quiet, holder: () => null }), null);
+  assert.equal(opens, 2);
 });

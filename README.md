@@ -93,7 +93,8 @@ write into a directory that is accessible by group or other.
 `--wait <seconds>` (default 900), 78 configuration error. A report the market
 could not take yet is kept and resent; the command still exits 0. Ctrl-C or
 SIGTERM while a command runs in the CLI itself aborts pending network calls,
-lets the current step finish and then exits 130.
+lets the current step finish and then exits 130. A second Ctrl-C exits at once
+(130); the interrupted step is completed or undone at the next start.
 
 Only one process works on a data directory at a time. When the service is
 running, commands other than `status` are handed to it and run between poll

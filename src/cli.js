@@ -110,30 +110,39 @@ export function renderStatus(s) {
   return out.join('\n');
 }
 
-// Runs the command with the state lock, or hands it to the lock holder (the service) and waits for its answer. A signal
-// while the command runs here aborts what can be aborted and exits once the current step has finished.
+// What a signal does while a command runs: locally it aborts what can be aborted and lets the current step finish, and
+// a second SIGINT exits at once (every step is journaled, so the next start completes or undoes it); while waiting for
+// the service it withdraws the request when the service has not taken it yet, and exits.
+export function commandSignals(ctx, { abort, sp, print, exit = (code) => process.exit(code) }) {
+  return (sig) => {
+    abort.abort();
+    if (ctx.local) {
+      if (ctx.interrupted && sig === 'SIGINT') {
+        print('interrupted again; exiting now');
+        exit(130);
+        return;
+      }
+      if (!ctx.interrupted) print('interrupted; finishing the current step first (Ctrl-C again to exit now)');
+      ctx.interrupted = true;
+      return;
+    }
+    if (ctx.reqId && sp.withdraw(ctx.reqId)) print('request withdrawn');
+    else if (ctx.reqId) print('the service already started the request; see `market-client status`');
+    exit(130);
+  };
+}
+
+// Runs the command with the state lock, or hands it to the lock holder (the service) and waits for its answer.
 async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) {
   const abort = new AbortController();
   const sp = spool(dataDir);
-  let reqId = null;
-  let local = false;
-  let interrupted = false;
-  const onSignal = () => {
-    abort.abort();
-    if (local) {
-      if (!interrupted) print('interrupted; finishing the current step first');
-      interrupted = true;
-      return;
-    }
-    if (reqId && sp.withdraw(reqId)) print('request withdrawn');
-    else if (reqId) print('the service already started the request; see `market-client status`');
-    process.exit(130);
-  };
+  const ctx = { reqId: null, local: false, interrupted: false };
+  const onSignal = commandSignals(ctx, { abort, sp, print });
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
   try {
     const r = await commandLoop();
-    return interrupted ? { ...r, code: 130 } : r;
+    return ctx.interrupted ? { ...r, code: 130 } : r;
   } finally {
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
@@ -152,23 +161,23 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
           if (!(err instanceof StateLockedError)) throw err;
         }
         if (runtime) {
-          local = true;
+          ctx.local = true;
           try {
-            if (reqId && !sp.withdraw(reqId)) return sp.take(reqId) ?? { code: EXIT.FAILED, message: 'the service stopped while running the request; check status' };
+            if (ctx.reqId && !sp.withdraw(ctx.reqId)) return sp.take(ctx.reqId) ?? { code: EXIT.FAILED, message: 'the service stopped while running the request; check status' };
             return await execute(runtime, { cmd, arg }, pollRound(logger, runtime));
           } finally {
             runtime.state.close();
           }
         }
-        if (!reqId) {
-          reqId = sp.submit(cmd, arg);
+        if (!ctx.reqId) {
+          ctx.reqId = sp.submit(cmd, arg);
           print('the service holds the state lock; the request was handed to it');
         }
       }
-      const r = sp.take(reqId);
+      const r = sp.take(ctx.reqId);
       if (r) return r;
       if (Date.now() >= deadline) {
-        return sp.withdraw(reqId)
+        return sp.withdraw(ctx.reqId)
           ? { code: EXIT.BUSY, message: 'the service did not take the request in time; nothing was done' }
           : { code: EXIT.BUSY, message: 'the request is still running in the service; check `market-client status` later' };
       }

@@ -409,6 +409,14 @@ test('a rollback is released only for the compared version and only its own mark
   assert.equal(f.state.read('installs', {})[SK(7)].rollback, null);
   assert.ok(fs.existsSync(path.join(rb, 'SKILL.md')), 'an unmarked directory is left alone');
   assert.ok(!fs.existsSync(path.join(f.dataDir, 'trash')) || fs.readdirSync(path.join(f.dataDir, 'trash')).length === 0);
+
+  f.skill(8, { v: 2, rollback: { version_no: 1, skill_version_id: VER(8, 1) } });
+  const other = path.join(f.dataDir, 'rollback', 's8', '1');
+  fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(other, '.market-managed'), JSON.stringify({ skill_id: SK(9), version_no: 1 }));
+  assert.equal(f.skills.releaseRollback(SK(8), VER(8, 2)), true);
+  assert.equal(f.state.read('installs', {})[SK(8)].rollback, null);
+  assert.ok(fs.existsSync(path.join(other, '.market-managed')), 'a directory marked by another skill is left alone');
 });
 
 test('a release whose delete fails has already let go of the rollback and leaves the copy whole', async (t) => {
