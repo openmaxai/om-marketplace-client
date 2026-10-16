@@ -6,7 +6,7 @@
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
-    "test": "node --test"
+    "test": "node --test --test-timeout=30000"
   },
   "repository": {
     "type": "git",

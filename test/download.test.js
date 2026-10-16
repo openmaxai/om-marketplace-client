@@ -6,9 +6,10 @@ import { skillPackage } from './fake/package.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { createMarketApi } from '../src/market-api.js';
 import { checkPackageUrl, downloadPackage, downloadUrlAllowed } from '../src/download.js';
-import { MarketError } from '../src/http.js';
+import { MarketError, createMarketHttp } from '../src/http.js';
 import { InstallFailure } from '../src/failure.js';
 import { ConfigError, emulatorOrigin } from '../src/config.js';
+import { within } from './helpers.js';
 
 const RID = U(7);
 const SUB = `/agents/${AGENT}/packages/${RID}`;
@@ -145,15 +146,15 @@ test('an oversized body is cut off while streaming, not read to the end', async 
 });
 
 test('the whole download, retries included, stops at the deadline', async (t) => {
-  const { fake, storage, link, run } = await harness(t);
-  fake.script('GET', C03, link(`${storage.origin}/b/slow`));
+  const { storage, link, run } = await harness(t);
+  const api = { packageDownload: async () => link(`${storage.origin}/b/slow`).json };
   const signals = [];
   const fetchImpl = (url, { signal }) => {
     signals.push(signal);
     return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
   };
   const t0 = Date.now();
-  await assert.rejects(run({ fetchImpl, deadlineMs: 200 }), (e) => e instanceof MarketError && e.transient);
+  await within(assert.rejects(run({ api, fetchImpl, deadlineMs: 200 }), (e) => e instanceof MarketError && e.transient), 5000, 'storage fetch');
   assert.ok(Date.now() - t0 < 2000);
   assert.equal(signals.length, 1);
   assert.ok(signals[0].aborted);
@@ -170,6 +171,33 @@ test('no storage request starts once the deadline has passed', async (t) => {
   assert.equal(fetched, 0);
 });
 
+const overdue = (e) => e instanceof MarketError && e.transient && e.message === 'package download deadline passed';
+
+test('a C-03 call that does not answer is cut off at the deadline', async () => {
+  let calls = 0;
+  const api = { packageDownload: () => { calls++; return new Promise(() => {}); } };
+  const t0 = Date.now();
+  await within(assert.rejects(downloadPackage({ api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, deadlineMs: 200 }), overdue),
+    5000, 'C-03 call');
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(calls, 1);
+});
+
+test('a retry whose wait would end past the deadline fails at once instead of waiting', async () => {
+  let calls = 0;
+  const api = {
+    packageDownload: async () => {
+      calls++;
+      throw new MarketError('busy', { status: 429, code: 'RATE_LIMITED', retryAfterMs: 10_000 });
+    },
+  };
+  const waits = [];
+  const sleep = async (ms) => { waits.push(ms); };
+  await assert.rejects(downloadPackage({ api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, sleep, deadlineMs: 5000 }), overdue);
+  assert.deepEqual(waits, []);
+  assert.equal(calls, 1);
+});
+
 test('C-03 errors: revoked, re-judged, transient retried, request ended rethrown', async (t) => {
   const { fake, storage, link, run } = await harness(t);
   fake.script('GET', C03, fake.problem(409, 'VERSION_REVOKED'), fake.problem(409, 'NOT_APPROVED'),
@@ -181,4 +209,34 @@ test('C-03 errors: revoked, re-judged, transient retried, request ended rethrown
   assert.deepEqual(await run({ sleep: async (ms) => { waits.push(ms); } }), pkg.zip);
   assert.ok(waits.length === 2 && waits[1] >= 1000);
   await assert.rejects(run(), (e) => e.name === 'MarketError' && e.code === 'NOT_FOUND');
+});
+
+test('a C-03 call still running at the deadline is aborted, not only abandoned', async () => {
+  let seen = null;
+  const api = {
+    packageDownload: ({ signal }) => {
+      seen = signal;
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(new MarketError('aborted', { code: 'NETWORK_ERROR', transient: true }))));
+    },
+  };
+  await within(assert.rejects(downloadPackage({ api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, deadlineMs: 200 }), overdue),
+    5000, 'C-03 call');
+  assert.ok(seen?.aborted);
+});
+
+test('the deadline abort reaches the C-03 HTTP request', async (t) => {
+  const { fake, auth } = await marketHarness(t);
+  fake.script('GET', `/api/v1/orgs/${ORG}${SUB}`, { status: 200, json: {}, delayMs: 3000 });
+  const signals = [];
+  const fetchImpl = (url, init) => {
+    if (String(url).includes('/packages/')) signals.push(init.signal);
+    return fetch(url, init);
+  };
+  const api = createMarketApi({ http: createMarketHttp({ bffUrl: fake.url, auth, fetchImpl }) });
+  const t0 = Date.now();
+  await within(assert.rejects(downloadPackage({ api, orgId: ORG, subPath: SUB, sha: pkg.sha, size: pkg.size, deadlineMs: 300 }), overdue),
+    5000, 'C-03 call');
+  assert.ok(Date.now() - t0 < 2000);
+  assert.equal(signals.length, 1);
+  assert.ok(signals[0].aborted);
 });
