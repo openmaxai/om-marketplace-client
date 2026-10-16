@@ -11,12 +11,12 @@ import { openState } from './state.js';
 import { createOrgs } from './orgs.js';
 import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
-import { createInstaller } from './install.js';
+import { createSkills } from './skills.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
 
-// Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then at
-// most one install intent runs. A round is skipped while the token's member id contradicts the configured one.
-export function buildTasks(logger, { revocations, intents, installer, identity, now = Date.now } = {}) {
+// Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
+// queued skill intents run. A round is skipped while the token's member id contradicts the configured one.
+export function buildTasks(logger, { revocations, intents, skills, identity, now = Date.now } = {}) {
   return [
     {
       name: 'poll',
@@ -29,7 +29,7 @@ export function buildTasks(logger, { revocations, intents, installer, identity, 
         } finally {
           await intents.pull();
         }
-        await installer?.runNext();
+        await skills?.runRound();
         return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
     },
@@ -90,15 +90,17 @@ export function createRuntime({
     const auth = createAuth({ bffUrl: config.bff_url, apiKey: config.api_key, tokenDir: path.join(dataDir, 'tokens'), fetchImpl, logger, signal });
     const api = createMarketApi({ http: createMarketHttp({ bffUrl: config.bff_url, auth, fetchImpl, logger, signal }) });
     const orgs = createOrgs({ config, state, auth, logger });
+    const skills = createSkills({
+      api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
+      installsAllowed: pinned,
+    });
     return {
       state,
       orgs,
-      installer: pinned ? createInstaller({
-        api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
-      }) : null,
+      skills,
       identity: identityCheck({ config, auth, state, logger }),
       intents: createIntentPuller({ api, state, orgs, logger }),
-      revocations: createRevocationPuller({ api, state, orgs, logger }),
+      revocations: createRevocationPuller({ api, state, orgs, logger, enforce: async () => skills.enforceRevocations() }),
     };
   } catch (err) {
     state.close();

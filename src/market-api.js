@@ -167,6 +167,29 @@ export function createMarketApi({ http }) {
       });
     },
 
+    // C-07.
+    async requestStatus({ orgId, requestId }) {
+      if (!isCanonicalUuid(requestId)) throw new TypeError('invalid requestId');
+      const r = await http.request('GET', orgId, `/install-requests/${requestId}`);
+      return validated('install request status', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const out = pick(object(data, 'body'), 'body', { request_id: uuid, status: oneOf(new Set(['running', 'succeeded', 'failed'])) });
+        if (out.request_id !== requestId) fail('body.request_id', 'does not match the request');
+        out.error_code = typeof data.error_code === 'string' ? data.error_code : null;
+        return out;
+      });
+    },
+
+    // C-08 (body has enabled) and C-09.
+    async manageSkill({ orgId, agentId, skillId, verb, body }) {
+      if (!isOrgOrMemberId(agentId) || !isCanonicalUuid(skillId) || !['set-enabled', 'uninstall'].includes(verb)) throw new TypeError('invalid manage call');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/skills/${skillId}:${verb}`, body);
+      return validated(`skills:${verb}`, r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        return pick(object(data, 'body'), 'body', verb === 'uninstall' ? { install_id: uuid, install_state: text(32) } : { install_id: uuid, enabled: bool });
+      });
+    },
+
     async pullRevocations({ orgId, cursor: from = null }) {
       if (from !== null && !isRevocationCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
       const r = await http.request('POST', orgId, '/revocations:query', from === null ? {} : { cursor: from });
