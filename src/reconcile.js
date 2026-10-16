@@ -282,7 +282,6 @@ export function createReconciler({ api, state, orgs, skills, templates = null, l
       });
       r.items = entries.length;
       if (!entries.length) r.sent = 'ok';
-      else if (unsaved) r.sent = 'budget_unsaved';
       else r.sent = limited ? 'rate_limited' : await send(orgId, r.agentId, entries, tally);
       if (r.sent === 'budget_unsaved') unsaved = true;
       else if (r.sent === 'rate_limited') limited = true;
