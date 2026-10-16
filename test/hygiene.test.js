@@ -82,3 +82,16 @@ test('package.json checks report the reason for the first failing rule', () => {
     assert.equal(check(bad), 'install_hook', bad);
   }
 });
+
+test('the first failing package.json in central-directory order is reported', () => {
+  const pkg = (a, b) => inspectPackage(buildZip([{ name: 'SKILL.md', data: GOOD_SKILL_MD }, a, b]));
+  const deps = { name: 'a/package.json', data: '{"dependencies":{"a":"1"}}' };
+  const hook = { name: 'b/package.json', data: '{"scripts":{"install":"x"}}' };
+  assert.equal(reasonOf(() => pkg(deps, hook)), 'npm_dependencies');
+  assert.equal(reasonOf(() => pkg(hook, deps)), 'install_hook');
+});
+
+test('name collisions are checked before the lock-file rule within one entry', () => {
+  const z = buildZip([{ name: 'SKILL.md', data: GOOD_SKILL_MD }, { name: 'lib/x', data: 'x' }, { name: 'LIB/yarn.lock', data: '' }]);
+  assert.equal(reasonOf(() => inspectPackage(z)), 'invalid_path');
+});
