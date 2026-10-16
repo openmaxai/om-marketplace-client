@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createScheduler, jittered, POLL_INTERVAL_MS, RECONCILE_INTERVAL_MS } from '../src/scheduler.js';
+import { createScheduler, jittered, POLL_INTERVAL_MS } from '../src/scheduler.js';
+import { RECONCILE_EVERY_MS } from '../src/reconcile.js';
 import { buildHeaders, CLIENT_VERSION, CLIENT_VERSION_HEADER } from '../src/version.js';
 import fs from 'node:fs';
 
@@ -24,7 +25,7 @@ test('jitter clamps out-of-range random values', () => {
 test('intervals: poll ~5 min, reconcile never exceeds 60 min', () => {
   assert.equal(jittered(POLL_INTERVAL_MS, () => 0), 4 * 60_000);
   assert.equal(jittered(POLL_INTERVAL_MS, () => 1), 6 * 60_000);
-  assert.ok(jittered(RECONCILE_INTERVAL_MS, () => 1) <= 60 * 60_000);
+  assert.ok(RECONCILE_EVERY_MS + jittered(POLL_INTERVAL_MS, () => 1) <= 60 * 60_000);
 });
 
 test('scheduler runs each task at start, reschedules with jitter, stops cleanly', async () => {

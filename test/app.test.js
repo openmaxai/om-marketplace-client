@@ -22,10 +22,28 @@ test('one poll round pulls revocations, then intents; a second runtime is locked
   fake.script('POST', `/api/v1/orgs/${ORG}/revocations:query`, { status: 200, json: { items: [], next_cursor: fakeCursor(0), has_more: false } });
   fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`,
     { status: 200, json: { items: [], has_more: false, next_after_seq: 3, policy_sha256: POLICY_SHA256 } });
-  await buildTasks(logger, rt).find((x) => x.name === 'poll').run();
-  assert.deepEqual(fake.market().map((r) => r.path.split('/').at(-1)), ['revocations:query', 'install-intents:query']);
+  fake.script('GET', `/api/v1/orgs/${ORG}/agents/${AGENT}/skills`, { status: 200, json: { items: [] } });
+  const poll = buildTasks(logger, rt).find((x) => x.name === 'poll');
+  await poll.run();
+  assert.deepEqual(fake.market().map((r) => r.path.split('/').at(-1)), ['revocations:query', 'install-intents:query', 'skills']);
   assert.equal(rt.state.read('intents', null).after_seq, 3);
   assert.deepEqual(Object.keys(rt.state.read('status', null).alerts), []);
+  assert.equal(rt.state.read('status', null).runs.reconcile.outcome, 'ok');
+  fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`, { status: 204 });
+  await poll.run();
+  assert.equal(fake.market().filter((r) => r.path.endsWith('/skills')).length, 1, 'reconcile is not run every round');
+});
+
+test('a poll round reconciles after skill and template intents, also when they throw', async () => {
+  const calls = [];
+  const logger = { debug() {}, info() {}, warn() {}, error() {} };
+  const pull = { pull: async () => calls.push('pull') };
+  const skills = { runRound: async () => { calls.push('skills'); throw new Error('boom'); } };
+  const templates = { runNext: async () => calls.push('templates') };
+  const reconcile = { maybeRun: async () => calls.push('reconcile') };
+  const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates, reconcile }).find((x) => x.name === 'poll');
+  await assert.rejects(poll.run(), /boom/);
+  assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates', 'reconcile']);
 });
 
 test('revocations are enforced on skills, then templates; a failure in one still runs the other and is rethrown', async () => {
