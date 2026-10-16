@@ -37,6 +37,14 @@ export function checkEntryPath(nameBytes) {
   return name;
 }
 
+// Go strings.EqualFold against an ASCII target.
+const ASCII_FOLD_PARTNERS = { '\u212a': 'k', '\u017f': 's' };
+export function equalFoldAscii(s, target) {
+  const a = [...s];
+  if (a.length !== target.length) return false;
+  return a.every((r, i) => (ASCII_FOLD_PARTNERS[r] ?? (r < '\x80' ? r.toLowerCase() : r)) === target[i].toLowerCase());
+}
+
 const trimSlash = (p) => (p.endsWith('/') ? p.slice(0, -1) : p);
 
 // Matches Go strings.EqualFold for the policy's ASCII segment.
@@ -118,7 +126,7 @@ export class PathIndex {
   // Both run once the whole central directory was added: forbidden segments before the file count, clashes after it.
   checkForbidden() {
     if (this.#forbidden !== null) {
-      throw new PackageError('forbidden_path', `${JSON.stringify(this.#forbidden)} has a forbidden path segment`);
+      throw new PackageError('forbidden_path', `${JSON.stringify(this.#forbidden)} has a forbidden path segment`, this.#forbidden);
     }
   }
 
