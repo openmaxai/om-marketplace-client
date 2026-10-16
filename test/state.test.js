@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { ROOT, mode, tmpHome } from './helpers.js';
-import { StateError, StateLockedError, openState as open, processStartId, stateScope, writeJsonAtomic } from '../src/state.js';
+import { StateError, StateLockedError, openState as open, processStartId, sha256Hex, stateScope, writeJsonAtomic } from '../src/state.js';
 
 const BFF = 'https://bff.example.test';
 const SCOPE = { orgId: 'org-1', memberId: 'm-1' };
@@ -158,38 +159,241 @@ test('processes contending for a stale lock: at most one holder at any moment, a
   }
 });
 
-test('a takeover guard left by a dead process is removed', () => {
-  const dataDir = path.join(tmpHome(), 'd');
-  writeLock(dataDir, '999999999\n');
-  fs.writeFileSync(`${lockPath(dataDir)}.takeover`, JSON.stringify({ pid: 999999999, start: null, nonce: 'x' }));
-  openState(dataDir, { bffUrl: BFF }).close();
-  assert.deepEqual(fs.readdirSync(path.dirname(lockPath(dataDir))).filter((n) => n.startsWith('lock')), []);
-});
+const reapName = (content) => `lock.reap-${sha256Hex(content).slice(0, 16)}`;
+const lockFiles = (dataDir) => fs.readdirSync(path.dirname(lockPath(dataDir))).filter((n) => n.startsWith('lock'));
+const deadPid = () => Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout);
+const record = (pid, start = null) => JSON.stringify({ pid, start, nonce: crypto.randomBytes(8).toString('hex') });
 
-test('a takeover guard held by a live process blocks the takeover until it is released', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
+async function sleeper(t) {
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
   t.after(() => child.kill('SIGKILL'));
   await new Promise((r) => child.once('spawn', r));
+  return child;
+}
+
+test('reap guards and temp files left by dead processes are removed', () => {
   const dataDir = path.join(tmpHome(), 'd');
-  writeLock(dataDir, '999999999\n');
-  const guard = `${lockPath(dataDir)}.takeover`;
-  fs.writeFileSync(guard, JSON.stringify({ pid: child.pid, start: processStartId(child.pid), nonce: 'x' }));
+  const dead = deadPid();
+  const stale = record(dead);
+  writeLock(dataDir, stale);
+  const dir = path.dirname(lockPath(dataDir));
+  const reaper = record(dead);
+  fs.writeFileSync(path.join(dir, reapName(stale)), reaper);
+  fs.writeFileSync(path.join(dir, `${reapName(stale)}.reap-${sha256Hex(reaper).slice(0, 16)}`), record(dead));
+  fs.writeFileSync(path.join(dir, 'lock.reap-0123456789abcdef'), record(dead));
+  fs.writeFileSync(path.join(dir, 'lock.takeover'), record(dead));
+  fs.writeFileSync(path.join(dir, `lock.tmp-${dead}-0badc0de`), '');
+  openState(dataDir, { bffUrl: BFF }).close();
+  assert.deepEqual(lockFiles(dataDir), []);
+});
+
+test('a reap guard held by a live process blocks removal of the stale lock until it is released', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
+  const child = await sleeper(t);
+  const dataDir = path.join(tmpHome(), 'd');
+  const stale = record(deadPid());
+  writeLock(dataDir, stale);
+  const guard = path.join(path.dirname(lockPath(dataDir)), reapName(stale));
+  fs.writeFileSync(guard, record(child.pid, processStartId(child.pid)));
   const script = `
     import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
+    process.stdout.write('started\\n');
     const t0 = Date.now();
     openState(${JSON.stringify(dataDir)}, { bffUrl: 'https://bff.example.test', orgId: 'org-1', memberId: 'm-1' }).close();
     process.stdout.write(String(Date.now() - t0));`;
   const c = spawn(process.execPath, ['--input-type=module', '-e', script]);
   let out = '';
-  c.stdout.on('data', (d) => { out += d; });
+  const started = new Promise((r) => c.stdout.on('data', (d) => { out += d; if (out.includes('\n')) r(); }));
   let done = false;
   const exited = new Promise((r) => c.on('exit', (code) => { done = true; r(code); }));
+  await started;
   await new Promise((r) => setTimeout(r, 500));
   assert.equal(done, false, 'waits while the guard is held');
-  assert.equal(fs.readFileSync(lockPath(dataDir), 'utf8'), '999999999\n', 'stale lock not taken while the guard is held');
+  assert.equal(fs.readFileSync(lockPath(dataDir), 'utf8'), stale, 'stale lock not removed while the guard is held');
   fs.unlinkSync(guard);
   assert.equal(await exited, 0);
-  assert.ok(Number(out) >= 200, out);
+  assert.ok(Number(out.split('\n')[1]) >= 400, out);
+  assert.deepEqual(lockFiles(dataDir), []);
+});
+
+test('a reap guard held by a live pid with a different start time is taken over', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
+  const child = await sleeper(t);
+  const dataDir = path.join(tmpHome(), 'd');
+  const stale = record(deadPid());
+  writeLock(dataDir, stale);
+  fs.writeFileSync(path.join(path.dirname(lockPath(dataDir)), reapName(stale)), record(child.pid, `${processStartId(child.pid)}0`));
+  openState(dataDir, { bffUrl: BFF }).close();
+  assert.deepEqual(lockFiles(dataDir), []);
+});
+
+test('an unreadable boot id makes the start time unknown, so a live holder keeps the lock', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
+  const child = await sleeper(t);
+  const start = processStartId(child.pid);
+  const dataDir = path.join(tmpHome(), 'd');
+  const content = record(child.pid, start);
+  writeLock(dataDir, content);
+  const readFileSync = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, ...rest) => {
+    if (p === '/proc/sys/kernel/random/boot_id') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    return readFileSync(p, ...rest);
+  });
+  assert.equal(processStartId(child.pid), null);
+  assert.throws(() => openState(dataDir, { bffUrl: BFF }), (err) => err instanceof StateLockedError && err.pid === child.pid);
+  assert.equal(readFileSync(lockPath(dataDir), 'utf8'), content);
+});
+
+// A child that pauses before every lock file operation (see step() in src/state.js) and reports it, so the test
+// decides the interleaving. After acquiring it keeps the lock until stdin closes.
+function stepper(t, dataDir) {
+  const script = `
+    import fs from 'node:fs';
+    import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
+    let done;
+    try {
+      openState(${JSON.stringify(dataDir)}, { bffUrl: 'https://bff.example.test', orgId: 'org-1', memberId: 'm-1' });
+      done = 'acquired';
+    } catch (err) {
+      done = err.name;
+    }
+    fs.writeSync(1, JSON.stringify({ done }) + '\\n');
+    try { while (fs.readSync(0, Buffer.alloc(1)) > 0); } catch {}`;
+  const c = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, OM_MARKETPLACE_CLIENT_TEST_LOCK_STEP: '1', OM_MARKETPLACE_CLIENT_TEST_LOCK_DELAY_MS: '0' },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  t.after(() => c.kill('SIGKILL'));
+  const queue = [];
+  const waiters = [];
+  let buf = '';
+  c.stdout.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const msg = JSON.parse(buf.slice(0, i));
+      buf = buf.slice(i + 1);
+      if (waiters.length) waiters.shift()(msg); else queue.push(msg);
+    }
+  });
+  const next = () => (queue.length ? Promise.resolve(queue.shift()) : new Promise((r) => waiters.push(r)));
+  let pending = null;
+  // Lets the child run until it is paused before an operation matching pred, or has finished.
+  return async (pred = () => false, maxSteps = 400) => {
+    for (let i = 0; i < maxSteps; i++) {
+      pending ??= await next();
+      if (pending.done || pred(pending)) return pending;
+      c.stdin.write('\n');
+      pending = null;
+    }
+    return pending;
+  };
+}
+
+const before = (op, name) => (m) => m.op === op && m.name === name;
+const isDone = (m) => m.done;
+
+test('interleaving: a dead reaper\'s guard is removed under its own guard, so a live guard is never deleted', async (t) => {
+  const dataDir = path.join(tmpHome(), 'd');
+  const dead = deadPid();
+  const stale = record(dead);
+  writeLock(dataDir, stale);
+  fs.writeFileSync(path.join(path.dirname(lockPath(dataDir)), reapName(stale)), record(dead));
+  const x = stepper(t, dataDir);
+  const y = stepper(t, dataDir);
+  // Y has re-read the dead reaper's guard and pauses before deleting it.
+  assert.ok(!(await y(before('unlink', reapName(stale)))).done);
+  // X tries to get as far as deleting the stale lock.
+  await x(before('unlink', 'lock'), 300);
+  const results = [(await y(isDone)).done, (await x(isDone)).done].sort();
+  assert.deepEqual(results, ['StateLockedError', 'acquired']);
+});
+
+test('interleaving: a reaper that judged the lock stale re-checks it before deleting', async (t) => {
+  const dataDir = path.join(tmpHome(), 'd');
+  const stale = record(deadPid());
+  writeLock(dataDir, stale);
+  const x = stepper(t, dataDir);
+  const y = stepper(t, dataDir);
+  // Y has judged the lock stale and pauses before taking the reap guard; X then acquires.
+  assert.ok(!(await y(before('create', reapName(stale)))).done);
+  assert.equal((await x(isDone)).done, 'acquired');
+  assert.equal((await y(isDone)).done, 'StateLockedError');
+});
+
+// Workers acquire and release repeatedly while random workers are SIGKILLed and respawned. A holder records its
+// pid in a marker file; finding a marker of a live pid means two holders. After each round one fresh process must
+// still acquire the lock promptly.
+async function killRound(dataDir, { workers = 8, durationMs = 300 } = {}) {
+  const marker = path.join(dataDir, 'holder');
+  const script = (once) => `
+    import fs from 'node:fs';
+    import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+    const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    for (;;) {
+      let s;
+      try {
+        s = openState(${JSON.stringify(dataDir)}, { bffUrl: 'https://bff.example.test', orgId: 'org-1', memberId: 'm-1' });
+      } catch (err) {
+        if (err.name !== 'StateLockedError') { fs.writeSync(1, 'E' + err.message + '\\n'); process.exit(1); }
+        pause(Math.random() * 3);
+        continue;
+      }
+      let prev = null;
+      try { prev = Number(fs.readFileSync(${JSON.stringify(marker)}, 'utf8')); } catch {}
+      if (prev && prev !== process.pid && alive(prev)) fs.writeSync(1, 'O\\n');
+      fs.writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+      fs.writeSync(1, 'A\\n');
+      pause(Math.random() * 3);
+      fs.unlinkSync(${JSON.stringify(marker)});
+      s.close();
+      if (${once}) process.exit(0);
+    }`;
+  const env = { ...process.env, OM_MARKETPLACE_CLIENT_TEST_LOCK_DELAY_MS: '1' };
+  const stats = { acquired: 0, overlaps: 0, errors: [], kills: 0 };
+  const startWorker = (once) => {
+    const c = spawn(process.execPath, ['--input-type=module', '-e', script(once)], { env, stdio: ['ignore', 'pipe', 'ignore'] });
+    c.exited = new Promise((r) => c.on('exit', r));
+    c.stdout.on('data', (d) => {
+      for (const line of String(d).split('\n')) {
+        if (line === 'A') stats.acquired++;
+        else if (line === 'O') stats.overlaps++;
+        else if (line) stats.errors.push(line);
+      }
+    });
+    return c;
+  };
+  const pool = Array.from({ length: workers }, () => startWorker(false));
+  const end = Date.now() + durationMs;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 5 + Math.random() * 20));
+    const i = Math.floor(Math.random() * pool.length);
+    pool[i].kill('SIGKILL');
+    stats.kills++;
+    pool[i] = startWorker(false);
+  }
+  for (const c of pool) c.kill('SIGKILL');
+  await Promise.all(pool.map((c) => c.exited));
+  const t0 = Date.now();
+  const last = startWorker(true);
+  stats.lastExit = await last.exited;
+  stats.lastMs = Date.now() - t0;
+  return stats;
+}
+
+test('random SIGKILLs during contention: never two holders, and the lock stays acquirable', async () => {
+  const rounds = Number(process.env.LOCK_KILL_ROUNDS) || 2;
+  const dataDir = path.join(tmpHome(), 'd');
+  fs.mkdirSync(dataDir);
+  const total = { acquired: 0, kills: 0, maxLastMs: 0 };
+  for (let i = 0; i < rounds; i++) {
+    const s = await killRound(dataDir);
+    assert.equal(s.overlaps, 0, `round ${i}: two holders`);
+    assert.deepEqual(s.errors, [], `round ${i}`);
+    assert.equal(s.lastExit, 0, `round ${i}: final acquire failed`);
+    total.acquired += s.acquired;
+    total.kills += s.kills;
+    total.maxLastMs = Math.max(total.maxLastMs, s.lastMs);
+  }
+  if (process.env.LOCK_KILL_ROUNDS) console.log(JSON.stringify({ rounds, ...total }));
 });
 
 test('writes replace the document by rename and fsync the directory', (t) => {
