@@ -1,5 +1,6 @@
 import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, isSha256Hex } from './ids.js';
+import { validSlug } from './pkg/frontmatter.js';
 
 export const INTENT_OPS = new Set(['install', 'upgrade', 'enable', 'disable', 'uninstall', 'write_template']);
 export const REVOCATION_KINDS = new Set(['version_revoke', 'template_revoke', 'shelf_revoke', 'sha_block']);
@@ -25,6 +26,9 @@ export const isRevocationCursor = (v) => typeof v === 'string' && CURSOR_RE.test
 const cursor = (v, p) => (isRevocationCursor(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
 const orgId = (v, p) => (isOrgOrMemberId(v) ? v : fail(p, 'must be an org id'));
 const oneOf = (set) => (v, p) => (set.has(v) ? v : fail(p, 'has an unknown value'));
+const text = (max) => (v, p) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : fail(p, 'must be a non-empty string'));
+const slug = (v, p) => (typeof v === 'string' && validSlug(v) ? v : fail(p, 'must be a skill slug'));
+const posInt = (v, p) => (Number.isSafeInteger(v) && v > 0 ? v : fail(p, 'must be a positive integer'));
 
 // Builds a fresh object from the known fields only, so unvalidated server data never reaches callers.
 function pick(src, p, spec) {
@@ -84,6 +88,30 @@ function parseRevocationPage(raw) {
   return page;
 }
 
+// C-02: 201 running with the package and its manifest, or 200 ALREADY_INSTALLED.
+function parseInstall(raw, status, req) {
+  const b = object(raw, 'body');
+  if (status === 200) {
+    if (b.status !== 'succeeded' || b.code !== 'ALREADY_INSTALLED') fail('body', 'is not ALREADY_INSTALLED');
+    if (b.request_id !== req.request_id) fail('body.request_id', 'does not match the request');
+    return { already_installed: true, request_id: b.request_id };
+  }
+  const r = pick(b, 'body', {
+    request_id: uuid, install_id: uuid, skill_id: uuid, slug, skill_version_id: uuid, version_no: posInt,
+    source_market_id: uuid, package_url: text(2048), package_sha256: sha, size_bytes: posInt,
+    file_manifest: array, skill_md: object, status: oneOf(new Set(['running'])),
+  });
+  if (r.request_id !== req.request_id || r.skill_id !== req.skill_id
+    || (req.skill_version_id && r.skill_version_id !== req.skill_version_id)) fail('body', 'does not match the request');
+  // Sizes and file counts over the package caps pass here; the installer reports them as PACKAGE_UNSAFE.
+  r.file_manifest = r.file_manifest.map((e, i) => pick(object(e, `body.file_manifest[${i}]`), `body.file_manifest[${i}]`, {
+    path: text(1024), size: uint, sha256: sha,
+  }));
+  r.skill_md = pick(r.skill_md, 'body.skill_md', { name: text(64), description: text(2000) });
+  if (r.skill_md.name !== r.slug) fail('body.skill_md.name', 'differs from the slug');
+  return r;
+}
+
 function validated(label, r, parse) {
   try {
     return parse(r.data);
@@ -109,6 +137,34 @@ export function createMarketApi({ http }) {
       if (r.status === 204) return r.empty ? null : validated(label, r, () => fail('body', 'must be empty on 204'));
       if (r.status !== 200) return validated(label, r, () => fail('status', `${r.status} is not expected`));
       return validated(label, r, (data) => parseIntentPage(data, afterSeq, limit));
+    },
+
+    // body is sent as given, so a retry replays it byte for byte.
+    async requestInstall({ orgId, agentId, body }) {
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/install-requests`, body);
+      if (r.status !== 200 && r.status !== 201) return validated('install-requests', r, () => fail('status', `${r.status} is not expected`));
+      return validated('install-requests', r, (data) => parseInstall(data, r.status, body));
+    },
+
+    // C-03 at subPath, which the caller derived from a checked package_url.
+    async packageDownload({ orgId, subPath }) {
+      const r = await http.request('GET', orgId, subPath);
+      return validated('packages', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        return pick(object(data, 'body'), 'body', { download_url: text(8192), expires_at: time, sha256: sha, size: posInt });
+      });
+    },
+
+    async reportInstallResult({ orgId, requestId, body }) {
+      if (!isCanonicalUuid(requestId)) throw new TypeError('invalid requestId');
+      const r = await http.request('POST', orgId, `/install-requests/${requestId}/result`, body);
+      return validated('install result', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const out = pick(object(data, 'body'), 'body', { request_id: uuid, status: oneOf(new Set(['succeeded', 'failed'])) });
+        if (out.request_id !== requestId) fail('body.request_id', 'does not match the request');
+        out.error_code = typeof data.error_code === 'string' ? data.error_code : null;
+        return out;
+      });
     },
 
     async pullRevocations({ orgId, cursor: from = null }) {

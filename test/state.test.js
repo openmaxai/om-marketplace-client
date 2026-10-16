@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { ROOT, mode, tmpHome } from './helpers.js';
-import { StateError, StateLockedError, openState as open, processStartId, sha256Hex, stateScope, writeJsonAtomic } from '../src/state.js';
+import { StateError, StateLockedError, openState as open, processStartId, setLockHooks, sha256Hex, stateScope, writeJsonAtomic } from '../src/state.js';
 
 const BFF = 'https://bff.example.test';
 const SCOPE = { orgId: 'org-1', memberId: 'm-1' };
@@ -82,6 +82,31 @@ test('a lock carrying this process id is left by a previous incarnation and is t
   }
 });
 
+test('without process start times every acquisition still writes a distinct lock record', (t) => {
+  setLockHooks({ startId: () => null });
+  t.after(() => setLockHooks({ startId: processStartId }));
+  const dataDir = path.join(tmpHome(), 'd');
+  const seen = [];
+  for (let i = 0; i < 2; i++) {
+    const s = openState(dataDir, { bffUrl: BFF });
+    seen.push(fs.readFileSync(lockPath(dataDir), 'utf8'));
+    s.close();
+  }
+  assert.equal(JSON.parse(seen[0]).start, null);
+  assert.equal(JSON.parse(seen[0]).pid, JSON.parse(seen[1]).pid);
+  assert.notEqual(seen[0], seen[1]);
+});
+
+test('the same data dir opened through another path is still locked', (t) => {
+  const home = tmpHome();
+  const dataDir = path.join(home, 'd');
+  const s = openState(dataDir, { bffUrl: BFF });
+  t.after(() => s.close());
+  fs.symlinkSync(home, path.join(home, 'alias'));
+  assert.throws(() => openState(path.join(home, 'alias', 'd'), { bffUrl: BFF }), StateLockedError);
+  assert.ok(fs.existsSync(lockPath(dataDir)));
+});
+
 test('a live pid holds the lock only while its start time matches', { skip: processStartId(process.pid) === null && 'no /proc' }, async (t) => {
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
   t.after(() => child.kill('SIGKILL'));
@@ -114,6 +139,7 @@ async function lockRace({ procs = 6, holdMs = 300, delayMs = 0 } = {}) {
   const startAt = Date.now() + 300;
   const script = `
     import fs from 'node:fs';
+    import ${JSON.stringify(path.join(ROOT, 'test/fake/lock-hooks.js'))};
     import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
     while (Date.now() < ${startAt});
     let s;
@@ -195,6 +221,7 @@ test('a reap guard held by a live process blocks removal of the stale lock until
   const guard = path.join(path.dirname(lockPath(dataDir)), reapName(stale));
   fs.writeFileSync(guard, record(child.pid, processStartId(child.pid)));
   const script = `
+    import ${JSON.stringify(path.join(ROOT, 'test/fake/lock-hooks.js'))};
     import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
     process.stdout.write('started\\n');
     const t0 = Date.now();
@@ -241,11 +268,12 @@ test('an unreadable boot id makes the start time unknown, so a live holder keeps
   assert.equal(readFileSync(lockPath(dataDir), 'utf8'), content);
 });
 
-// A child that pauses before every lock file operation (see step() in src/state.js) and reports it, so the test
+// A child that pauses before every lock file operation (see test/fake/lock-hooks.js) and reports it, so the test
 // decides the interleaving. After acquiring it keeps the lock until stdin closes.
 function stepper(t, dataDir) {
   const script = `
     import fs from 'node:fs';
+    import ${JSON.stringify(path.join(ROOT, 'test/fake/lock-hooks.js'))};
     import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
     let done;
     try {
@@ -325,6 +353,7 @@ async function killRound(dataDir, { workers = 8, durationMs = 300 } = {}) {
   const marker = path.join(dataDir, 'holder');
   const script = (once) => `
     import fs from 'node:fs';
+    import ${JSON.stringify(path.join(ROOT, 'test/fake/lock-hooks.js'))};
     import { openState } from ${JSON.stringify(path.join(ROOT, 'src/state.js'))};
     const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
     const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);

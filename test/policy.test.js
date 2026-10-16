@@ -136,3 +136,21 @@ test('generic placeholder deletion is linear on nested layers', () => {
   assert.ok(deleteGeneric(line) === '{}!`');
   assert.ok(process.hrtime.bigint() - t < 2_000_000_000n);
 });
+
+test('argument names may start with _ or an uppercase letter', () => {
+  const hit = (args, line) => reasonOf([skill(`arguments: [${args}]\n`), { path: 'a.md', content: Buffer.from(line) }]);
+  const violation = { result: 'violations', violations: [{ code: 'SKILL_COMMAND_INJECTION', file: 'a.md', line: 1 }] };
+  assert.deepEqual(hit('_x, _', '``$$_x_`!'), violation);
+  assert.deepEqual(hit('X, Y', '``$$XY`!'), violation);
+});
+
+test('builtin placeholders delete $ARGUMENTS[n] before $n', () => {
+  assert.equal(deleteBuiltin('$0$ARGUMENTS[1]0'), '');
+});
+
+test('generic placeholder deletion keeps no state between calls', () => {
+  assert.equal(deleteGeneric('$ARGUMENTS['), deleteGenericReference('$ARGUMENTS['));
+  assert.equal(deleteGeneric('x$ARGUMENTS[1]'), 'x');
+  assert.equal(deleteGeneric('$ARGUMENTS[12'), deleteGenericReference('$ARGUMENTS[12'));
+  assert.equal(deleteGeneric('$ARGUMENTS[1]x'), 'x');
+});

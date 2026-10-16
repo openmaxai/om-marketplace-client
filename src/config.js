@@ -66,6 +66,17 @@ export function normalizeBffUrl(raw) {
   return `${u.protocol}//${u.host}`;
 }
 
+// Dev only: a storage emulator origin is accepted only with a loopback http market and must itself be loopback.
+export function emulatorOrigin(raw, bffUrl) {
+  const bad = () => new ConfigError('config.json storage_emulator_origin is allowed only as a loopback origin with a loopback http bff_url');
+  let u;
+  try { u = new URL(String(raw)); } catch { throw bad(); }
+  const bff = new URL(bffUrl);
+  if (bff.protocol !== 'http:' || !LOCAL_HOSTS.has(bff.hostname) || !LOCAL_HOSTS.has(u.hostname)
+    || !['http:', 'https:'].includes(u.protocol) || String(raw).replace(/\/$/, '') !== u.origin) throw bad();
+  return u.origin;
+}
+
 function cleanId(name, value) {
   const v = String(value).trim();
   if (/[\s\u0000-\u001f\u007f]/.test(v)) throw new ConfigError(`${name} contains whitespace or control characters`);
@@ -197,6 +208,7 @@ export function validateConfig(obj) {
     config.log_level = obj.log_level;
   }
   config.orgs = normalizeOrgs(obj.orgs, config.org_id, config.member_id);
+  if (obj.storage_emulator_origin != null) config.storage_emulator_origin = emulatorOrigin(obj.storage_emulator_origin, config.bff_url);
   return config;
 }
 
