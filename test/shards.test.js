@@ -9,19 +9,12 @@ import {
 } from '../src/shards.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { installShards } from '../hooks/lib/shards.js';
+import { fakeZylos } from './fake/zylos.js';
 
 const ID = '0190f000-0000-7000-8000-000000000001';
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
-// A zylos dir with the shard registry and the client installed (as a link) under .claude/skills.
-function zylos({ installed = true, registry = true } = {}) {
-  const z = path.join(tmpHome(), 'zylos');
-  const skills = path.join(z, '.claude', 'skills');
-  fs.mkdirSync(path.join(skills, 'activity-monitor', 'scripts'), { recursive: true });
-  if (registry) fs.writeFileSync(path.join(skills, 'activity-monitor', 'scripts', 'shard-registry.js'), '');
-  if (installed) fs.symlinkSync(ROOT, path.join(skills, 'om-marketplace-client'));
-  return z;
-}
+const zylos = fakeZylos;
 
 test('token estimate follows zylos: ceil(ascii/4 + other/1.3) over code points', () => {
   assert.equal(estimateTokens(''), 0);
