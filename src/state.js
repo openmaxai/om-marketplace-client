@@ -119,7 +119,7 @@ const LOCK_WAIT_MS = 10000;
 // dir must not be shared between containers.
 function lockIsStale({ pid, start }) {
   if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid || !pidAlive(pid)) return true;
-  const current = start ? processStartId(pid) : null;
+  const current = start ? hooks.startId(pid) : null;
   return current !== null && current !== start;
 }
 
@@ -127,35 +127,24 @@ function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// Test-only hooks run before each lock file operation: a random pause of up to
-// OM_MARKETPLACE_CLIENT_TEST_LOCK_DELAY_MS, and with OM_MARKETPLACE_CLIENT_TEST_LOCK_STEP=1 a report of the
-// operation on stdout followed by a blocking wait for one line on stdin.
-function step(op, file) {
-  const max = Number(process.env.OM_MARKETPLACE_CLIENT_TEST_LOCK_DELAY_MS);
-  if (max > 0) sleepMs(Math.random() * max);
-  if (process.env.OM_MARKETPLACE_CLIENT_TEST_LOCK_STEP !== '1') return;
-  fs.writeSync(1, `${JSON.stringify({ op, name: path.basename(file) })}\n`);
-  const buf = Buffer.alloc(1);
-  for (;;) {
-    let n;
-    try { n = fs.readSync(0, buf, 0, 1, null); } catch (err) { if (err.code === 'EAGAIN') { sleepMs(1); continue; } throw err; }
-    if (n === 0) process.exit(1);
-    if (buf[0] === 0x0a) return;
-  }
+// Test seam: test/fake/lock-hooks.js replaces these; production never does.
+const hooks = { step: () => {}, startId: (pid) => processStartId(pid) };
+export function setLockHooks(h) {
+  Object.assign(hooks, h);
 }
 
 function readLockFile(file) {
-  step('read', file);
+  hooks.step('read', file);
   try { return fs.readFileSync(file, 'utf8'); } catch (err) { if (err.code === 'ENOENT') return null; throw err; }
 }
 
 function unlinkFile(file) {
-  step('unlink', file);
+  hooks.step('unlink', file);
   try { fs.unlinkSync(file); } catch (err) { if (err.code !== 'ENOENT') throw err; }
 }
 
 function ownerRecord() {
-  return JSON.stringify({ pid: process.pid, start: processStartId(process.pid), nonce: crypto.randomBytes(8).toString('hex') });
+  return JSON.stringify({ pid: process.pid, start: hooks.startId(process.pid), nonce: crypto.randomBytes(8).toString('hex') });
 }
 
 const TMP_RE = /\.tmp-(\d+)-[0-9a-f]{8}$/;
@@ -166,20 +155,20 @@ function createExclusive(file, content) {
   const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   const fd = fs.openSync(tmp, 'wx', 0o600);
   try {
-    fs.writeSync(fd, content);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    step('create', file);
+    try {
+      fs.writeSync(fd, content);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    hooks.step('create', file);
     fs.linkSync(tmp, file);
     return true;
   } catch (err) {
     if (err.code === 'EEXIST') return false;
     throw err;
   } finally {
-    fs.unlinkSync(tmp);
+    try { fs.unlinkSync(tmp); } catch { /* left to sweepLockDir */ }
   }
 }
 
@@ -300,7 +289,8 @@ export function openState(dataDir, { bffUrl, orgId, memberId, now = Date.now }) 
   const root = path.join(dataDir, 'state');
   ensureDir(dataDir);
   ensureDir(root);
-  const lockFile = path.join(root, 'lock');
+  // Keyed by real path, so one process opening the data dir through another path does not take its own lock.
+  const lockFile = path.join(fs.realpathSync(root), 'lock');
   acquireLock(lockFile);
   const dir = path.join(root, stateScope(bffUrl, orgId, memberId));
   try {
