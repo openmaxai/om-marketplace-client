@@ -345,6 +345,33 @@ export function openState(dataDir, { bffUrl, orgId, memberId, now = Date.now }) 
   };
   const EMPTY_STATUS = { alerts: {}, runs: {} };
   const iso = () => new Date(now()).toISOString();
+  const isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const usable = (s) => isMap(s) && isMap(s.alerts) && isMap(s.runs);
+
+  // status.json, or a fresh one when it is unusable; the unusable file is moved to corrupt/ and that is itself an alert.
+  function readStatus() {
+    let s;
+    try { s = read('status', EMPTY_STATUS); } catch (err) { if (!(err instanceof StateError)) throw err; }
+    if (usable(s)) return s;
+    const aside = path.join(dir, 'corrupt');
+    ensureDir(aside);
+    try { fs.renameSync(docPath('status'), path.join(aside, `status-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`)); } catch { /* replaced below */ }
+    fsyncDir(aside);
+    const at = iso();
+    return { alerts: { 'corrupt:status': { message: 'status.json was unreadable; it was moved aside and earlier alerts are lost', since: at, updated_at: at } }, runs: {} };
+  }
+
+  // Status writes never throw: alerts are raised from error paths. False when status.json cannot be written.
+  function updateStatus(fn) {
+    try {
+      const s = readStatus();
+      fn(s);
+      write('status', s);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   return {
     dir,
@@ -353,21 +380,24 @@ export function openState(dataDir, { bffUrl, orgId, memberId, now = Date.now }) 
     update,
     journal: collection(path.join(dir, 'requests')),
     outbox: collection(path.join(dir, 'outbox')),
-    // Alerts persist in status.json until cleared; returns true when the alert is new.
+    // Alerts persist in status.json until cleared; returns true when the alert is new, or could not be stored (so the
+    // caller logs it).
     setAlert(key, message) {
       let added = false;
-      update('status', EMPTY_STATUS, (s) => {
+      const ok = updateStatus((s) => {
         added = !s.alerts[key];
         s.alerts[key] = { message, since: s.alerts[key]?.since ?? iso(), updated_at: iso() };
       });
-      return added;
+      return added || !ok;
     },
     clearAlert(key) {
-      if (!read('status', EMPTY_STATUS).alerts[key]) return;
-      update('status', EMPTY_STATUS, (s) => { delete s.alerts[key]; });
+      let cur = null;
+      try { cur = read('status', EMPTY_STATUS); } catch { /* repaired by updateStatus */ }
+      if (usable(cur) && !cur.alerts[key]) return;
+      updateStatus((s) => { delete s.alerts[key]; });
     },
     recordRun(name, outcome) {
-      update('status', EMPTY_STATUS, (s) => { s.runs[name] = { outcome, at: iso() }; });
+      updateStatus((s) => { s.runs[name] = { outcome, at: iso() }; });
     },
     close: () => releaseLock(lockFile),
   };

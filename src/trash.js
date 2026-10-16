@@ -29,9 +29,17 @@ export function discard(dir, trashRoot) {
   return true;
 }
 
-// Deletes everything under dir; for areas nothing else can see (trash, staging).
+// Deletes everything under dir; for areas nothing else can see (trash, staging). dir itself must be a real directory, so a
+// link is never followed. Returns how many entries could not be removed.
 export function emptyTrash(dir) {
   let names;
-  try { names = fs.readdirSync(dir); } catch { return; }
-  for (const n of names) fs.rmSync(path.join(dir, n), { recursive: true, force: true });
+  try {
+    if (!fs.lstatSync(dir).isDirectory()) return 0;
+    names = fs.readdirSync(dir);
+  } catch { return 0; }
+  let left = 0;
+  for (const n of names) {
+    try { fs.rmSync(path.join(dir, n), { recursive: true, force: true }); } catch { left += 1; }
+  }
+  return left;
 }

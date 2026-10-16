@@ -113,7 +113,8 @@ export function createTemplates({
   }
 
   // A new install epoch (no epoch record in this state dir) clears the slot map and quarantines every template dir
-  // named by a canonical adoption id; declarations are never touched. Unreadable slots.json: nothing is touched.
+  // named by a canonical adoption id; declarations are never touched. Missing or unreadable slots.json: nothing is
+  // touched and nothing is written.
   function startEpoch() {
     if (state.read('epoch', null)) return;
     let slots;
@@ -121,10 +122,12 @@ export function createTemplates({
     if (slots === undefined) {
       state.setAlert('template_epoch', 'slots.json is unreadable; template content was left untouched');
       logger.warn('slots.json is unreadable; template content was left untouched');
+    } else if (slots === null) {
+      logger.warn('new install epoch without slots.json; template content was left untouched');
     } else {
       writeSlots(dataDir, emptySlots());
       let names = [];
-      try { names = slots ? fs.readdirSync(path.join(dataDir, 'templates')) : []; } catch { /* no templates dir */ }
+      try { names = fs.readdirSync(path.join(dataDir, 'templates')); } catch { /* no templates dir */ }
       for (const name of names.filter(isCanonicalUuid)) quarantine(dataDir, name);
     }
     state.write('epoch', { epoch: uuidv7(now()), created_at: iso(), tombstones: [] });

@@ -476,3 +476,31 @@ test('alerts persist until cleared and report whether they are new', () => {
   assert.deepEqual(s.read('status', null).alerts, {});
   s.close();
 });
+
+test('an unusable status.json is moved aside and replaced; alerts and runs never throw', (t) => {
+  for (const bad of ['{not json', 'null', '[]', '{"alerts":[],"runs":{}}', '{"alerts":{}}']) {
+    const s = openState(path.join(tmpHome(), 'd'), { bffUrl: BFF, now: () => 0 });
+    const file = path.join(s.dir, 'status.json');
+    for (const op of [() => s.setAlert('a', 'm'), () => s.clearAlert('a'), () => s.recordRun('r', 'ok')]) {
+      fs.writeFileSync(file, bad);
+      op();
+      const st = s.read('status', null);
+      assert.ok(st.alerts['corrupt:status'], bad);
+      assert.equal(typeof st.runs, 'object');
+    }
+    assert.equal(s.setAlert('a', 'm'), true);
+    assert.equal(fs.readdirSync(path.join(s.dir, 'corrupt')).filter((n) => n.startsWith('status-')).length, 3);
+    s.close();
+  }
+  if (process.getuid?.() === 0) return;
+  const s = openState(path.join(tmpHome(), 'd'), { bffUrl: BFF, now: () => 0 });
+  s.setAlert('a', 'kept');
+  fs.chmodSync(s.dir, 0o500);
+  t.after(() => fs.chmodSync(s.dir, 0o700));
+  assert.equal(s.setAlert('a', 'not stored'), true, 'an alert that cannot be stored is reported as new so it is logged');
+  s.clearAlert('a');
+  s.recordRun('r', 'ok');
+  fs.chmodSync(s.dir, 0o700);
+  assert.deepEqual(Object.keys(s.read('status', null).alerts), ['a']);
+  s.close();
+});
