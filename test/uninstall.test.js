@@ -8,7 +8,7 @@ import { startFakeMarket } from './fake/market.js';
 import { fakeZylos } from './fake/zylos.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
-import { openState, writeJsonAtomic } from '../src/state.js';
+import { openState, processStartId, setLockHooks, writeJsonAtomic } from '../src/state.js';
 import { declaration, ensureDeclarations, readSlots, shardName, shardsDir, writeSlots } from '../src/shards.js';
 import { preUninstall } from '../hooks/lib/uninstall.js';
 
@@ -99,10 +99,13 @@ test('the pre-uninstall hook stops the service, works without a config and exits
   const log = path.join(home, 'pm2.log');
   fs.writeFileSync(path.join(bin, 'pm2'), `#!/bin/sh\necho "$@" >> '${log}'\n`, { mode: 0o755 });
   markedSkill(path.join(home, 'zylos', '.claude', 'skills', 'market--demo'));
+  markedSkill(path.join(home, 'elsewhere'), U(4));
+  fs.symlinkSync(path.join(home, 'elsewhere'), path.join(home, 'zylos', '.claude', 'skills', 'market--alias'));
   const r = runHook('pre-uninstall.js', { env: { ...baseEnv(dataDir), PATH: bin } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(fs.readFileSync(log, 'utf8').trim(), 'stop zylos-om-marketplace-client');
   assert.ok(fs.existsSync(path.join(QDIR(dataDir, '1-unrecorded'), '.market-managed')));
+  assert.ok(fs.lstatSync(path.join(home, 'zylos', '.claude', 'skills', 'market--alias')).isSymbolicLink(), 'a link is not moved');
   assert.match(r.stdout, /no usable config/);
   writeJsonAtomic(path.join(dataDir, 'config.json'), { broken: true });
   assert.equal(runHook('pre-uninstall.js', { env: { ...baseEnv(dataDir), PATH: bin } }).status, 0);
@@ -168,6 +171,18 @@ function sleeper() {
   return c;
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test('without start times anywhere (no /proc), a lock holder is never signalled', async (t) => {
+  setLockHooks({ startId: () => null });
+  t.after(() => setLockHooks({ startId: processStartId }));
+  const s = await setup(t, recordAll);
+  s.state.close();
+  const other = sleeper();
+  t.after(() => other.kill('SIGKILL'));
+  fs.writeFileSync(path.join(s.dataDir, 'state', 'lock'), JSON.stringify({ pid: other.pid, start: null, nonce: 'x' }));
+  assert.equal(await preUninstall(opts(s, { lockWaitMs: 200, termGraceMs: 300 })), false);
+  assert.ok(alive(other.pid));
+});
 
 test('a lock naming an unrelated process without a start time, or with another one, is never signalled', async (t) => {
   for (const start of [null, 'not-its-boot:1']) {

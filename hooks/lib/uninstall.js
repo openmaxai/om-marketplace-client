@@ -70,7 +70,6 @@ function quarantineSkills(skillsDir, dataDir, installs, log) {
   for (const n of names.filter((x) => x.startsWith(SKILL_DIR_PREFIX))) {
     const dir = path.join(skillsDir, n);
     try {
-      if (!fs.lstatSync(dir).isDirectory()) continue;
       const m = readMarker(dir);
       if (!isCanonicalUuid(m?.skill_id)) continue;
       const rec = installs ? (Object.hasOwn(installs, m.skill_id) ? installs[m.skill_id] : null) : undefined;

@@ -112,3 +112,27 @@ test('a rollback that cannot finish keeps the installed version and raises an al
   assert.equal(fs.readFileSync(path.join(f.rb(2), 'foreign'), 'utf8'), 'x');
   assert.ok(f.state.read('status', null).alerts[`rollback:${SKILL}`]);
 });
+
+test('an interrupted rollback whose kept copy vanished puts the moved version back; another version in place is left alone', async (t) => {
+  const journal = (f) => f.state.journal.put(U(50), {
+    op: 'rollback', phase: 'rollback', skill_id: SKILL, slug: 'demo', where: 'enabled',
+    from: { version_no: 2, skill_version_id: VID(2), package_sha256: SHA(2) }, to: { version_no: 1, skill_version_id: VID(1), package_sha256: SHA(1) },
+  });
+  const gone = await harness(t);
+  journal(gone);
+  fs.renameSync(gone.live, gone.rb(2));
+  fs.rmSync(gone.rb(1), { recursive: true });
+  gone.make();
+  assert.equal(version(gone.live), 2);
+  assert.equal(gone.rec().version_no, 2);
+  assert.ok(gone.state.read('status', null).alerts[`rollback:${SKILL}`]);
+
+  const other = await harness(t);
+  journal(other);
+  fs.rmSync(other.live, { recursive: true });
+  marker(other.live, 3);
+  other.make();
+  assert.equal(version(other.live), 3, 'a version the journal does not name is not replaced');
+  assert.equal(version(other.rb(1)), 1);
+  assert.equal(other.state.journal.get(U(50)).phase, 'closed');
+});
