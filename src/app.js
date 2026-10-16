@@ -32,8 +32,11 @@ export function buildTasks(logger, { revocations, intents, skills, templates, id
         } finally {
           await intents.pull();
         }
-        await skills?.runRound();
-        await templates?.runNext();
+        try {
+          await skills?.runRound();
+        } finally {
+          await templates?.runNext();
+        }
         return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
       },
     },
@@ -43,6 +46,18 @@ export function buildTasks(logger, { revocations, intents, skills, templates, id
       run: async () => logger.debug(`reconcile: ${templates?.reconcile().length ?? 0} template discrepancies`),
     },
   ];
+}
+
+// New revocations quarantine installed skills first, then template adoptions. Both always run; a failure is rethrown
+// afterwards so the revocation cursor stays put and the page is enforced again.
+export function revocationEnforcer({ skills, templates }) {
+  return async () => {
+    let failure = null;
+    for (const step of [() => skills?.enforceRevocations(), () => templates()?.sweepRevoked()]) {
+      try { step(); } catch (err) { failure ??= err; }
+    }
+    if (failure) throw failure;
+  };
 }
 
 // Install-time variables must not linger in the service env; only names are logged.
@@ -100,10 +115,7 @@ export function createRuntime({
       installsAllowed: pinned,
     });
     let templates = null;
-    // New revocations quarantine installed skills first, then template adoptions.
-    const revocations = createRevocationPuller({
-      api, state, orgs, logger, enforce: async () => { skills.enforceRevocations(); templates?.sweepRevoked(); },
-    });
+    const revocations = createRevocationPuller({ api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates }) });
     templates = createTemplates({
       api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
     });

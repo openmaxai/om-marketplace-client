@@ -50,7 +50,7 @@ function land(dataDir, id, bundle) {
     for (const f of bundle.files) writeConfined(stage, f.path, f.data);
     const got = scan(stage);
     const want = new Map(bundle.files.map((f) => [f.path, sha256(f.data)]));
-    if (got.length !== want.size || !got.every((g) => want.get(g.path) === g.sha256)) throw new InstallFailure('PACKAGE_MISMATCH', 'staged_files_mismatch');
+    if (got.length !== want.size || !got.every((g) => want.get(g.path) === g.sha256)) throw internal('staged_files_mismatch');
     if (lstatOrNull(target)) {
       old = path.join(root, `${id}.old-${rand()}`);
       fs.renameSync(target, old);

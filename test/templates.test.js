@@ -12,6 +12,8 @@ import { createTemplates } from '../src/templates.js';
 import { ensureDeclarations, readSlots, shardsDir, writeSlots } from '../src/shards.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
+import { C02, SKILL, VID, skillHarness } from './fake/skills.js';
+import { MAX_PACKAGE_BYTES, MAX_PACKAGE_FILES } from '../src/pkg/zip.js';
 
 const ADOPTION = U(11);
 const INTENT = U(12);
@@ -198,4 +200,44 @@ test('a new epoch clears the slot map and quarantines adoption dirs only when sl
   assert.deepEqual(fs.readdirSync(templates).sort(), [ADOPTION.toUpperCase(), 'keep-me'].sort());
   assert.ok(fs.existsSync(path.join(f.dataDir, 'quarantine', ADOPTION, 'inject.md')));
   assert.deepEqual(fs.readdirSync(shardsDir(f.zylosDir)).sort(), decls);
+});
+
+test('skill and template intents of one org run in seq order across both runners', async (t) => {
+  const h = await skillHarness(t);
+  const zylosDir = fakeZylos();
+  ensureDeclarations(zylosDir);
+  const bundle = templateBundle();
+  h.fake.script('GET', C04, { status: 200, json: {
+    download_url: h.storage.serve('/t', { status: 200, body: bundle.zip }), expires_at: '2026-10-16T00:05:00Z', sha256: bundle.sha, size: bundle.size,
+  } });
+  h.fake.script('POST', C15, applied);
+  const skillIntent = (id, seq, op, n = null) => intent({ id: U(id), seq, op, skill_id: SKILL, skill_version_id: n ? VID(n) : null, template_id: null, adoption_id: null });
+  h.fake.script('POST', C01, page([skillIntent(30, 1, 'install', 1), intent({ seq: 2, bundle_sha256: bundle.sha }), skillIntent(31, 3, 'disable')]));
+  await createIntentPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now }).pull();
+  const skills = h.make();
+  const templates = createTemplates({
+    api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir, emulatorOrigin: h.storage.origin, now: h.now, sleep: async () => {},
+  });
+  const order = () => h.fake.requests.map((r) => r.path).filter((p) => p.endsWith('/install-requests') || p === C15 || p.endsWith(':set-enabled'));
+  assert.equal(await templates.runNext(), null);
+  assert.deepEqual(await skills.runRound(), ['succeeded']);
+  assert.equal(h.state.read('intents', null).queue.find((q) => q.id === U(31)).status, 'queued');
+  assert.equal(await templates.runNext(), 'succeeded');
+  assert.deepEqual(await skills.runRound(), ['done']);
+  assert.deepEqual(order(), [C02, C15, `${B}/agents/${AGENT}/skills/${SKILL}:set-enabled`]);
+  assert.deepEqual(h.state.read('intents', null).queue, []);
+});
+
+test('a bundle over the size or file caps is PACKAGE_UNSAFE too_large / too_many_files', async (t) => {
+  const big = templateBundle();
+  const f = await harness(t, { bundle: big, c04: [{ status: 200, json: {
+    download_url: 'https://storage.googleapis.com/x', expires_at: '2026-10-16T00:05:00Z', sha256: big.sha, size: MAX_PACKAGE_BYTES + 1,
+  } }] });
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['PACKAGE_UNSAFE', 'too_large']);
+  const files = Object.fromEntries(Array.from({ length: MAX_PACKAGE_FILES }, (_, i) => [`sop/s${i}.md`, 'x']));
+  const g = await harness(t, { bundle: templateBundle({ files }) });
+  assert.equal(await g.templates.runNext(), 'failed');
+  assert.deepEqual([g.sent()[0].error_code, g.sent()[0].error_message], ['PACKAGE_UNSAFE', 'too_many_files']);
+  for (const x of [f, g]) assert.equal(fs.existsSync(x.dir), false);
 });

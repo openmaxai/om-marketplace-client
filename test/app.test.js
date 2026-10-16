@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
 import { fakeCursor, marketHarness, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG } from './fake/pull.js';
-import { buildTasks, createRuntime } from '../src/app.js';
+import { buildTasks, createRuntime, revocationEnforcer } from '../src/app.js';
 import { StateLockedError } from '../src/state.js';
 import { writeConfig } from '../src/config.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
@@ -26,6 +26,39 @@ test('one poll round pulls revocations, then intents; a second runtime is locked
   assert.deepEqual(fake.market().map((r) => r.path.split('/').at(-1)), ['revocations:query', 'install-intents:query']);
   assert.equal(rt.state.read('intents', null).after_seq, 3);
   assert.deepEqual(Object.keys(rt.state.read('status', null).alerts), []);
+});
+
+test('revocations are enforced on skills, then templates; a failure in one still runs the other and is rethrown', async () => {
+  const calls = [];
+  const skills = { enforceRevocations: () => calls.push('skills') };
+  const templates = { sweepRevoked: () => calls.push('templates') };
+  await revocationEnforcer({ skills, templates: () => templates })();
+  assert.deepEqual(calls, ['skills', 'templates']);
+  for (const broken of ['skills', 'templates']) {
+    calls.length = 0;
+    const boom = () => { calls.push(broken); throw new Error(broken); };
+    const enforce = revocationEnforcer({
+      skills: broken === 'skills' ? { enforceRevocations: boom } : skills, templates: () => (broken === 'templates' ? { sweepRevoked: boom } : templates),
+    });
+    await assert.rejects(enforce(), new RegExp(broken));
+    assert.deepEqual(calls, ['skills', 'templates']);
+  }
+  await revocationEnforcer({ skills, templates: () => null })();
+});
+
+test('a poll round runs skill intents, then a template intent, even when the skill round throws', async () => {
+  const calls = [];
+  const logger = { debug() {}, info() {}, warn() {}, error() {} };
+  const pull = { pull: async () => calls.push('pull') };
+  for (const fail of [false, true]) {
+    calls.length = 0;
+    const skills = { runRound: async () => { calls.push('skills'); if (fail) throw new Error('boom'); } };
+    const templates = { runNext: async () => calls.push('templates') };
+    const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates }).find((x) => x.name === 'poll');
+    if (fail) await assert.rejects(poll.run(), /boom/);
+    else await poll.run();
+    assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates']);
+  }
 });
 
 test('the poll round is skipped while the token belongs to another member', async (t) => {

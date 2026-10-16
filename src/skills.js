@@ -475,13 +475,18 @@ export function createSkills({
     }
   }
 
-  // Head of the queue in seq order, skipping orgs held back this round and intents that are not skill intents.
+  // Head of the queue in seq order, skipping orgs held back this round.
   function nextIntent(blocked) {
     const t = now();
     const revoked = revokedSet(state);
     for (const it of state.read('intents', EMPTY_INTENTS).queue) {
       if (blocked.has(it.org_id) || (it.status !== 'queued' && it.status !== 'running')) continue;
-      if (!SKILL_OPS.has(it.op) || !it.skill_id || (!installsAllowed && PACKAGE_OPS.has(it.op))) continue;
+      // Another runner's intent (a template intent) goes first: later intents of its org wait for it.
+      if (!SKILL_OPS.has(it.op) || !it.skill_id) {
+        blocked.add(it.org_id);
+        continue;
+      }
+      if (!installsAllowed && PACKAGE_OPS.has(it.op)) continue;
       const stale = Date.parse(it.expires_at) <= t ? 'expired' : PACKAGE_OPS.has(it.op) && revoked.has('skill_version_id', it.skill_version_id) ? 'version revoked' : null;
       if (it.status === 'queued' && stale) {
         logger.info(`intent ${it.id} dropped: ${stale}`);
