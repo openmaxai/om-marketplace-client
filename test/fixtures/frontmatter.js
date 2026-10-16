@@ -30,6 +30,8 @@ export const frontmatterCases = {
   'block folded strip': [fm(`name: demo\ndescription: >-\n  a\n    b\n`), ok('demo', 'a b')],
   'block keep': [fm(`name: demo\ndescription: |+\n  a\n`), null],
   'block on name': [fm(`name: |\n  demo\n${D}`), null],
+  'block on version': [fm(`name: demo\n${D}version: |\n  1.0.0\n`), null],
+  'block on version, no description': [fm('name: demo\nversion: |\n  1.0.0\n'), null],
   'empty block': [fm(`name: demo\ndescription: |\n`), null],
   'duplicate name': [fm(`name: demo\nname: demo\n${D}`), null],
   'other keys': [fm(`name: demo\n${D}metadata:\n  a: [1, 2]\n- x\nlicense: "MIT"\ntags: [a, "b, c"] # t\n`), ok('demo', 'd')],

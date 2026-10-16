@@ -1,7 +1,6 @@
 // Skill package policy from the vendored v1.json: top-level frontmatter key allowlist on every SKILL.md and an inline
 // command scan of every .md. Results, codes and their order match the market's CheckSkillPolicy.
-import fs from 'node:fs';
-import { POLICY_FILE } from '../policy/pin.js';
+import { POLICY_FILE, POLICY_SHA256, readPinnedPolicy } from '../policy/pin.js';
 import { PackageError } from './zip.js';
 import { equalFoldAscii } from './paths.js';
 import { MAX_SKILL_MD_BYTES, decodeUTF8, frontmatterKeys } from './frontmatter.js';
@@ -14,7 +13,7 @@ export const MAX_SKILL_LINE_BYTES = 1 << 20;
 
 // The rules this client implements; a policy file with other patterns is refused.
 export const GENERIC_PLACEHOLDER = /\$(\{[^}]*\}|ARGUMENTS(\[[0-9]+\])?|[0-9]+|[A-Za-z_][A-Za-z0-9_-]*)/g;
-const BUILTIN_PLACEHOLDERS = [/\$ARGUMENTS\[[0-9]+\]/g, /\$[0-9]+/g, /\$ARGUMENTS/g];
+export const BUILTIN_PLACEHOLDERS = [/\$ARGUMENTS\[[0-9]+\]/g, /\$[0-9]+/g, /\$ARGUMENTS/g];
 const ARGUMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // Violations sorted by (file bytes, line, code, key), at most max_violations of them.
@@ -30,8 +29,9 @@ export class SkillPolicyError extends Error {
 
 const isAscii = (s) => /^[\x20-\x7e]+$/.test(s);
 
-export function loadPolicy(file = POLICY_FILE) {
-  const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+// Parses the same bytes whose hash was checked against pin.
+export function loadPolicy(file = POLICY_FILE, pin = POLICY_SHA256) {
+  const p = JSON.parse(readPinnedPolicy(file, pin).toString('utf8'));
   const fm = p.frontmatter;
   const inj = p.injection;
   if (p.policy !== 'skill-policy/v1' || inj.placeholder_sigil !== '$' || inj.placeholder_pattern !== GENERIC_PLACEHOLDER.source ||
@@ -47,7 +47,7 @@ export function loadPolicy(file = POLICY_FILE) {
     basename: fm.file_basename,
     extension: inj.file_extension,
     forbidden: p.package.forbidden_path_segments,
-    injection: { ...inj, builtin: BUILTIN_PLACEHOLDERS },
+    injection: inj,
     maxViolations: p.max_violations,
     vectors: p.vectors,
   };
@@ -162,44 +162,70 @@ export function checkSkillPolicy(files, rules = policy()) {
   if (err) throw err;
 }
 
-// Line by line (split on \n). Declared names are deleted over the whole text first; names never span lines, so the
-// lines of both texts pair up one to one.
+// Line by line (split on \n). Only lines that can hit need declared names deleted, and only those with the sigil
+// directly before a possible name's first character; those are deleted in batches joined by \n (names never contain \n,
+// so this equals deleting per line).
+const NAME_START = /\$[A-Za-z_]/;
+const NAME_BATCH_CHARS = 256 << 10;
+
 function scanInjections(r, path, text, names, vs) {
-  let deleted = text;
-  for (const n of names) deleted = deleted.replaceAll(r.placeholder_sigil + n, '');
-  const same = deleted === text;
-  let a = 0;
-  let b = 0;
-  for (let ln = 1; ; ln++) {
-    let i = text.indexOf('\n', a);
-    let j = same ? i : deleted.indexOf('\n', b);
-    if ((i < 0) !== (j < 0)) throw new PackageError('skill_md_invalid', `${path}: deleting argument names changed the line count`, path);
-    const last = i < 0;
-    if (last) {
-      i = text.length;
-      j = deleted.length;
+  let batch = [];
+  let batchLines = [];
+  let batchChars = 0;
+  const flush = () => {
+    let joined = batch.join('\n');
+    for (const n of names) {
+      const p = r.placeholder_sigil + n;
+      if (joined.includes(p)) joined = joined.replaceAll(p, '');
     }
-    if (i > a || j > b) {
-      const line = text.slice(a, i);
-      if (injectionLine(r, line, same ? line : deleted.slice(b, j))) vs.add({ code: COMMAND_INJECTION, file: path, line: ln });
+    const deleted = joined.split('\n');
+    if (deleted.length !== batch.length) throw new PackageError('skill_md_invalid', `${path}: deleting argument names changed the line count`, path);
+    for (let k = 0; k < batch.length; k++) {
+      if (injectionLine(r, batch[k], deleted[k])) vs.add({ code: COMMAND_INJECTION, file: path, line: batchLines[k] });
     }
-    if (last) return;
-    a = i + 1;
-    b = j + 1;
+    [batch, batchLines, batchChars] = [[], [], 0];
+  };
+  // cannotHit holds for a line without any of these characters, so only lines containing one are visited.
+  const triggers = [...new Set([r.fence_bang, ...r.fence_markers.map((m) => m[0])])];
+  const at = triggers.map((c) => text.indexOf(c));
+  let ln = 1;
+  let counted = 0; // newlines before this index are counted in ln
+  for (;;) {
+    let t = -1;
+    for (const x of at) if (x >= 0 && (t < 0 || x < t)) t = x;
+    if (t < 0) break;
+    const a = text.lastIndexOf('\n', t) + 1;
+    let i = text.indexOf('\n', t);
+    if (i < 0) i = text.length;
+    if (a > counted) for (let k = text.indexOf('\n', counted); k >= 0 && k < a; k = text.indexOf('\n', k + 1)) ln++;
+    const line = text.slice(a, i);
+    if (!cannotHit(r, line)) {
+      if (names.length > 0 && NAME_START.test(line)) {
+        batch.push(line);
+        batchLines.push(ln);
+        batchChars += line.length + 1;
+        if (batchChars >= NAME_BATCH_CHARS) flush();
+      } else if (injectionLine(r, line, line)) {
+        vs.add({ code: COMMAND_INJECTION, file: path, line: ln });
+      }
+    }
+    if (i === text.length) break;
+    ln++;
+    counted = i + 1;
+    for (let k = 0; k < at.length; k++) if (at[k] >= 0 && at[k] <= i) at[k] = text.indexOf(triggers[k], i + 1);
   }
+  if (batch.length > 0) flush();
 }
 
 // line: raw text; s: line with declared argument names deleted. A hit on the raw line, after each deletion step of
 // strategy 1 (names, then builtin placeholders), or after strategy 2 (generic placeholders until nothing changes).
-export function injectionLine(r, line, s) {
-  if (cannotHit(r, line)) return false;
+function injectionLine(r, line, s) {
   if (injectionRaw(r, line)) return true;
   if (s !== line && injectionRaw(r, s)) return true;
-  let t = s;
-  for (const re of r.builtin) t = t.replace(re, '');
+  const t = deleteBuiltin(s);
   if (t !== s && injectionRaw(r, t)) return true;
   const u = deleteGeneric(line);
-  return u !== line && injectionRaw(r, u);
+  return u !== line && u !== s && u !== t && injectionRaw(r, u);
 }
 
 // Deleting placeholders only removes characters, so a line without the bang and with fewer characters than any fence
@@ -215,7 +241,7 @@ function cannotHit(r, line) {
 }
 
 function injectionRaw(r, line) {
-  if (r.substrings.some((s) => line.includes(s))) return true;
+  for (const s of r.substrings) if (line.includes(s)) return true;
   for (const m of r.fence_markers) {
     for (let j = line.indexOf(m); j >= 0; j = line.indexOf(m, j + 1)) {
       let k = j + m.length;
@@ -232,13 +258,136 @@ const isIdentPart = (c) => isIdentStart(c) || isDigit(c) || c === 0x2d;
 const DOLLAR = 0x24;
 const OPEN_BRACE = 0x7b;
 const CLOSE_BRACE = 0x7d;
+const OPEN_BRACKET = 0x5b;
+const CLOSE_BRACKET = 0x5d;
 const ARGUMENTS = 'ARGUMENTS';
 const DEAD = -2;
+
+// Deletes each match of fn(s, i) (the end of a match at the $ at i, or -1) left to right without overlap.
+function deleteDollarMatches(s, fn) {
+  let out = '';
+  let kept = 0;
+  for (let i = s.indexOf('$'); i >= 0; i = s.indexOf('$', i)) {
+    const e = fn(s, i);
+    if (e < 0) {
+      i++;
+      continue;
+    }
+    out += s.slice(kept, i);
+    kept = i = e;
+  }
+  return kept === 0 ? s : out + s.slice(kept);
+}
+
+const digitsEnd = (s, i) => {
+  while (i < s.length && isDigit(s.charCodeAt(i))) i++;
+  return i;
+};
+const ARGUMENTS_INDEX = '$ARGUMENTS[';
+
+// Same result as deleting BUILTIN_PLACEHOLDERS matches in order, one pass each.
+export function deleteBuiltin(s) {
+  s = deleteDollarMatches(s, (x, i) => {
+    if (!x.startsWith(ARGUMENTS_INDEX, i)) return -1;
+    const j = i + ARGUMENTS_INDEX.length;
+    const k = digitsEnd(x, j);
+    return k > j && x.charCodeAt(k) === CLOSE_BRACKET ? k + 1 : -1;
+  });
+  s = deleteDollarMatches(s, (x, i) => {
+    const k = digitsEnd(x, i + 1);
+    return k > i + 1 ? k : -1;
+  });
+  return s.includes('$ARGUMENTS') ? s.replaceAll('$ARGUMENTS', '') : s;
+}
 
 // Same result as deleting GENERIC_PLACEHOLDER matches from one line repeatedly until nothing changes, in linear time.
 // The line is a linked list of surviving characters. Each pass tries every surviving $ left to right in the pattern's
 // branch order; a $ that failed can only match again once a span right after it is deleted, so later passes only retry
 // the $ directly left of a deleted span. "First surviving } at or after i" is a union-find over original indices.
+// State is module-level and buffers are reused across calls (not reentrant).
+let nextBuf = new Int32Array(0);
+let prevBuf = new Int32Array(0);
+let upBuf = new Int32Array(0);
+const grow = (buf, n) => (buf.length >= n ? buf : new Int32Array(Math.max(n, 2 * buf.length)));
+let g = '';
+let gn = 0;
+let next = nextBuf;
+let prev = prevBuf;
+let up = null;
+let head = 0;
+let digitsTo = null;
+let removed = false;
+let later = [];
+
+function findBrace(i) {
+  if (!up) {
+    up = upBuf = grow(upBuf, gn + 1);
+    up[gn] = gn;
+    for (let j = gn - 1; j >= 0; j--) up[j] = g.charCodeAt(j) === CLOSE_BRACE && prev[j] !== DEAD ? j : up[j + 1];
+  }
+  let r = i;
+  while (up[r] !== r) r = up[r];
+  while (i !== r) {
+    const u = up[i];
+    up[i] = r;
+    i = u;
+  }
+  return r;
+}
+
+// Index of the last character of the match at the $ at p, or -1.
+function matchAt(p) {
+  const n = gn;
+  const q = next[p];
+  if (q >= n) return -1;
+  const c = g.charCodeAt(q);
+  if (c === OPEN_BRACE) {
+    const b = findBrace(q + 1);
+    return b < n ? b : -1;
+  }
+  let last = p;
+  let r = q;
+  let k = 0;
+  while (k < ARGUMENTS.length && r < n && g.charCodeAt(r) === ARGUMENTS.charCodeAt(k)) {
+    last = r;
+    r = next[r];
+    k++;
+  }
+  if (k === ARGUMENTS.length) {
+    if (r < n && g.charCodeAt(r) === OPEN_BRACKET) {
+      digitsTo ??= new Map();
+      let d = digitsTo.get(r) ?? r;
+      while (next[d] < n && isDigit(g.charCodeAt(next[d]))) d = next[d];
+      digitsTo.set(r, d);
+      if (d !== r && next[d] < n && g.charCodeAt(next[d]) === CLOSE_BRACKET) return next[d];
+    }
+    return last;
+  }
+  const part = isDigit(c) ? isDigit : isIdentStart(c) ? isIdentPart : null;
+  if (!part) return -1;
+  let e = q;
+  while (next[e] < n && part(g.charCodeAt(next[e]))) e = next[e];
+  return e;
+}
+
+function tryAt(p) {
+  if (prev[p] === DEAD) return;
+  const e = matchAt(p);
+  if (e < 0) return;
+  const l = prev[p];
+  const r = next[e];
+  for (let i = p; ; i = next[i]) {
+    prev[i] = DEAD;
+    if (up && g.charCodeAt(i) === CLOSE_BRACE) up[i] = i + 1;
+    if (i === e) break;
+  }
+  if (l >= 0) next[l] = r;
+  else head = r;
+  if (r < gn) prev[r] = l;
+  removed = true;
+  if (l >= 0 && g.charCodeAt(l) === DOLLAR && later[later.length - 1] !== l) later.push(l);
+}
+
 export function deleteGeneric(line) {
   const n = line.length;
   let first = -1;
@@ -250,80 +399,33 @@ export function deleteGeneric(line) {
     }
   }
   if (first < 0) return line;
-  const next = new Int32Array(n);
-  const prev = new Int32Array(n);
-  for (let i = 0; i < n; i++) [next[i], prev[i]] = [i + 1, i - 1];
-  let head = 0;
-  let up = null;
-  const findBrace = (i) => {
-    if (!up) {
-      up = new Int32Array(n + 1);
-      up[n] = n;
-      for (let j = n - 1; j >= 0; j--) up[j] = line.charCodeAt(j) === CLOSE_BRACE && prev[j] !== DEAD ? j : up[j + 1];
-    }
-    let r = i;
-    while (up[r] !== r) r = up[r];
-    while (i !== r) [i, up[i]] = [up[i], r];
-    return r;
-  };
-  const digitsTo = new Map();
-  // Index of the last character of the match at the $ at p, or -1.
-  const matchAt = (p) => {
-    const q = next[p];
-    if (q >= n) return -1;
-    const c = line.charCodeAt(q);
-    if (c === OPEN_BRACE) {
-      const b = findBrace(q + 1);
-      return b < n ? b : -1;
-    }
-    let [last, r, k] = [p, q, 0];
-    while (k < ARGUMENTS.length && r < n && line.charCodeAt(r) === ARGUMENTS.charCodeAt(k)) [last, r, k] = [r, next[r], k + 1];
-    if (k === ARGUMENTS.length) {
-      if (r < n && line[r] === '[') {
-        let d = digitsTo.get(r) ?? r;
-        while (next[d] < n && isDigit(line.charCodeAt(next[d]))) d = next[d];
-        digitsTo.set(r, d);
-        if (d !== r && next[d] < n && line[next[d]] === ']') return next[d];
-      }
-      return last;
-    }
-    const part = isDigit(c) ? isDigit : isIdentStart(c) ? isIdentPart : null;
-    if (!part) return -1;
-    let e = q;
-    while (next[e] < n && part(line.charCodeAt(next[e]))) e = next[e];
-    return e;
-  };
-  let removed = false;
-  let later = [];
-  const tryAt = (p) => {
-    if (prev[p] === DEAD) return;
-    const e = matchAt(p);
-    if (e < 0) return;
-    const [l, r] = [prev[p], next[e]];
-    for (let i = p; ; i = next[i]) {
-      prev[i] = DEAD;
-      if (up && line.charCodeAt(i) === CLOSE_BRACE) up[i] = i + 1;
-      if (i === e) break;
-    }
-    if (l >= 0) next[l] = r;
-    else head = r;
-    if (r < n) prev[r] = l;
-    removed = true;
-    if (l >= 0 && line.charCodeAt(l) === DOLLAR && later[later.length - 1] !== l) later.push(l);
-  };
+  g = line;
+  gn = n;
+  next = nextBuf = grow(nextBuf, n);
+  prev = prevBuf = grow(prevBuf, n);
+  for (let i = 0; i < n; i++) {
+    next[i] = i + 1;
+    prev[i] = i - 1;
+  }
+  head = 0;
+  up = null;
+  digitsTo = null;
+  removed = false;
+  later = [];
   for (let i = first; i >= 0; i = line.indexOf('$', i + 1)) tryAt(i);
   while (later.length) {
     const cands = later;
     later = [];
     for (const p of cands) tryAt(p);
   }
+  g = '';
   if (!removed) return line;
-  const parts = [];
+  let out = '';
   for (let i = head; i < n;) {
     let j = i;
     while (j + 1 < n && next[j] === j + 1) j++;
-    parts.push(line.slice(i, j + 1));
+    out += line.slice(i, j + 1);
     i = next[j];
   }
-  return parts.join('');
+  return out;
 }
