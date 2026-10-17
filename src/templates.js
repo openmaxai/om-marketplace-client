@@ -14,9 +14,12 @@ import { declarationsReady, emptySlots, readSlots, runtimeOf, writeSlots } from 
 import { JITTER_RATIO, POLL_INTERVAL_MS } from './scheduler.js';
 
 export const MAX_TOMBSTONES = 1000;
+const MAX_ROUND_GAP_MS = Math.ceil(POLL_INTERVAL_MS * (1 + JITTER_RATIO));
 // A write waiting for the Codex slot hooks is reported while its intent still has at least 2 min left, even when the
 // next poll round comes as late as the jitter allows.
-export const HOOKS_REPORT_MARGIN_MS = 2 * 60 * 1000 + Math.ceil(POLL_INTERVAL_MS * (1 + JITTER_RATIO));
+export const HOOKS_REPORT_MARGIN_MS = 2 * 60 * 1000 + MAX_ROUND_GAP_MS;
+// Longest a write waits for the Codex slot hooks in total; later intents of its org wait behind it.
+export const HOOKS_MAX_DEFERRAL_MS = 15 * 60 * 1000;
 const C15_CODES = new Set(['PACKAGE_MISMATCH', 'PACKAGE_UNSAFE', 'INSTALL_TARGET_CONFLICT', 'CLIENT_INTERNAL']);
 const RETRY_LATER = new Set(['INTENT_OUT_OF_ORDER', 'CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 const LIVE = new Set(['queued', 'running']);
@@ -257,35 +260,45 @@ export function createTemplates({
   }
 
   // Codex adds the slot hooks only when its session next starts, so a write waits for them while its intent has more
-  // than HOOKS_REPORT_MARGIN_MS left (with no known expiry: for one round); later intents of its org wait too. Then it is
-  // reported as inject_unavailable, before the market times it out.
-  function hooksPending(it, body) {
+  // than HOOKS_REPORT_MARGIN_MS left (with no known expiry: for one round), for at most HOOKS_MAX_DEFERRAL_MS in total,
+  // and only while no later template intent of its org is queued (the runner takes one per round); later intents of its
+  // org wait too. Then it is reported
+  // as inject_unavailable, before the market times it out.
+  function hooksPending(it, body, queue) {
     const rec = state.read('template_hooks', null) ?? {};
     const since = Number.isFinite(Date.parse(rec.pending_since)) ? rec.pending_since : iso();
-    const live = new Set(state.read('intents', EMPTY_INTENTS).queue.map((q) => q.id));
-    const waited = Array.isArray(rec.deferred) ? rec.deferred.filter((id) => live.has(id)) : [];
+    const live = new Set(queue.map((q) => q.id));
+    // Legacy records list the deferred ids only; their deferral is counted from pending_since.
+    const prev = Array.isArray(rec.deferred) ? Object.fromEntries(rec.deferred.map((id) => [id, since]))
+      : rec.deferred && typeof rec.deferred === 'object' ? rec.deferred : {};
+    const waited = Object.fromEntries(Object.entries(prev).filter(([id]) => live.has(id)));
     hooksAlert();
     const exp = Date.parse(it.expires_at);
-    const wait = Number.isFinite(exp) ? exp - now() > HOOKS_REPORT_MARGIN_MS : !waited.includes(it.id);
-    const deferred = wait ? [...new Set([...waited, it.id])] : waited.filter((id) => id !== it.id);
+    const first = Date.parse(waited[it.id]);
+    const elapsed = Number.isFinite(first) ? now() - first : 0;
+    const behind = queue.some((q) => isTemplateIntent(q) && q.org_id === it.org_id && q.seq > it.seq && LIVE.has(q.status));
+    const wait = !behind && elapsed + MAX_ROUND_GAP_MS <= HOOKS_MAX_DEFERRAL_MS
+      && (Number.isFinite(exp) ? exp - now() > HOOKS_REPORT_MARGIN_MS : !(it.id in waited));
+    const deferred = { ...waited };
+    if (!wait) delete deferred[it.id];
+    else if (!Number.isFinite(first)) deferred[it.id] = iso();
     const next = { pending_since: since, deferred };
     if (JSON.stringify(next) !== JSON.stringify(rec)) state.write('template_hooks', next);
     if (wait) {
-      if (!waited.includes(it.id)) logger.info(`template intent ${it.id} waits for the slot hooks; they are added when the Codex session next starts`);
+      if (!(it.id in waited)) logger.info(`template intent ${it.id} waits for the slot hooks; they are added when the Codex session next starts`);
       return 'deferred';
     }
     logger.warn(`template intent ${it.id} reported as inject_unavailable: the slot hooks are still missing`);
     return { ...body, status: 'failed', error_code: 'CLIENT_INTERNAL', error_message: 'inject_unavailable', rendered_sha256: it.bundle_sha256 };
   }
   function hooksReady() {
-    if (state.read('template_hooks', null) === null) return;
-    state.write('template_hooks', null);
+    if (state.read('template_hooks', null) !== null) state.write('template_hooks', null);
     state.clearAlert('template_hooks_pending');
   }
 
-  async function write(it, body) {
+  async function write(it, body, queue) {
     if (!declarationsReady(zylosDir)) {
-      if (runtimeOf(zylosDir) === 'codex') return hooksPending(it, body);
+      if (runtimeOf(zylosDir) === 'codex') return hooksPending(it, body, queue);
     } else {
       hooksReady();
     }
@@ -400,7 +413,7 @@ export function createTemplates({
         const requestId = it.request_id ?? uuidv7(now());
         setIntent(it.id, { status: 'running', request_id: requestId });
         const base = { request_id: requestId, intent_id: it.id, kind: it.op === 'write_template' ? 'write' : 'uninstall' };
-        const body = it.op === 'write_template' ? await write(it, base) : remove(it, base);
+        const body = it.op === 'write_template' ? await write(it, base, queue) : remove(it, base);
         if (typeof body === 'string') return body;
         state.update('template_reports', {}, (d) => { d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body }; });
         return send(requestId);
@@ -415,6 +428,7 @@ export function createTemplates({
     // content or slot is gone or was changed locally.
     reconcile() {
       epochResolved();
+      if (declarationsReady(zylosDir)) hooksReady();
       sweepRevoked();
       const recs = adoptions();
       const slots = setSlots((s) => {

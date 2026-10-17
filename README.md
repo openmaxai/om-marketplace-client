@@ -35,8 +35,11 @@ needed for them.
    Claude the agent restarts once when idle; memory and context are kept. On
    Codex the templates take effect when the Codex session next starts. Until
    then a template write raises an alert (restart the Codex session, then adopt
-   the template again) and is reported as failed (`inject_unavailable`) before
-   its order expires. Upgrades do the same.
+   the template again) and waits, holding back later orders of its org. It is
+   reported as failed (`inject_unavailable`) before its order expires, after at
+   most 15 minutes of waiting (`HOOKS_MAX_DEFERRAL_MS`), or at once when another
+   template order of its org is queued behind it. The alert clears once the
+   hooks are present. Upgrades do the same.
 4. Unset the `COCO_*` variables in that shell
    (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).
    The PM2 app filters them out and the service removes any it still inherits,
