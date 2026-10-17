@@ -38,7 +38,7 @@ needed for them.
    the template again) and waits, holding back later orders of its org. It is
    reported as failed (`inject_unavailable`) before its order expires, after at
    most 15 minutes of waiting (`HOOKS_MAX_DEFERRAL_MS`), or at once when another
-   template order of its org is queued behind it. The alert clears once the
+   template order of any org is queued behind it. The alert clears once the
    hooks are present. Upgrades do the same.
 4. Unset the `COCO_*` variables in that shell
    (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).

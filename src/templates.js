@@ -261,9 +261,8 @@ export function createTemplates({
 
   // Codex adds the slot hooks only when its session next starts, so a write waits for them while its intent has more
   // than HOOKS_REPORT_MARGIN_MS left (with no known expiry: for one round), for at most HOOKS_MAX_DEFERRAL_MS in total,
-  // and only while no later template intent of its org is queued (the runner takes one per round); later intents of its
-  // org wait too. Then it is reported
-  // as inject_unavailable, before the market times it out.
+  // and only while no later template intent of any org is queued (a deferral ends the round); later intents of its org
+  // wait too. Then it is reported as inject_unavailable, before the market times it out.
   function hooksPending(it, body, queue) {
     const rec = state.read('template_hooks', null) ?? {};
     const since = Number.isFinite(Date.parse(rec.pending_since)) ? rec.pending_since : iso();
@@ -276,7 +275,7 @@ export function createTemplates({
     const exp = Date.parse(it.expires_at);
     const first = Date.parse(waited[it.id]);
     const elapsed = Number.isFinite(first) ? now() - first : 0;
-    const behind = queue.some((q) => isTemplateIntent(q) && q.org_id === it.org_id && q.seq > it.seq && LIVE.has(q.status));
+    const behind = queue.some((q) => isTemplateIntent(q) && q.seq > it.seq && LIVE.has(q.status));
     const wait = !behind && elapsed + MAX_ROUND_GAP_MS <= HOOKS_MAX_DEFERRAL_MS
       && (Number.isFinite(exp) ? exp - now() > HOOKS_REPORT_MARGIN_MS : !(it.id in waited));
     const deferred = { ...waited };
