@@ -10,7 +10,7 @@ import { createIntentPuller } from '../src/intents.js';
 import { EMPTY_REVOKED, createRevocationPuller } from '../src/revocations.js';
 import { createTemplates } from '../src/templates.js';
 import { ensureDeclarations, readSlots, shardsDir, writeSlots } from '../src/shards.js';
-import { HOOKS_REPORT_MARGIN_MS } from '../src/templates.js';
+import { HOOKS_MAX_DEFERRAL_MS, HOOKS_REPORT_MARGIN_MS } from '../src/templates.js';
 import { writeSlotHooks } from './fake/zylos.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
@@ -542,7 +542,7 @@ test('on Codex a write with no known expiry waits one round, and an expired one 
   assert.equal(await f.templates.runNext(), 'deferred');
   assert.equal(await f.templates.runNext(), 'failed');
   assert.equal(f.sent()[0].error_message, 'inject_unavailable');
-  assert.deepEqual(f.state.read('template_hooks', null).deferred, []);
+  assert.deepEqual(f.state.read('template_hooks', null).deferred, {});
 
   const g = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-16T00:10:00Z' })] });
   codex(g);
@@ -551,6 +551,87 @@ test('on Codex a write with no known expiry waits one round, and an expired one 
   assert.match(alertsOf(g).template_hooks_pending.message, /restart the Codex session/);
   assert.ok(g.lines.some((l) => /expired before it was run; dropped/.test(l)));
   assert.deepEqual(g.state.read('intents', null).queue, []);
+  writeSlotHooks(g.zylosDir, { runtime: 'codex' });
+  g.templates.reconcile();
+  assert.equal(alertsOf(g).template_hooks_pending, undefined);
+});
+
+test('on Codex a write with 6 min between rounds is reported with more than 2 min left', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-16T00:13:30Z' })] });
+  codex(f);
+  let rounds = 0;
+  while ((await f.templates.runNext()) === 'deferred') {
+    f.clock.t += 6 * MIN;
+    rounds += 1;
+  }
+  const left = Date.parse('2026-10-16T00:13:30Z') - f.clock.t;
+  assert.equal(rounds, 1);
+  assert.ok(left > 2 * MIN, `reported with ${left} ms left`);
+  assert.equal(f.sent()[0].error_message, 'inject_unavailable');
+});
+
+test('on Codex a write is not deferred while a later template intent of its org is queued', async (t) => {
+  const bundle = templateBundle();
+  const exp = '2026-10-16T00:10:00Z';
+  const f = await harness(t, { bundle, items: [
+    intent({ bundle_sha256: bundle.sha, expires_at: exp }),
+    intent({ id: U(14), bundle_sha256: bundle.sha, expires_at: exp, seq: 2 }),
+  ] });
+  codex(f);
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual(f.sent().map((b) => [b.intent_id, b.error_message]), [[INTENT, 'inject_unavailable']]);
+  assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session/);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.deepEqual(Object.keys(f.state.read('template_hooks', null).deferred), [U(14)]);
+
+  // Queued behind it: a template uninstall of its org counts; one of another org, one not runnable, or a skill intent
+  // does not.
+  const behind = async (over, want) => {
+    const g = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: exp })] });
+    codex(g);
+    g.state.update('intents', null, (d) => { d.queue.push({ ...d.queue[0], id: U(14), seq: 2, ...over }); });
+    assert.equal(await g.templates.runNext(), want, JSON.stringify(over));
+  };
+  await behind({ op: 'uninstall', adoption_id: U(15) }, 'failed');
+  await behind({ org_id: U(98) }, 'deferred');
+  await behind({ status: 'org_not_configured' }, 'deferred');
+  await behind({ op: 'install', skill_id: SKILL, skill_version_id: VID(1), template_id: null, adoption_id: null }, 'deferred');
+});
+
+test('on Codex a write with a long expiry waits at most HOOKS_MAX_DEFERRAL_MS in total, across restarts', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-17T00:00:00Z' })] });
+  codex(f);
+  const start = f.clock.t;
+  let templates = f.templates;
+  while ((await templates.runNext()) === 'deferred') {
+    f.clock.t += MIN;
+    templates = f.make();
+  }
+  const waited = f.clock.t - start;
+  assert.ok(waited <= HOOKS_MAX_DEFERRAL_MS && waited > HOOKS_MAX_DEFERRAL_MS - 7 * MIN, `reported after ${waited} ms`);
+  assert.deepEqual(f.sent().map((b) => [b.status, b.error_message]), [['failed', 'inject_unavailable']]);
+  assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session/);
+
+  // A record from before per-intent times counts from pending_since.
+  const g = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-17T00:00:00Z' })] });
+  codex(g);
+  g.state.write('template_hooks', { pending_since: new Date(g.clock.t - 20 * MIN).toISOString(), deferred: [INTENT] });
+  assert.equal(await g.templates.runNext(), 'failed');
+});
+
+test('reconcile clears the hooks alert once the Codex slot hooks are present', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-17T00:00:00Z' })] });
+  codex(f);
+  assert.equal(await f.templates.runNext(), 'deferred');
+  f.templates.reconcile();
+  assert.ok(alertsOf(f).template_hooks_pending);
+  writeSlotHooks(f.zylosDir, { runtime: 'codex' });
+  f.templates.reconcile();
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  assert.equal(f.state.read('template_hooks', null), null);
 });
 
 test('on Claude missing slot hooks still fail the write at once', async (t) => {

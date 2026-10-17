@@ -38,11 +38,11 @@ test('pages are queued with the cursor until has_more is false; 204 leaves the c
 });
 
 test('the cursor survives a restart and a failed page keeps earlier pages', async (t) => {
-  const { fake, puller, state, api, orgs, logger } = await setup(t);
+  const { fake, puller, state, api, orgs, logger, now } = await setup(t);
   fake.script('POST', PATH, page([intent(1)], 1, true), { status: 503, problem: { code: 'DEPENDENCY_UNAVAILABLE' } });
   assert.deepEqual(await puller.pull(), { outcome: 'transient', added: 1 });
   assert.equal(state.read('intents', null).after_seq, 1);
-  const again = createIntentPuller({ api, state, orgs, logger });
+  const again = createIntentPuller({ api, state, orgs, logger, now });
   fake.script('POST', PATH, page([intent(2)], 2));
   await again.pull();
   assert.deepEqual(sentSeqs(fake), [0, 1, 1]);

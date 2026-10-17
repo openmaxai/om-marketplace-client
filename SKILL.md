@@ -80,8 +80,9 @@ any it inherits, logging only their names. At runtime the service reads only
 Post-install and post-upgrade declare the template session-start shards and run
 the zylos hook sync only when their hooks are missing. On Claude the agent
 restarts once when idle; memory and context are kept. On Codex the templates
-take effect when the Codex session next starts; template writes wait until then
-(an alert is raised after 24 h).
+take effect when the Codex session next starts. Until then a template write
+raises an alert and waits at most 15 minutes, then is reported as failed
+(`inject_unavailable`).
 
 ## Commands
 
