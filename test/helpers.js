@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const FAKE_KEY = 'cwsk_TEST_SECRET_6f1c2a9e0b7d4e33'; // gitleaks:allow (fake test fixture)
 
+export const FAKE_CF_ID = 'cfid_TEST_0a1b2c3d4e5f.access';
+export const FAKE_CF_SECRET = 'cfsecret_TEST_8d7c6b5a4f3e2d1c0b9a'; // gitleaks:allow (fake test fixture)
+export const CF_ENV = Object.freeze({ COCO_CF_ACCESS_CLIENT_ID: FAKE_CF_ID, COCO_CF_ACCESS_CLIENT_SECRET: FAKE_CF_SECRET });
+
 export const VALID_ENV = Object.freeze({
   COCO_BFF_URL: 'https://bff.example.test/',
   COCO_API_KEY: FAKE_KEY,

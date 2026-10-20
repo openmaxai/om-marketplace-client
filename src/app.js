@@ -1,6 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
-import { EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
+import { EXIT_CONFIG, cfAccessFromConfig, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
 import { createLogger } from './logger.js';
 import { createScheduler, POLL_INTERVAL_MS } from './scheduler.js';
@@ -130,8 +130,11 @@ export function createRuntime({
     } else {
       state.clearAlert('policy_pin');
     }
-    const auth = createAuth({ bffUrl: config.bff_url, apiKey: config.api_key, tokenDir: path.join(dataDir, 'tokens'), fetchImpl, logger, signal });
-    const api = createMarketApi({ http: createMarketHttp({ bffUrl: config.bff_url, auth, fetchImpl, logger, signal }) });
+    const cfAccess = cfAccessFromConfig(config);
+    const auth = createAuth({
+      bffUrl: config.bff_url, apiKey: config.api_key, tokenDir: path.join(dataDir, 'tokens'), fetchImpl, logger, signal, cfAccess,
+    });
+    const api = createMarketApi({ http: createMarketHttp({ bffUrl: config.bff_url, auth, fetchImpl, logger, signal, cfAccess }) });
     const orgs = createOrgs({ config, state, auth, logger });
     const skills = createSkills({
       api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
@@ -199,7 +202,7 @@ export async function main({ dataDir } = {}) {
   process.once('SIGTERM', onTerm);
   process.once('SIGINT', onInt);
 
-  logger.info(`om-marketplace-client ${CLIENT_VERSION} starting (bff_url=${config.bff_url}, org_id=${config.org_id})`);
+  logger.info(`om-marketplace-client ${CLIENT_VERSION} starting (bff_url=${config.bff_url}, org_id=${config.org_id}, cf_access=${cfAccessFromConfig(config) ? 'on' : 'off'})`);
   // A CLI command may hold the lock for a while; wait for it rather than exit.
   for (let waited = false; !stopping && !runtime;) {
     try {

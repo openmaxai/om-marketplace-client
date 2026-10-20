@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.1.0
+version: 0.1.1
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after
@@ -48,6 +48,11 @@ config:
       description: This Agent's member ID in COCO_ORG_ID. Required by post-install.
     - name: COCO_IDENTITY_ID
       description: This Agent's identity ID.
+    - name: COCO_CF_ACCESS_CLIENT_ID
+      description: Cloudflare Access service token client ID, for a BFF behind Cloudflare Access. Set together with COCO_CF_ACCESS_CLIENT_SECRET or not at all.
+    - name: COCO_CF_ACCESS_CLIENT_SECRET
+      description: Cloudflare Access service token client secret. Set together with COCO_CF_ACCESS_CLIENT_ID or not at all.
+      sensitive: true
 ---
 
 # om-marketplace-client
@@ -72,7 +77,11 @@ Client side of Agent Market for zylos Agents.
 
 `hooks/post-install.js` reads `COCO_BFF_URL`, `COCO_API_KEY`, `COCO_ORG_ID`,
 `COCO_MEMBER_ID` (required) and `COCO_IDENTITY_ID` (optional) from the
-environment and writes `config.json` (mode 0600). Without a TTY it never
+environment and writes `config.json` (mode 0600). For a BFF behind Cloudflare
+Access, also set `COCO_CF_ACCESS_CLIENT_ID` and `COCO_CF_ACCESS_CLIENT_SECRET`
+(both or neither); they are sent as `CF-Access-Client-Id` /
+`CF-Access-Client-Secret` only to the `bff_url` origin, never to storage
+download URLs. A redirect to Cloudflare Access fails with `ACCESS_REQUIRED`. Without a TTY it never
 prompts and exits with code 78 naming any missing variable. Unset the `COCO_*`
 variables after install; the PM2 app filters them out and the service removes
 any it inherits, logging only their names. At runtime the service reads only
