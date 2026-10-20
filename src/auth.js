@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isOrgOrMemberId } from './ids.js';
 import { normalizeBffUrl } from './config.js';
-import { DEFAULT_TIMEOUT_MS, MarketError, SILENT_LOGGER, errorFromResponse, sendJson } from './http.js';
+import { DEFAULT_TIMEOUT_MS, MarketError, SILENT_LOGGER, cfAccessHeaders, errorFromResponse, sendJson } from './http.js';
 
 export const REFRESH_MARGIN_MS = 60_000;
 export const REFRESH_ON_401_WINDOW_MS = 10 * 60_000;
@@ -53,7 +53,7 @@ const sha256Hex = (v) => crypto.createHash('sha256').update(String(v), 'utf8').d
 // exchanged again.
 export function createAuth({
   bffUrl, apiKey, tokenDir = null, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now,
-  uid = process.getuid?.(), signal = null,
+  uid = process.getuid?.(), signal = null, cfAccess = null,
 }) {
   if (!apiKey) throw new Error('api key is required');
   const origin = normalizeBffUrl(bffUrl);
@@ -152,11 +152,15 @@ export function createAuth({
 
   async function post(endpoint, body, bearer) {
     const label = `auth POST ${endpoint}`;
+    const url = new URL(endpoint, base);
     const r = await sendJson({
       fetchImpl,
-      url: new URL(endpoint, base),
+      url,
       method: 'POST',
-      headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: {
+        Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json', Accept: 'application/json',
+        ...cfAccessHeaders(cfAccess, url, origin),
+      },
       body,
       timeoutMs,
       label,

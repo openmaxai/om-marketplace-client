@@ -107,18 +107,19 @@ export function assertMarketHeaders(rec, { apiKey }) {
 }
 
 // Fake market plus auth and http wired with a capturing debug logger.
-export async function marketHarness(t, { timeoutMs } = {}) {
+export async function marketHarness(t, { timeoutMs, cfAccess = null } = {}) {
   const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: VALID_ENV.COCO_MEMBER_ID });
   t.after(fake.close);
   const lines = [];
   const logger = createLogger('debug', { log: (l) => lines.push(l), error: (l) => lines.push(l) });
-  const auth = createAuth({ bffUrl: fake.url, apiKey: FAKE_KEY, logger });
-  const http = createMarketHttp({ bffUrl: fake.url, auth, logger, timeoutMs });
+  const auth = createAuth({ bffUrl: fake.url, apiKey: FAKE_KEY, logger, cfAccess });
+  const http = createMarketHttp({ bffUrl: fake.url, auth, logger, timeoutMs, cfAccess });
   // Every recorded market request is checked, and no credential ever reaches the log.
   t.after(() => {
     for (const r of fake.market()) assertMarketHeaders(r, { apiKey: FAKE_KEY });
     const log = lines.join('\n');
-    for (const s of [FAKE_KEY, ...fake.issued.access, ...fake.issued.refresh]) assert.ok(!log.includes(s), 'secret logged');
+    const cfSecret = cfAccess ? [cfAccess.clientSecret] : [];
+    for (const s of [FAKE_KEY, ...cfSecret, ...fake.issued.access, ...fake.issued.refresh]) assert.ok(!log.includes(s), 'secret logged');
   });
   return { fake, auth, http, lines };
 }

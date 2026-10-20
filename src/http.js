@@ -59,6 +59,21 @@ export function errorFromResponse(label, r, nowMs = Date.now()) {
   return new MarketError(`${label}: HTTP ${r.status}${p.code ? ` ${p.code}` : ''}`, { status: r.status, ...p, retryAfterMs });
 }
 
+// Cloudflare Access service-token headers, only for a request to the configured BFF origin.
+export function cfAccessHeaders(cfAccess, url, bffOrigin) {
+  if (!cfAccess || new URL(url).origin !== bffOrigin) return {};
+  return { 'CF-Access-Client-Id': cfAccess.clientId, 'CF-Access-Client-Secret': cfAccess.clientSecret };
+}
+
+function isAccessRedirect(res, url) {
+  try {
+    const host = new URL(res.headers.get('location'), url).hostname.toLowerCase();
+    return host === 'cloudflareaccess.com' || host.endsWith('.cloudflareaccess.com');
+  } catch {
+    return false;
+  }
+}
+
 async function readLimited(res, max, label) {
   const tooLarge = () => new MarketError(`${label}: response too large`, { status: res.status, code: 'RESPONSE_TOO_LARGE', transient: false });
   if (Number(res.headers.get('content-length')) > max) {
@@ -101,6 +116,11 @@ export async function sendJson({
     });
     if (res.status >= 300 && res.status < 400) {
       await res.body?.cancel().catch(() => {});
+      // Transient so pending reports are kept until the configuration is fixed.
+      if (isAccessRedirect(res, url)) {
+        throw new MarketError(`${label}: blocked by Cloudflare Access; configure the Cloudflare Access service token `
+          + '(COCO_CF_ACCESS_CLIENT_ID, COCO_CF_ACCESS_CLIENT_SECRET) or check that it is valid', { status: res.status, code: 'ACCESS_REQUIRED', transient: true });
+      }
       throw new MarketError(`${label}: redirect refused`, { status: res.status, code: 'REDIRECT_REFUSED', transient: false });
     }
     raw = await readLimited(res, MAX_RESPONSE_BYTES, label);
@@ -120,10 +140,11 @@ export async function sendJson({
   return { status: res.status, headers: res.headers, type, data, empty: raw.length === 0 };
 }
 
-// Market calls under {bffUrl}/api/v1/orgs/{orgId}. Only the bearer token, the client version and content
-// negotiation headers are sent; callers cannot add headers. subPath segments must already be percent-encoded.
+// Market calls under {bffUrl}/api/v1/orgs/{orgId}. Only the bearer token, the client version, content negotiation
+// and (when configured) Cloudflare Access headers are sent; callers cannot add headers. subPath segments must already
+// be percent-encoded.
 export function createMarketHttp({
-  bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now, signal = null,
+  bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now, signal = null, cfAccess = null,
 }) {
   const base = new URL(normalizeBffUrl(bffUrl));
   // An abort of `cancel` ends this one request.
@@ -142,14 +163,22 @@ export function createMarketHttp({
       const headers = buildHeaders(token, {
         Accept: 'application/json, application/problem+json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...cfAccessHeaders(cfAccess, url, base.origin),
       });
       logger.debug(label);
       return { token, r: await sendJson({ fetchImpl, url, method, headers, body, timeoutMs, label, signal, cancel }) };
     };
-    let { token, r } = await send();
-    if (r.status === 401 && await auth.renewAfter401(orgId, token)) {
-      logger.warn(`${label}: HTTP 401, retrying once with a renewed token for org ${orgId}`);
-      ({ r } = await send());
+    let token;
+    let r;
+    try {
+      ({ token, r } = await send());
+      if (r.status === 401 && await auth.renewAfter401(orgId, token)) {
+        logger.warn(`${label}: HTTP 401, retrying once with a renewed token for org ${orgId}`);
+        ({ r } = await send());
+      }
+    } catch (err) {
+      if (err?.code === 'ACCESS_REQUIRED') logger.error(err.message);
+      throw err;
     }
     if (r.status >= 200 && r.status < 300) {
       logger.debug(`${label}: HTTP ${r.status}`);

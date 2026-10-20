@@ -21,6 +21,8 @@ const PROMPTS = {
   COCO_ORG_ID: 'Organization ID',
   COCO_MEMBER_ID: "This Agent's member ID",
   COCO_IDENTITY_ID: "This Agent's identity ID (optional)",
+  COCO_CF_ACCESS_CLIENT_ID: 'Cloudflare Access service token client ID (optional)',
+  COCO_CF_ACCESS_CLIENT_SECRET: 'Cloudflare Access service token client secret (optional)',
 };
 
 export function envValues(env) {
@@ -106,7 +108,7 @@ export async function runInstall({
     const { path: written, config } = writeConfig(values, dataDir, { tightenExisting: path.resolve(dataDir) === defaultDataDir(env) });
     fs.mkdirSync(path.join(dataDir, 'logs'), { recursive: true, mode: 0o700 });
     log(`[om-marketplace-client] config written to ${written} (mode 0600)`);
-    log(`[om-marketplace-client] bff_url=${config.bff_url} org_id=${config.org_id} member_id=${config.member_id} identity_id=${config.identity_id ?? '(unset)'}`);
+    log(`[om-marketplace-client] bff_url=${config.bff_url} org_id=${config.org_id} member_id=${config.member_id} identity_id=${config.identity_id ?? '(unset)'} cf_access=${config.cf_access_client_id ? 'configured' : '(unset)'}`);
     return 0;
   } catch (err) {
     if (err instanceof ConfigError) {

@@ -41,7 +41,7 @@ needed for them.
    template order of any org is queued behind it. The alert clears once the
    hooks are present. Upgrades do the same.
 4. Unset the `COCO_*` variables in that shell
-   (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).
+   (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID COCO_CF_ACCESS_CLIENT_ID COCO_CF_ACCESS_CLIENT_SECRET`).
    The PM2 app filters them out and the service removes any it still inherits,
    logging only their names.
 5. Restart the Agent session once.
@@ -59,10 +59,26 @@ that code. Fix the configuration, then `pm2 restart zylos-om-marketplace-client`
 | `COCO_ORG_ID` | yes | Organization ID the Agent belongs to. |
 | `COCO_MEMBER_ID` | yes | This Agent's member ID in that organization. |
 | `COCO_IDENTITY_ID` | no | This Agent's identity ID. |
+| `COCO_CF_ACCESS_CLIENT_ID` | no | Cloudflare Access service token client ID. Set together with the secret or not at all. |
+| `COCO_CF_ACCESS_CLIENT_SECRET` | no | Cloudflare Access service token client secret. Never printed. |
 
 The running service reads only its own `config.json`, never these variables.
 Re-running the post-install hook with no `COCO_*` variables keeps an existing
 valid `config.json`. A partial set fails and leaves the file unchanged.
+
+### Cloudflare Access
+
+When the BFF is behind Cloudflare Access, set both `COCO_CF_ACCESS_CLIENT_ID`
+and `COCO_CF_ACCESS_CLIENT_SECRET` (a service token). They are stored in
+`config.json` as `cf_access_client_id` / `cf_access_client_secret` and sent as
+the `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers only on requests
+to the `COCO_BFF_URL` origin (token exchange and refresh, market calls,
+package URL lookup), never to storage download URLs or any other origin.
+Redirects are still never followed. Without the token, a BFF behind Access
+answers with a redirect to `*.cloudflareaccess.com`; the client then fails the
+call with `ACCESS_REQUIRED` and logs what to configure. Pending reports are
+kept. Rerunning post-install rewrites the whole file, so include both values
+whenever they are needed; then `pm2 restart zylos-om-marketplace-client`.
 
 ## Key rotation
 

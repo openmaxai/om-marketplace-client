@@ -15,11 +15,17 @@ export const ENV_FIELDS = [
   ['COCO_MEMBER_ID', 'member_id'],
   ['COCO_IDENTITY_ID', 'identity_id'],
   ['COCO_API_KEY', 'api_key'],
+  ['COCO_CF_ACCESS_CLIENT_ID', 'cf_access_client_id'],
+  ['COCO_CF_ACCESS_CLIENT_SECRET', 'cf_access_client_secret'],
 ];
 
 export const REQUIRED_ENV = ['COCO_BFF_URL', 'COCO_API_KEY', 'COCO_ORG_ID', 'COCO_MEMBER_ID'];
 
-export const SECRET_ENV = new Set(['COCO_API_KEY']);
+export const SECRET_ENV = new Set(['COCO_API_KEY', 'COCO_CF_ACCESS_CLIENT_SECRET']);
+
+// Cloudflare Access service token: optional, but both values or neither. Omitted from config.json when unset.
+const CF_ACCESS_ENV = ['COCO_CF_ACCESS_CLIENT_ID', 'COCO_CF_ACCESS_CLIENT_SECRET'];
+const OMIT_WHEN_UNSET = new Set(CF_ACCESS_ENV);
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1']);
 const LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
@@ -83,6 +89,18 @@ function cleanId(name, value) {
   return v;
 }
 
+// Sent as an HTTP header value: visible ASCII only.
+function headerValue(name, value) {
+  if (!/^[\x21-\x7e]{1,4096}$/.test(value)) throw new ConfigError(`${name} must be visible ASCII without spaces`);
+  return value;
+}
+
+// {clientId, clientSecret} when a Cloudflare Access service token is configured, else null.
+export function cfAccessFromConfig(config) {
+  if (!config?.cf_access_client_id || !config?.cf_access_client_secret) return null;
+  return { clientId: config.cf_access_client_id, clientSecret: config.cf_access_client_secret };
+}
+
 export function missingRequired(values) {
   return REQUIRED_ENV.filter((name) => !String(values[name] ?? '').trim());
 }
@@ -93,11 +111,14 @@ export function buildConfig(values) {
   if (missing.length) {
     throw new ConfigError(`missing required variables: ${missing.join(', ')}`, { missing });
   }
+  const set = CF_ACCESS_ENV.filter((n) => String(values[n] ?? '').trim());
+  if (set.length === 1) throw new ConfigError('Cloudflare Access client id and client secret must be set together');
   const config = { schema_version: CONFIG_SCHEMA_VERSION };
   for (const [envName, field] of ENV_FIELDS) {
     const raw = String(values[envName] ?? '').trim();
     if (envName === 'COCO_BFF_URL') config[field] = normalizeBffUrl(raw);
-    else config[field] = raw ? cleanId(envName, raw) : null;
+    else if (raw && OMIT_WHEN_UNSET.has(envName)) config[field] = headerValue(envName, raw);
+    else if (!OMIT_WHEN_UNSET.has(envName)) config[field] = raw ? cleanId(envName, raw) : null;
   }
   return config;
 }
