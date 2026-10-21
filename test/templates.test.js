@@ -58,6 +58,20 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, dir: path.join(h.dataDir, 'templates', ADOPTION) };
 }
 
+test('a render version 2 bundle records role.json in the slot and is emitted with its duty and boundary', async (t) => {
+  const role = JSON.stringify({ boundary: 'Never send mail.', duty: 'Inbox triage.' });
+  const f = await harness(t, { bundle: templateBundle({ files: { 'role.json': role }, index: { render_version: 2 } }) });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  const slot = readSlots(f.dataDir)['1'];
+  assert.equal(slot.role_sha256, f.state.read('adoptions', {})[ADOPTION].role_sha256);
+  assert.match(slot.role_sha256, /^[0-9a-f]{64}$/);
+  assert.match(emitSlot(1, { dataDir: f.dataDir }), /\n\nDuty: Inbox triage\.\nBoundary: Never send mail\.\n\n# Demo\n/);
+  assert.deepEqual(f.templates.reconcile(), []);
+  writeSlots(f.dataDir, { 1: { ...slot, role_sha256: 'f'.repeat(64) } });
+  assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_inject_missing', adoption_id: ADOPTION }]);
+});
+
 test('a write intent lands the bundle, takes a slot, is emitted and reported with C-15', async (t) => {
   const f = await harness(t);
   assert.equal(await f.templates.runNext(), 'succeeded');

@@ -9,7 +9,7 @@ import { revokedSet } from './revocations.js';
 import { downloadPackage } from './download.js';
 import { failureFor, scan, writeConfined } from './land.js';
 import { discard, fsyncDir, leftInTrash } from './trash.js';
-import { INJECT, inspectBundle } from './pkg/bundle.js';
+import { INJECT, ROLE, inspectBundle } from './pkg/bundle.js';
 import { declarationsReady, emptySlots, readSlots, runtimeOf, writeSlots } from './shards.js';
 import { JITTER_RATIO, POLL_INTERVAL_MS } from './scheduler.js';
 
@@ -131,11 +131,11 @@ export function createTemplates({
   }
   const slotOf = (slots, id) => Object.keys(slots).find((n) => slots[n]?.adoption_id === id);
   const clearSlot = (id) => setSlots((s) => { const n = slotOf(s, id); if (n) s[n] = null; return Boolean(n); });
-  function assignSlot(id, injectSha) {
+  function assignSlot(id, injectSha, roleSha) {
     setSlots((s) => {
       const n = slotOf(s, id) ?? Object.keys(s).find((k) => s[k] === null);
       if (!n) throw internal('slots_full');
-      s[n] = { adoption_id: id, inject_sha256: injectSha };
+      s[n] = { adoption_id: id, inject_sha256: injectSha, ...(roleSha ? { role_sha256: roleSha } : {}) };
       return true;
     });
   }
@@ -199,7 +199,7 @@ export function createTemplates({
     const rec = adoptions()[id];
     const st = lstatOrNull(dir(id));
     if (rec?.state === 'active' && rec.bundle_sha256 === it.bundle_sha256 && st?.isDirectory() && unchanged(rec)) {
-      return assignSlot(id, rec.inject_sha256);
+      return assignSlot(id, rec.inject_sha256, rec.role_sha256);
     }
     if (st && (!st.isDirectory() || !['active', 'writing', 'failed'].includes(rec?.state))) throw conflict('target_exists');
     if (st && rec.state === 'active' && !it.discard_local_changes && !unchanged(rec)) throw conflict('locally_modified');
@@ -217,9 +217,11 @@ export function createTemplates({
       throw internal('role_write_failed');
     }
     const injectSha = sha256(bundle.files.find((f) => f.path === INJECT).data);
+    const roleFile = bundle.files.find((f) => f.path === ROLE);
+    const roleSha = roleFile ? sha256(roleFile.data) : undefined;
     putAdoption(id, {
       adoption_id: id, org_id: it.org_id, template_id: it.template_id, bundle_sha256: it.bundle_sha256, manifest_sha256: manifestSha,
-      template: bundle.index.template, version: bundle.index.version, inject_sha256: injectSha, state: 'writing',
+      template: bundle.index.template, version: bundle.index.version, inject_sha256: injectSha, role_sha256: roleSha, state: 'writing',
       files: bundle.files.map((f) => ({ path: f.path, size: f.data.length, sha256: sha256(f.data) })),
     });
     try {
@@ -233,7 +235,7 @@ export function createTemplates({
       throw err;
     }
     putAdoption(id, { state: 'active' });
-    assignSlot(id, injectSha);
+    assignSlot(id, injectSha, roleSha);
   }
 
   // C-04 answers one 404 for every reason: pull C-11 first, then ask C-01 whether the intent is still pending.
@@ -438,9 +440,9 @@ export function createTemplates({
       const items = [];
       for (const [id, rec] of Object.entries(recs)) {
         if (rec.state !== 'active') continue;
-        // The emitter prints nothing while the slot's sha differs from the landed inject.md.
+        // The emitter prints nothing while the slot's shas differ from the landed inject.md and role.json.
         const n = slotOf(slots, id);
-        if (!n || slots[n].inject_sha256 !== rec.inject_sha256 || !lstatOrNull(dir(id))?.isDirectory()) {
+        if (!n || slots[n].inject_sha256 !== rec.inject_sha256 || slots[n].role_sha256 !== rec.role_sha256 || !lstatOrNull(dir(id))?.isDirectory()) {
           items.push({ kind: 'template_inject_missing', adoption_id: id });
         } else if (!unchanged(rec)) {
           // Same basis as C-15: the bundle the content was rendered from.

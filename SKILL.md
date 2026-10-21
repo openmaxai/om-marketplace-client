@@ -90,6 +90,11 @@ restarts once when idle; memory and context are kept. On Codex the templates
 take effect when the Codex session next starts. Until then a template write
 raises an alert and waits at most 15 minutes, then is reported as failed
 (`inject_unavailable`).
+Each template shard prints a fixed priority line (organization rules > template
+> the agent's own habits), the template's file path, the template's duty and
+boundary (`role.json`; no boundary line when it is empty), then `inject.md`.
+Duty, boundary and `inject.md` together stay within 2000 estimated tokens, so
+the whole shard fits the zylos 2200-token shard budget.
 
 ## Commands
 
