@@ -30,12 +30,18 @@ export function estimateTokens(text) {
   return Math.ceil(ascii / 4 + other / 1.3);
 }
 
-// role.json of a template bundle: exactly {boundary, duty}, both strings, duty not blank. Null otherwise.
+// Control characters and line breaks (C0, DEL, C1 incl. NEL, LS, PS): each role field must stay on one line.
+const ROLE_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+// role.json of a template bundle: exactly {boundary, duty}, both strings, duty not blank, neither with a line break or
+// control character, in the server's canonical form (which also rules out duplicate keys). Null otherwise.
 export function parseRole(text) {
   let r;
   try { r = JSON.parse(text); } catch { return null; }
   if (!r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).sort().join() !== 'boundary,duty') return null;
   if (typeof r.duty !== 'string' || !r.duty.trim() || typeof r.boundary !== 'string') return null;
+  if (ROLE_FORBIDDEN.test(r.duty) || ROLE_FORBIDDEN.test(r.boundary)) return null;
+  if (JSON.stringify({ boundary: r.boundary, duty: r.duty }) !== text) return null;
   return { duty: r.duty, boundary: r.boundary };
 }
 

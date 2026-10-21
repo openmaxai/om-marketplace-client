@@ -10,7 +10,9 @@ import { downloadPackage } from './download.js';
 import { failureFor, scan, writeConfined } from './land.js';
 import { discard, fsyncDir, leftInTrash } from './trash.js';
 import { INJECT, ROLE, inspectBundle } from './pkg/bundle.js';
-import { declarationsReady, emptySlots, readSlots, runtimeOf, writeSlots } from './shards.js';
+import { PackageError } from './pkg/zip.js';
+import { declarationsReady, emptySlots, readSlots, roleLines, runtimeOf, writeSlots } from './shards.js';
+import { composeSection } from './shard-emitter.js';
 import { JITTER_RATIO, POLL_INTERVAL_MS } from './scheduler.js';
 
 export const MAX_TOMBSTONES = 1000;
@@ -211,6 +213,10 @@ export function createTemplates({
       emulatorOrigin, fetchImpl, now, sleep, signal,
     });
     const bundle = inspectBundle(bytes);
+    // The whole section the emitter will print (priority and path lines included) must fit, or the slot would print nothing.
+    if (composeSection(dir(id), (bundle.role ? roleLines(bundle.role) : '') + bundle.inject) === null) {
+      throw new PackageError('inject_too_large', 'template section does not fit the shard budget');
+    }
     const revoked = revokedSet(state);
     const manifestSha = bundle.index.manifest_sha256;
     if (revoked.has('manifest_sha256', manifestSha) || revoked.blocksSha(manifestSha) || revoked.blocksSha(it.bundle_sha256)) {

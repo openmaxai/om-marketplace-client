@@ -31,8 +31,9 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {} } = {}) {
+async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir } = {}) {
   const h = await pullHarness(t, { orgs });
+  if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
   t.after(storage.close);
   const zylosDir = fakeZylos({ hooks: true });
@@ -102,6 +103,21 @@ test('a sha mismatch or an over-budget inject segment writes nothing', async (t)
     assert.equal(fs.existsSync(x.dir), false);
     assert.equal(readSlots(x.dataDir), null);
   }
+});
+
+// The emitter adds the priority and path lines; a section that would then not fit prints nothing, so it is refused at
+// install. Mutation check: dropping the composeSection precheck in writeBundle makes this fail.
+test('a template whose whole section does not fit the shard budget writes nothing', async (t) => {
+  const bundle = templateBundle({ inject: 'a'.repeat(8000) });
+  const ok = await harness(t, { bundle });
+  assert.equal(await ok.templates.runNext(), 'succeeded');
+  assert.notEqual(emitSlot(1, { dataDir: ok.dataDir }), '');
+  const long = (d) => { const p = path.join(d, 'x'.repeat(200), 'y'.repeat(200)); fs.mkdirSync(p, { recursive: true }); return p; };
+  const f = await harness(t, { bundle, dataDir: long });
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['PACKAGE_UNSAFE', 'inject_too_large']);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.equal(readSlots(f.dataDir), null);
 });
 
 test('no free slot, a revoked manifest or a local write failure is CLIENT_INTERNAL', async (t) => {
