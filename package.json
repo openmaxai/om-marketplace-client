@@ -1,6 +1,6 @@
 {
   "name": "om-marketplace-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent Market client for zylos agents: applies install intents from the marketplace and reports results",
   "type": "module",
   "main": "src/main.js",

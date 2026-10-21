@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.1.0
+version: 0.1.1
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after
@@ -33,21 +33,21 @@ upgrade:
   repo: github:openmaxai/om-marketplace-client
   branch: main
 
-# Read by hooks/post-install.js from the environment; not prompted by zylos so the
-# API key is never collected through chat or written to ~/zylos/.env.
+# Read by hooks/post-install.js from the environment, falling back per field to the openmax component config;
+# not prompted by zylos so the API key is never collected through chat or written to ~/zylos/.env.
 config:
   optional:
     - name: COCO_BFF_URL
-      description: Workspace BFF base URL (https; http only for localhost). Required by post-install.
+      description: Workspace BFF base URL (https; http only for localhost). Required unless the openmax component config provides it (server.bff_url).
     - name: COCO_API_KEY
-      description: This Agent's Workspace API key. Required by post-install.
+      description: This Agent's Workspace API key. Required unless the openmax component config provides it (agent.api_key).
       sensitive: true
     - name: COCO_ORG_ID
-      description: Organization ID this Agent belongs to. Required by post-install.
+      description: Primary organization ID. Required unless the openmax component config provides it (an enabled org).
     - name: COCO_MEMBER_ID
-      description: This Agent's member ID in COCO_ORG_ID. Required by post-install.
+      description: This Agent's member ID in COCO_ORG_ID. Required unless the openmax component config provides it (that org's self.member_id).
     - name: COCO_IDENTITY_ID
-      description: This Agent's identity ID.
+      description: This Agent's identity ID (openmax agent.identity_id).
 ---
 
 # om-marketplace-client
@@ -70,13 +70,20 @@ Client side of Agent Market for zylos Agents.
 
 ## Configuration
 
-`hooks/post-install.js` reads `COCO_BFF_URL`, `COCO_API_KEY`, `COCO_ORG_ID`,
-`COCO_MEMBER_ID` (required) and `COCO_IDENTITY_ID` (optional) from the
-environment and writes `config.json` (mode 0600). Without a TTY it never
-prompts and exits with code 78 naming any missing variable. Unset the `COCO_*`
-variables after install; the PM2 app filters them out and the service removes
-any it inherits, logging only their names. At runtime the service reads only
-`config.json`. Key rotation: rerun post-install with the complete variable set.
+`zylos add om-marketplace-client` needs no settings on an Agent with the openmax
+component. `hooks/post-install.js` takes `COCO_BFF_URL`, `COCO_API_KEY`,
+`COCO_ORG_ID`, `COCO_MEMBER_ID` (required) and `COCO_IDENTITY_ID` (optional)
+from the environment; each one not set is taken from the openmax component
+config (`~/zylos/components/openmax/config.json`, or under `$ZYLOS_DIR`). Only
+enabled orgs count: the primary is the one matching `COCO_ORG_ID`, else the
+enabled org with the lowest id; the other enabled orgs go into the `orgs` map.
+It writes `config.json` (mode 0600) and logs each field's source, never its
+value. Without a TTY it never prompts; if a required value is in neither place
+it exits with code 78, naming the missing variables and why the openmax
+component config could not supply them. Unset any `COCO_*` variables after
+install; the PM2 app filters them out and the service removes any it inherits,
+logging only their names. At runtime the service reads only `config.json`. Key
+rotation: rerun post-install with the new `COCO_API_KEY`.
 Post-install and post-upgrade declare the template session-start shards and run
 the zylos hook sync only when their hooks are missing. On Claude the agent
 restarts once when idle; memory and context are kept. On Codex the templates
