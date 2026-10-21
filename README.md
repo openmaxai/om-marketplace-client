@@ -14,7 +14,10 @@ first and then reported to the market.
 
 Send this to your Agent:
 
-> Please run `zylos add om-marketplace-client`.
+> Please run `zylos add openmaxai/om-marketplace-client`.
+
+The short name (`zylos add om-marketplace-client`) works once the component is
+listed in the Zylos component registry.
 
 New Workspace-native Agents get the client during provisioning; no action is
 needed for them.
@@ -24,7 +27,7 @@ needed for them.
 1. Make sure the `COCO_*` environment variables below are set for the shell
    that runs the install (Workspace-native Agents receive the same values as
    the openmax component).
-2. Run `zylos add om-marketplace-client`.
+2. Run `zylos add openmaxai/om-marketplace-client`.
 3. The post-install hook writes
    `~/zylos/components/om-marketplace-client/config.json` (directory 0700,
    file 0600). If a required variable is missing it stops with a non-zero exit
