@@ -31,8 +31,9 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {} } = {}) {
+async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir } = {}) {
   const h = await pullHarness(t, { orgs });
+  if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
   t.after(storage.close);
   const zylosDir = fakeZylos({ hooks: true });
@@ -57,6 +58,20 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   } });
   return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, dir: path.join(h.dataDir, 'templates', ADOPTION) };
 }
+
+test('a render version 2 bundle records role.json in the slot and is emitted with its duty and boundary', async (t) => {
+  const role = JSON.stringify({ boundary: 'Never send mail.', duty: 'Inbox triage.' });
+  const f = await harness(t, { bundle: templateBundle({ files: { 'role.json': role }, index: { render_version: 2 } }) });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  const slot = readSlots(f.dataDir)['1'];
+  assert.equal(slot.role_sha256, f.state.read('adoptions', {})[ADOPTION].role_sha256);
+  assert.match(slot.role_sha256, /^[0-9a-f]{64}$/);
+  assert.match(emitSlot(1, { dataDir: f.dataDir }), /\n\nDuty: Inbox triage\.\nBoundary: Never send mail\.\n\n# Demo\n/);
+  assert.deepEqual(f.templates.reconcile(), []);
+  writeSlots(f.dataDir, { 1: { ...slot, role_sha256: 'f'.repeat(64) } });
+  assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+  assert.deepEqual(f.templates.reconcile(), [{ kind: 'template_inject_missing', adoption_id: ADOPTION }]);
+});
 
 test('a write intent lands the bundle, takes a slot, is emitted and reported with C-15', async (t) => {
   const f = await harness(t);
@@ -88,6 +103,21 @@ test('a sha mismatch or an over-budget inject segment writes nothing', async (t)
     assert.equal(fs.existsSync(x.dir), false);
     assert.equal(readSlots(x.dataDir), null);
   }
+});
+
+// The emitter adds the priority and path lines; a section that would then not fit prints nothing, so it is refused at
+// install. Mutation check: dropping the composeSection precheck in writeBundle makes this fail.
+test('a template whose whole section does not fit the shard budget writes nothing', async (t) => {
+  const bundle = templateBundle({ inject: 'a'.repeat(8000) });
+  const ok = await harness(t, { bundle });
+  assert.equal(await ok.templates.runNext(), 'succeeded');
+  assert.notEqual(emitSlot(1, { dataDir: ok.dataDir }), '');
+  const long = (d) => { const p = path.join(d, 'x'.repeat(200), 'y'.repeat(200)); fs.mkdirSync(p, { recursive: true }); return p; };
+  const f = await harness(t, { bundle, dataDir: long });
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['PACKAGE_UNSAFE', 'inject_too_large']);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.equal(readSlots(f.dataDir), null);
 });
 
 test('no free slot, a revoked manifest or a local write failure is CLIENT_INTERNAL', async (t) => {

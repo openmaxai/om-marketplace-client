@@ -11,6 +11,8 @@ export const SLOT_COUNT = 4;
 export const SLOTS_FILE = 'slots.json';
 export const INJECT_MAX_TOKENS = 2000;
 export const SHARD_BUDGET = Object.freeze({ maxChars: 10000, maxTokens: 2200 });
+// Room kept for the header line zylos prepends to each shard (worst case incl. its "predecessor not ready" note).
+export const SHARD_HEADER_RESERVE = Object.freeze({ maxChars: 200, maxTokens: 50 });
 const ORDER_BASE = 60;
 const SLOTS = Array.from({ length: SLOT_COUNT }, (_, i) => i + 1);
 const ENTRY_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'shards');
@@ -26,6 +28,27 @@ export function estimateTokens(text) {
     else other += 1;
   }
   return Math.ceil(ascii / 4 + other / 1.3);
+}
+
+// Control characters and line breaks (C0, DEL, C1 incl. NEL, LS, PS): each role field must stay on one line.
+const ROLE_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+// role.json of a template bundle: exactly {boundary, duty}, both strings, duty not blank, neither with a line break or
+// control character, in the server's canonical form (which also rules out duplicate keys). Null otherwise.
+export function parseRole(text) {
+  let r;
+  try { r = JSON.parse(text); } catch { return null; }
+  if (!r || typeof r !== 'object' || Array.isArray(r) || Object.keys(r).sort().join() !== 'boundary,duty') return null;
+  if (typeof r.duty !== 'string' || !r.duty.trim() || typeof r.boundary !== 'string') return null;
+  if (ROLE_FORBIDDEN.test(r.duty) || ROLE_FORBIDDEN.test(r.boundary)) return null;
+  if (JSON.stringify({ boundary: r.boundary, duty: r.duty }) !== text) return null;
+  return { duty: r.duty, boundary: r.boundary };
+}
+
+// Duty and boundary lines printed ahead of the inject segment, byte for byte the server's domain.RenderRoleLines (the
+// inject budget is measured on these lines plus the segment). No boundary line when it is empty.
+export function roleLines({ duty, boundary }) {
+  return `Duty: ${duty}\n${boundary ? `Boundary: ${boundary}\n` : ''}\n`;
 }
 
 export function defaultZylosDir(env = process.env) {
@@ -118,9 +141,11 @@ export function syncHooks(zylosDir, { env = process.env, spawn = spawnSync } = {
 }
 
 const EMPTY_SLOTS = Object.freeze(Object.fromEntries(SLOTS.map((n) => [String(n), null])));
-const validSlot = (v) => v === null || (v && typeof v === 'object' && isCanonicalUuid(v.adoption_id) && isSha256Hex(v.inject_sha256));
+const validSlot = (v) => v === null || (v && typeof v === 'object' && isCanonicalUuid(v.adoption_id) && isSha256Hex(v.inject_sha256)
+  && (v.role_sha256 === undefined || isSha256Hex(v.role_sha256)));
 
-// D/slots.json: slot n -> {adoption_id, inject_sha256} or null. Returns null when missing; throws when unusable.
+// D/slots.json: slot n -> {adoption_id, inject_sha256, role_sha256?} or null; role_sha256 only for bundles with
+// role.json. Returns null when missing; throws when unusable.
 export function readSlots(dataDir) {
   const raw = readJson(path.join(dataDir, SLOTS_FILE), null);
   if (raw === null) return null;
