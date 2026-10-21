@@ -102,6 +102,7 @@ test('env path and interactive path produce byte-identical config.json', async (
     env: { COCO_BFF_URL: VALID_ENV.COCO_BFF_URL },
     isTTY: true,
     dataDir: qaDir,
+    zylosDir: tmpHome(),
     ask: async (q, opts) => {
       const name = q.match(/\[(COCO_[A-Z_]+)\]/)[1];
       asked.push([name, opts.hidden]);
@@ -122,7 +123,7 @@ test('no TTY never prompts', async () => {
   const dataDir = dataDirIn(tmpHome());
   let prompted = false;
   const code = await runInstall({
-    env: {}, isTTY: false, dataDir,
+    env: {}, isTTY: false, dataDir, zylosDir: tmpHome(),
     ask: async () => { prompted = true; return 'x'; },
     log: () => {}, error: () => {},
   });

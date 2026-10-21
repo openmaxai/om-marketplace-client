@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Writes config.json from COCO_* env vars; prompts for missing values only when stdin is a TTY. Then declares the
-// template session-start shards.
+// Writes config.json from COCO_* env vars, filling missing ones from the openmax component config; prompts for what is
+// still missing only when stdin is a TTY. Then declares the template session-start shards.
 import { runInstall } from './lib/install.js';
 import { installShards } from './lib/shards.js';
 import { resolveDataDir } from '../src/config.js';

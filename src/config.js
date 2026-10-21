@@ -165,12 +165,14 @@ function existingOrgs(dataDir, primaryOrg) {
 }
 
 // Single write path for every install route (env, interactive, configure hook).
-// Always rewrites the whole file, so a complete value set also rotates the key; a hand-edited orgs map is kept.
-export function writeConfig(values, dataDir, { tightenExisting = false } = {}) {
+// Always rewrites the whole file, so a complete value set also rotates the key; a hand-edited orgs map is kept and wins
+// over extraOrgs ({<org_id>: {member_id}}, e.g. derived from the openmax component config).
+export function writeConfig(values, dataDir, { tightenExisting = false, extraOrgs } = {}) {
   const config = buildConfig(values);
   prepareDataDir(dataDir, tightenExisting);
-  const orgs = existingOrgs(dataDir, config.org_id);
-  if (orgs) config.orgs = orgs;
+  const added = Object.entries(extraOrgs ?? {}).filter(([k]) => k !== config.org_id);
+  const orgs = { ...Object.fromEntries(added), ...existingOrgs(dataDir, config.org_id) };
+  if (Object.keys(orgs).length) config.orgs = orgs;
   const target = configPath(dataDir);
   const tmp = path.join(dataDir, `.config.json.${process.pid}.${Date.now()}.tmp`);
   try {
