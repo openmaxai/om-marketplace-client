@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-21
+
+### Added
+- Each template shard starts with a fixed priority line (organization rules >
+  template > the agent's own habits), then the path line, then the template's
+  duty and boundary lines from `role.json`, then `inject.md`.
+- Bundles at render version 2 carry `role.json` (`{boundary, duty}`); version 1
+  bundles are still accepted without it.
+
+### Changed
+- `role.json` must be the server's canonical bytes; duty and boundary must be
+  single-line with no control characters. Its sha256 is recorded in the slot and
+  the shard prints nothing if the file later differs.
+- The 2000-token limit covers the duty/boundary lines and `inject.md` together.
+  A template write is refused as `inject_too_large` when the full section would
+  not fit the shard budget.
+
+### Upgrade Notes
+
+No action needed. Templates installed with 0.1.1 keep working.
+
 ## [0.1.1] - 2026-10-21
 
 ### Added
