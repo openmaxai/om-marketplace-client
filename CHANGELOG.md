@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A picked-up install or upgrade whose version was revoked is now reported to the
+  market as `failed`/`VERSION_REVOKED` after a restart, instead of being closed
+  only locally and left running until it timed out: when the stored C-02 answer
+  is now revoked or blocked, and when the C-02 replay is refused with 404
+  `VERSION_NOT_FOUND` or 409 `VERSION_REVOKED`.
+- A 409 `REQUEST_ID_CONFLICT` to a `VERSION_REVOKED` report is only logged; the
+  market closing the same request first is expected. Other reports still alert.
+- A `failed`/`VERSION_REVOKED` answer to a succeeded install report quarantines
+  the landed copy instead of discarding it.
+
 ## [0.1.2] - 2026-10-21
 
 ### Added
