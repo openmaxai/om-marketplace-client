@@ -379,7 +379,10 @@ export function createTemplates({
     else if (wrote && res.status === 'failed' && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
     state.update('template_reports', {}, (d) => { delete d[requestId]; });
     setIntent(r.intent_id, null);
-    if (stale) await revocations?.pull();
+    // The report is already settled; a failed pull only delays the sweep to the next round.
+    if (stale) {
+      try { await revocations?.pull(); } catch (err) { logger.warn(`revocations pull after stale ${requestId} failed: ${err.message}`); }
+    }
     return r.body.status;
   }
 

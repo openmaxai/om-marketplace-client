@@ -372,7 +372,7 @@ export function createSkills({
       }
       // The market picked this request and keeps it running until a result comes, so a refused replay is reported.
       if (picked && err instanceof MarketError && REPLAY_REVOKED.has(err.code)) {
-        return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: 'version_revoked' });
+        return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: err.code.toLowerCase() });
       }
       return rejected(err, it, `${it.op} request`);
     }

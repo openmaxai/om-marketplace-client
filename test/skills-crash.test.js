@@ -198,7 +198,8 @@ for (const [p, when] of [
     h.over.c02.push(p);
     assert.deepEqual(await h.make().runRound(), ['failed']);
     assert.equal(h.sent(C02).filter((r) => r.json.op === 'upgrade').length, 2);
-    assertRevokedOnce(h, rid);
+    // The message carries the code the replay was refused with, so the market can tell a revocation from a lost listing.
+    assertRevokedOnce(h, rid, p.problem.code.toLowerCase());
     assert.equal(alertText(h), '');
     assert.deepEqual(await h.make().runRound(), []);
     assert.equal(h.sent(`/install-requests/${rid}/result`).length, 1);

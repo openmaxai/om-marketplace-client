@@ -31,7 +31,7 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir } = {}) {
+async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller } = {}) {
   const h = await pullHarness(t, { orgs });
   if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
@@ -44,7 +44,7 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   } }]));
   h.fake.script('POST', C15, ...c15);
   await createIntentPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now }).pull();
-  const revocations = createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
+  const revocations = puller ?? createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
   const make = () => createTemplates({
     api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir, revocations, emulatorOrigin: storage.origin,
     now: h.now, sleep: async () => {},
@@ -758,6 +758,18 @@ test('an upgrade answered stale/active is quarantined and never injected, then C
   assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
   assert.deepEqual(Object.keys(alertsOf(f)), alerts);
   assert.deepEqual(f.state.read('template_reports', {}), {});
+});
+
+test('a C-11 pull that throws after a stale answer is logged; the settled report stays settled', async (t) => {
+  const f = await harness(t, { c15: [stale('failed')], revocations: { pull: async () => { throw new Error('pull boom'); } } });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+  assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+  assert.deepEqual([f.state.read('template_reports', {}), f.state.read('intents', null).queue], [{}, []]);
+  assert.ok(f.lines.some((l) => /revocations pull after stale .* failed: pull boom/.test(l)));
+  assert.equal(await f.templates.runNext(), null);
+  assert.equal(f.sent().length, 1);
 });
 
 test('an applied answer keeps the write and pulls nothing', async (t) => {
