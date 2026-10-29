@@ -118,6 +118,9 @@ for (const code of ['PACKAGE_MISMATCH', 'VERSION_REVOKED']) {
     await s.runRound();
     assert.equal(h.marker().version_no, 1);
     assert.equal(h.state.read('installs', {})[SKILL].version_no, 1);
+    // A version the market calls revoked is quarantined even before C-11 says so; anything else is discarded.
+    assert.deepEqual(quarantined(h), code === 'VERSION_REVOKED' ? { [`2-${VID(2)}`]: 2 } : {});
+    assert.deepEqual(h.state.outbox.list(), []);
     h.over.c06.push((req) => ({ status: 200, json: { request_id: req.path.split('/')[6], status: 'failed', error_code: code } }));
     await s.uninstall(SKILL);
     await h.queue(['install', 2]);

@@ -23,6 +23,10 @@ const GONE = new Set(['INTENT_NOT_PENDING', 'INTENT_EXPIRED']);
 const SHOWN = new Set(['VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED', 'SKILL_ALREADY_INSTALLED', 'INSTALLED_BY_OTHER_ORG']);
 const { O_RDONLY, O_NOFOLLOW } = fs.constants;
 const CORRUPT = Symbol('corrupt');
+// recover(): the market has the request running, so C-02 is sent again as a replay.
+const REPLAY = Symbol('replay');
+// A C-02 replay re-checks visibility; a revoked version answers one of these.
+const REPLAY_REVOKED = new Set(['VERSION_NOT_FOUND', 'VERSION_REVOKED']);
 // Node system errors (EACCES, EIO, ENOSPC...) carry a syscall; anything else thrown on a journal entry means its content is bad.
 const isFsError = (err) => typeof err?.syscall === 'string';
 const isVersion = (v) => v !== null && typeof v === 'object' && Number.isSafeInteger(v.version_no) && v.version_no >= 0
@@ -190,9 +194,8 @@ export function createSkills({
 
   // Takes a landing back: the landed copy is discarded (quarantined when revoked) and the replaced version restored.
   // A no-op landing (the version was already in place) leaves the directories to restorePrior alone.
-  function undoLanding(j) {
+  function undoLanding(j, revoked = isRevoked(j.response)) {
     const { response: res, prior } = j;
-    const revoked = isRevoked(res);
     for (const w of j.noop ? [] : ['enabled', 'disabled']) {
       const d = dirOf(res.slug, w);
       if (readMarker(d)?.package_sha256 !== res.package_sha256) continue;
@@ -241,8 +244,10 @@ export function createSkills({
         return 'deferred';
       }
       const msg = `${o.kind} report ${id} refused (${err.code || err.status})`;
-      if (c !== 'gone' && (o.kind === 'result' || err.status !== 404)) state.setAlert(`report:${id}`, msg);
-      logger.warn(msg);
+      // A VERSION_REVOKED report may cross the market's own close of the request; that conflict is expected.
+      const expected = err.code === 'REQUEST_ID_CONFLICT' && o.kind === 'result' && o.body.error_code === 'VERSION_REVOKED';
+      if (c !== 'gone' && !expected && (o.kind === 'result' || err.status !== 404)) state.setAlert(`report:${id}`, msg);
+      logger.warn(expected ? `${msg}; the market already closed it` : msg);
     }
     // Idempotent, so it runs again when a crash comes before the outbox entry is gone.
     const j = readEntry('journal', id);
@@ -251,7 +256,8 @@ export function createSkills({
       else if (res.error_code === 'INSTALL_TIMEOUT') logger.warn(`install ${id}: market timed it out; the landed version stays for reconcile`);
       else {
         logger.warn(`install ${id}: market refused the result (${res.error_code}); rolling back`);
-        undoLanding(j);
+        // The market knows of the revocation before the next C-11 pull does: the landed copy is quarantined, not discarded.
+        undoLanding(j, res.error_code === 'VERSION_REVOKED' || isRevoked(j.response));
       }
     }
     state.outbox.remove(id);
@@ -283,7 +289,8 @@ export function createSkills({
     return 'closed';
   }
 
-  // A request seen before this run: resolves what landed locally against C-07. Returns an outcome, or null to (re)send C-02.
+  // A request seen before this run: resolves what landed locally against C-07. Returns an outcome, or null to send C-02
+  // (REPLAY when the market already has the request running).
   // A version revoked while the process was down is taken back instead of being recorded or reported as installed.
   async function recover(it, rid, j) {
     const st = await statusOf(it, rid);
@@ -304,16 +311,23 @@ export function createSkills({
     if (st.status !== 'running') return close(it, rid, `market status ${st.status} ${st.error_code ?? ''}`.trim());
     if (j.result) return report(rid, it, j.result);
     if (revoked) return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: 'version_revoked' });
+    const why = j.response && !landed && revokedReason(j.response);
+    if (why) return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: why });
     if (landed) return report(rid, it, { status: 'succeeded', installed_sha256: j.response.package_sha256 });
-    return null;
+    return REPLAY;
+  }
+
+  function revokedReason(res) {
+    const revoked = revokedSet(state);
+    if (revoked.has('skill_version_id', res.skill_version_id)) return 'version_revoked';
+    return revoked.blocksSha(res.package_sha256) ? 'sha_blocked' : null;
   }
 
   // The market may pick the version, so what C-02 selected is checked against the revoked set and the package caps
   // before any download. Returns [code, message] or null.
   function refusedBeforeDownload(res) {
-    const revoked = revokedSet(state);
-    if (revoked.has('skill_version_id', res.skill_version_id)) return ['VERSION_REVOKED', 'version_revoked'];
-    if (revoked.blocksSha(res.package_sha256)) return ['VERSION_REVOKED', 'sha_blocked'];
+    const why = revokedReason(res);
+    if (why) return ['VERSION_REVOKED', why];
     if (res.size_bytes > MAX_PACKAGE_BYTES || res.file_manifest.reduce((n, e) => n + e.size, 0) > MAX_PACKAGE_BYTES) {
       return ['PACKAGE_UNSAFE', 'too_large'];
     }
@@ -336,9 +350,11 @@ export function createSkills({
     const rid = it.request_id ?? uuidv7(now());
     let j = readEntry('journal', rid);
     if (j === CORRUPT || j?.phase === 'reported' || j?.phase === 'closed') return setIntent(it.id, null), 'closed';
+    let picked = false;
     if (j) {
       const r = await recover(it, rid, j);
-      if (r) return r;
+      if (r && r !== REPLAY) return r;
+      picked = r === REPLAY;
     } else {
       const body = {
         request_id: rid, skill_id: it.skill_id, ...(it.skill_version_id ? { skill_version_id: it.skill_version_id } : {}),
@@ -353,6 +369,10 @@ export function createSkills({
     } catch (err) {
       if (err instanceof MarketError && err.code === 'RESPONSE_INVALID') {
         return report(rid, it, { status: 'failed', error_code: 'CLIENT_INTERNAL', error_message: 'install_response_invalid' });
+      }
+      // The market picked this request and keeps it running until a result comes, so a refused replay is reported.
+      if (picked && err instanceof MarketError && REPLAY_REVOKED.has(err.code)) {
+        return report(rid, it, { status: 'failed', error_code: 'VERSION_REVOKED', error_message: err.code.toLowerCase() });
       }
       return rejected(err, it, `${it.op} request`);
     }

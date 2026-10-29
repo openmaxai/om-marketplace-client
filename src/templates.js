@@ -371,11 +371,18 @@ export function createTemplates({
       if (lapsed && r.body.kind === 'write' && r.body.status === 'succeeded') revoke(r.adoption_id, 'write order no longer pending');
       else if (!lapsed) state.setAlert(`template_result:${requestId}`, `template result ${requestId} rejected (${err.code || err.status})`);
     }
-    if (res && r.body.kind === 'write' && r.body.status === 'succeeded' && res.status === 'failed' && res.error_code !== 'INSTALL_TIMEOUT') {
-      revoke(r.adoption_id, 'market closed the write as failed');
-    }
+    const wrote = res && r.body.kind === 'write' && r.body.status === 'succeeded';
+    // A stale answer means the market did not take this write (revoked, blocked or timed out meanwhile), also when the
+    // adoption stays active on its previous version: what landed is never kept.
+    const stale = wrote && res.outcome === 'stale';
+    if (stale) revoke(r.adoption_id, 'market did not accept the write (stale)');
+    else if (wrote && res.status === 'failed' && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
     state.update('template_reports', {}, (d) => { delete d[requestId]; });
     setIntent(r.intent_id, null);
+    // The report is already settled; a failed pull only delays the sweep to the next round.
+    if (stale) {
+      try { await revocations?.pull(); } catch (err) { logger.warn(`revocations pull after stale ${requestId} failed: ${err.message}`); }
+    }
     return r.body.status;
   }
 

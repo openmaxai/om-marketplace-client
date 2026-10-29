@@ -31,7 +31,7 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir } = {}) {
+async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller } = {}) {
   const h = await pullHarness(t, { orgs });
   if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
@@ -44,7 +44,7 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   } }]));
   h.fake.script('POST', C15, ...c15);
   await createIntentPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now }).pull();
-  const revocations = createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
+  const revocations = puller ?? createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
   const make = () => createTemplates({
     api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir, revocations, emulatorOrigin: storage.origin,
     now: h.now, sleep: async () => {},
@@ -703,4 +703,93 @@ test('on Claude missing slot hooks still fail the write at once', async (t) => {
   assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['CLIENT_INTERNAL', 'inject_unavailable']);
   assert.equal(f.state.read('template_hooks', null), null);
   assert.equal(alertsOf(f).template_hooks_pending, undefined);
+});
+
+const stale = (status) => ({ status: 200, json: { adoption_id: ADOPTION, status, outcome: 'stale' } });
+const after = (f) => f.fake.market().map((r) => r.path.split('/').at(-1)).slice(f.fake.market().findIndex((r) => r.path === C15));
+const quarantinedCopies = (f) => { try { return fs.readdirSync(path.join(f.dataDir, 'quarantine')).sort(); } catch { return []; } };
+
+for (const [name, answer] of [
+  ['stale/failed', stale('failed')],
+  ['stale/failed INSTALL_TIMEOUT', { status: 200, json: { ...stale('failed').json, error_code: 'INSTALL_TIMEOUT' } }],
+]) {
+  test(`a first deploy answered ${name} is quarantined with its slot cleared, then C-11 is pulled`, async (t) => {
+    const f = await harness(t, { c15: [answer] });
+    assert.equal(await f.templates.runNext(), 'succeeded');
+    assert.equal(readSlots(f.dataDir)['1'], null);
+    assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+    assert.equal(fs.existsSync(f.dir), false);
+    assert.equal(fs.readFileSync(path.join(f.dataDir, 'quarantine', ADOPTION, 'sop/triage.md'), 'utf8'), '# Triage\n');
+    assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+    assert.deepEqual(after(f), ['write-results', 'revocations:query']);
+    assert.deepEqual([f.state.read('template_reports', {}), f.state.read('intents', null).queue], [{}, []]);
+  });
+}
+
+test('an upgrade answered stale/active is quarantined and never injected, then C-11 is pulled; a second stale answer changes nothing', async (t) => {
+  const f = await harness(t, { c15: [applied] });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.match(emitSlot(1, { dataDir: f.dataDir }), /Help with demos/);
+  const next = templateBundle({ inject: '# Demo\n\nNew version.\n', files: { 'sop/triage.md': '# Triage v2\n' } });
+  f.serveAgain(next);
+  rewrite(f, { bundle_sha256: next.sha });
+  f.fake.script('POST', C15, stale('active'));
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.sent()[1].status, 'succeeded');
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(emitSlot(1, { dataDir: f.dataDir }), '');
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+  assert.equal(fs.readFileSync(path.join(f.dataDir, 'quarantine', ADOPTION, 'sop/triage.md'), 'utf8'), '# Triage v2\n');
+  assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+  assert.deepEqual(after(f).slice(-2), ['write-results', 'revocations:query']);
+  assert.deepEqual(f.templates.reconcile(), []);
+  const alerts = Object.keys(alertsOf(f));
+
+  // The same report again (as after a crash before it was dropped) gets the same answer and is harmless.
+  const [, body] = f.sent();
+  f.state.update('template_reports', {}, (d) => { d[body.request_id] = { org_id: ORG, adoption_id: ADOPTION, intent_id: U(15), body }; });
+  f.fake.script('POST', C15, stale('active'));
+  assert.equal(await f.templates.runNext(), null);
+  const raw = f.fake.requests.filter((r) => r.path === C15).map((r) => r.body);
+  assert.equal(raw.at(-1), raw.at(-2));
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+  assert.deepEqual(Object.keys(alertsOf(f)), alerts);
+  assert.deepEqual(f.state.read('template_reports', {}), {});
+});
+
+test('a C-11 pull that throws after a stale answer is logged; the settled report stays settled', async (t) => {
+  const f = await harness(t, { c15: [stale('failed')], revocations: { pull: async () => { throw new Error('pull boom'); } } });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+  assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+  assert.deepEqual([f.state.read('template_reports', {}), f.state.read('intents', null).queue], [{}, []]);
+  assert.ok(f.lines.some((l) => /revocations pull after stale .* failed: pull boom/.test(l)));
+  assert.equal(await f.templates.runNext(), null);
+  assert.equal(f.sent().length, 1);
+});
+
+test('an applied answer keeps the write and pulls nothing', async (t) => {
+  const f = await harness(t);
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(readSlots(f.dataDir)['1'].adoption_id, ADOPTION);
+  assert.equal(fs.existsSync(f.dir), true);
+  assert.equal(f.fake.requests.filter((r) => r.path.endsWith('revocations:query')).length, 0);
+});
+
+test('a sha_block hitting a record still in writing quarantines it', async (t) => {
+  const f = await harness(t);
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  f.state.update('adoptions', {}, (d) => { d[ADOPTION].state = 'writing'; });
+  f.state.write('revoked', { ...EMPTY_REVOKED, sha_block: [MANIFEST_SHA] });
+  f.templates.sweepRevoked();
+  assert.equal(readSlots(f.dataDir)['1'], null);
+  assert.equal(fs.existsSync(f.dir), false);
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+  assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
+  f.templates.sweepRevoked();
+  assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
 });
