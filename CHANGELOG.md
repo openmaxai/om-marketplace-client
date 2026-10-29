@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   market closing the same request first is expected. Other reports still alert.
 - A `failed`/`VERSION_REVOKED` answer to a succeeded install report quarantines
   the landed copy instead of discarding it.
+- A template write answered `stale` by C-15 (first deploy or upgrade) is no
+  longer kept: its slot is cleared, the new content is quarantined, and C-11 is
+  pulled at once.
 
 ## [0.1.2] - 2026-10-21
 
