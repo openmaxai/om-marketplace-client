@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
 import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
+import { looksLikeSecret } from '../src/secretscan.js';
 import {
   HEARTBEAT_MS, MAX_REPORT_BYTES, MAX_SCAN_ENTRIES, MAX_REPORT_ITEMS, MAX_SKILL_MD_READ, MIN_CHANGE_INTERVAL_MS, REPORT_EVERY_MS, buildReport, cleanText,
   componentSkillNames, createLocalSkillReporter, parseFrontmatter, reportHash, scanLocalSkills,
@@ -280,13 +281,40 @@ test('the heartbeat stays below the market stale window of 24 hours by more than
   assert.ok(HEARTBEAT_MS + 2 * (REPORT_EVERY_MS + 6 * 60 * 1000) < 24 * 60 * 60 * 1000);
 });
 
-test('only the first MAX_SCAN_ENTRIES directory entries are looked at; the report is then truncated', () => {
+test('only the first MAX_SCAN_ENTRIES directory entries are read; the report is then truncated', () => {
   const { zylosDir, skillsDir } = fakeZylosDir();
-  for (let i = 0; i < MAX_SCAN_ENTRIES; i += 1) fs.mkdirSync(path.join(skillsDir, `a${String(i).padStart(4, '0')}`));
-  skill(skillsDir, 'zz-last');
+  for (let i = 0; i < MAX_SCAN_ENTRIES - 1; i += 1) fs.mkdirSync(path.join(skillsDir, `a${String(i).padStart(4, '0')}`));
+  skill(skillsDir, 'one');
+  const full = scanLocalSkills({ skillsDir, zylosDir });
+  assert.equal(full.capped, false);
+  assert.deepEqual(full.items.map((i) => i.location_id), ['one']);
+  fs.mkdirSync(path.join(skillsDir, 'b-extra'));
   const scan = scanLocalSkills({ skillsDir, zylosDir });
   assert.equal(scan.capped, true);
-  assert.deepEqual(scan.items, []);
+  assert.ok(scan.items.length <= 1);
   assert.equal(buildReport(scan.items, 'now', { capped: scan.capped }).truncated, true);
   assert.equal(buildReport([], 'now').truncated, false);
+});
+
+test('a name, version or directory name that looks like a credential is never sent', () => {
+  const { zylosDir, skillsDir } = fakeZylosDir();
+  skill(skillsDir, 'ok-skill');
+  skill(skillsDir, 'named', '---\nname: ghp_0123456789abcdefABCDEF\nversion: 1\n---\n');
+  skill(skillsDir, 'versioned', '---\nname: v\nversion: "token=abcdefgh12"\n---\n');
+  skill(skillsDir, 'AKIAABCDEFGHIJKLMNOP');
+  skill(skillsDir, 'wide', '---\nname: ｇｈｐ＿0123456789abcdefABCDEF\n---\n');
+  const scan = scanLocalSkills({ skillsDir, zylosDir });
+  assert.deepEqual(scan.items.map((i) => i.location_id), ['ok-skill']);
+  assert.equal(scan.skipped, 4);
+});
+
+test('credential scan follows the market rules', () => {
+  for (const hit of ['sk-abcdefghijklmnop1234', 'xoxb-1234567890abcdef', 'eyJa.eyJb.sig', 'Bearer abcdefghijklmnopqrstu',
+    'https://u:p@h', 'password: hunter22hunter', 'AIza' + 'a'.repeat(35), '0x' + '0123456789abcdef'.repeat(2),
+    'aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE', 'secret: "correct horse battery"', 'g\u200bhp_0123456789abcdefABCD']) {
+    assert.equal(looksLikeSecret(hit), true, hit);
+  }
+  for (const miss of ['task-runner', 'desk-abcdefghijklmnop1234', 'pdf tools', '1.2.3', 'sk-short', 'a'.repeat(40), 'my secret notes']) {
+    assert.equal(looksLikeSecret(miss), false, miss);
+  }
 });

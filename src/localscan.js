@@ -7,6 +7,7 @@ import { MarketError } from './http.js';
 import { SKILL_DIR_PREFIX } from './land.js';
 import { enterTooOldMode, tooOld } from './intents.js';
 import { RECONCILE_EVERY_MS } from './reconcile.js';
+import { looksLikeSecret } from './secretscan.js';
 
 export const MAX_REPORT_ITEMS = 200;
 export const MAX_REPORT_BYTES = 64 * 1024;
@@ -73,12 +74,28 @@ export function parseFrontmatter(text) {
   return out;
 }
 
-// The first MAX_SKILL_MD_READ bytes of a regular SKILL.md, never through a link; null when there is none.
-function readHead(file) {
+// The opened file is the expected one: where /proc is available, the path of the descriptor itself; otherwise the
+// directory is still the same directory, not a link put in its place.
+function openedAt(fd, expected, dir, dirStat) {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`) === expected;
+  } catch {
+    try {
+      const st = fs.lstatSync(dir);
+      return st.isDirectory() && st.dev === dirStat.dev && st.ino === dirStat.ino;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// The first MAX_SKILL_MD_READ bytes of a regular SKILL.md, never through a link (also not a directory swapped for a
+// link after it was checked); null when there is none.
+function readHead(file, { expected, dir, dirStat }) {
   let fd;
   try {
     fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-    if (!fs.fstatSync(fd).isFile()) return null;
+    if (!fs.fstatSync(fd).isFile() || !openedAt(fd, expected, dir, dirStat)) return null;
     const buf = Buffer.alloc(MAX_SKILL_MD_READ);
     let n = 0;
     while (n < buf.length) {
@@ -122,21 +139,33 @@ export function componentSkillNames(zylosDir, skillsDir) {
 
 // First-level directories of skillsDir with a SKILL.md, sorted by name. Skipped: market-managed (market--*), dot
 // entries, links (never followed), non-directories, directories without SKILL.md and names the market would drop.
-// Only the first MAX_SCAN_ENTRIES entries are looked at. Returns { items, skipped, capped }; a missing skillsDir is an empty scan, any other read error is thrown.
+// Only the first MAX_SCAN_ENTRIES entries the directory lists are read. Returns { items, skipped, capped }; a missing
+// skillsDir is an empty scan, any other read error is thrown.
 export function scanLocalSkills({ skillsDir, zylosDir }) {
-  let names;
+  const names = [];
+  let capped = false;
+  let handle;
   try {
-    names = fs.readdirSync(skillsDir);
+    handle = fs.opendirSync(skillsDir);
+    for (let e = handle.readSync(); e !== null; e = handle.readSync()) {
+      if (names.length === MAX_SCAN_ENTRIES) {
+        capped = true;
+        break;
+      }
+      names.push(e.name);
+    }
   } catch (err) {
     if (err.code === 'ENOENT') return { items: [], skipped: 0, capped: false };
     throw err;
+  } finally {
+    if (handle) handle.closeSync();
   }
+  const realBase = fs.realpathSync(skillsDir);
   const components = componentSkillNames(zylosDir, skillsDir);
   const items = [];
   let skipped = 0;
   names.sort();
-  const capped = names.length > MAX_SCAN_ENTRIES;
-  for (const name of names.slice(0, MAX_SCAN_ENTRIES)) {
+  for (const name of names) {
     if (name.startsWith(SKILL_DIR_PREFIX) || name.startsWith('.')) continue;
     const dir = path.join(skillsDir, name);
     let st;
@@ -148,13 +177,17 @@ export function scanLocalSkills({ skillsDir, zylosDir }) {
       skipped += 1;
       continue;
     }
-    const head = readHead(md);
+    const head = readHead(md, { expected: path.join(realBase, name, 'SKILL.md'), dir, dirStat: st });
     const fm = head === null ? { name: null, version: null } : parseFrontmatter(head);
     const item = { location_id: name };
     const n = cleanText(fm.name, { cut: true });
     const v = cleanText(fm.version);
     if (n !== null) item.name = n;
     if (v !== null) item.version = v;
+    if ([item.location_id, item.name, item.version].some(looksLikeSecret)) {
+      skipped += 1;
+      continue;
+    }
     item.source = components.has(name) ? 'zylos_component' : lexists(path.join(dir, '.git')) ? 'git' : 'local';
     items.push(item);
   }

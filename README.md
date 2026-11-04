@@ -169,7 +169,9 @@ file hashes are never sent.
   with `.`, symbolic links and names outside `[A-Za-z0-9._-]` (up to 128
   characters) are skipped. Links are never followed and only the first 64 KiB
   of SKILL.md is read, for the frontmatter.
-- At most the first 1000 entries of the skills directory are looked at, and at
+- A skill whose directory name, `name` or `version` looks like a credential
+  (the market's credential rules) is left out.
+- At most the first 1000 entries the skills directory lists are read, and at
   most 200 skills (and 64 KiB) are sent; beyond that the list is marked as
   truncated.
 - It is sent to each configured org with that org's token and member id: once
@@ -177,6 +179,9 @@ file hashes are never sent.
   org accepted is not sent again, except every 12 hours. A list the market
   refused is sent again only after 12 hours. One org failing does not
   affect the other orgs, pulling or reconcile.
+- An Agent configured for several orgs has one skills directory, so every org
+  receives the same list: the Agent's owner in one org can see the directory
+  names of skills used for another org.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
 
