@@ -301,7 +301,7 @@ test('a name, version or directory name that looks like a credential is never se
   skill(skillsDir, 'ok-skill');
   skill(skillsDir, 'named', '---\nname: ghp_0123456789abcdefABCDEF\nversion: 1\n---\n');
   skill(skillsDir, 'versioned', '---\nname: v\nversion: "token=abcdefgh12"\n---\n');
-  skill(skillsDir, 'AKIAABCDEFGHIJKLMNOP');
+  skill(skillsDir, ['AKIA', 'ABCDEFGHIJKLMNOP'].join(''));
   skill(skillsDir, 'wide', '---\nname: ｇｈｐ＿0123456789abcdefABCDEF\n---\n');
   const scan = scanLocalSkills({ skillsDir, zylosDir });
   assert.deepEqual(scan.items.map((i) => i.location_id), ['ok-skill']);
