@@ -181,7 +181,7 @@ file hashes are never sent.
   affect the other orgs, pulling or reconcile.
 - An Agent configured for several orgs has one skills directory, so every org
   receives the same list: the Agent's owner in one org can see the directory
-  names of skills used for another org.
+  names of skills used for another org. This is accepted product behaviour.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
 

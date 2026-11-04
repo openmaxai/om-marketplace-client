@@ -139,7 +139,8 @@ export function componentSkillNames(zylosDir, skillsDir) {
 
 // First-level directories of skillsDir with a SKILL.md, sorted by name. Skipped: market-managed (market--*), dot
 // entries, links (never followed), non-directories, directories without SKILL.md and names the market would drop.
-// Only the first MAX_SCAN_ENTRIES entries the directory lists are read. Returns { items, skipped, capped }; a missing
+// Only the first MAX_SCAN_ENTRIES entries in directory order (not name order) are read, so beyond the cap the reported
+// batch can differ between scans. Returns { items, skipped, capped }; a missing
 // skillsDir is an empty scan, any other read error is thrown.
 export function scanLocalSkills({ skillsDir, zylosDir }) {
   const names = [];
