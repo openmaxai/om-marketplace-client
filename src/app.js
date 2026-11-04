@@ -14,14 +14,16 @@ import { createRevocationPuller } from './revocations.js';
 import { createSkills } from './skills.js';
 import { createTemplates } from './templates.js';
 import { createReconciler } from './reconcile.js';
+import { createLocalSkillReporter } from './localscan.js';
 import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
 import { EXIT, execute, spool } from './commands.js';
 
 // Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
 // queued skill intents run, then at most one template intent, then reconcile when it is due (reconcile.maybeRun), so
-// a scan never runs alongside an install. A round is skipped while the token's member id contradicts the configured one.
-export function pollRound(logger, { revocations, intents, skills, templates, reconcile, identity, now = Date.now } = {}) {
+// a scan never runs alongside an install; the local skill report comes last, on the same cadence. A round is skipped
+// while the token's member id contradicts the configured one.
+export function pollRound(logger, { revocations, intents, skills, templates, reconcile, localSkills, identity, now = Date.now } = {}) {
   return async () => {
     if (!revocations || !intents) return logger.debug('poll: not wired');
     if (identity && !(await identity())) return undefined;
@@ -37,7 +39,11 @@ export function pollRound(logger, { revocations, intents, skills, templates, rec
         await templates?.runNext();
       }
     } finally {
-      await reconcile?.maybeRun();
+      try {
+        await reconcile?.maybeRun();
+      } finally {
+        await localSkills?.maybeRun();
+      }
     }
     return { minDelayMs: Math.max(revocations.notBefore?.() ?? 0, intents.notBefore?.() ?? 0) - now() };
   };
@@ -152,6 +158,7 @@ export function createRuntime({
       revocations,
       templates,
       reconcile: createReconciler({ api, state, orgs, skills, templates, logger }),
+      localSkills: createLocalSkillReporter({ api, state, orgs, logger, skillsDir, zylosDir }),
     };
   } catch (err) {
     state.close();

@@ -14,6 +14,7 @@ import { preUninstall, whenUnlocked } from '../hooks/lib/uninstall.js';
 
 const ADOPTION = U(20);
 const C10 = `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`;
+const C16 = `/api/v1/orgs/${ORG}/agents/${AGENT}/local-skills:report`;
 const VID = U(2);
 const markedSkill = (dir, skillId = U(1)) => {
   fs.mkdirSync(dir, { recursive: true });
@@ -45,6 +46,9 @@ async function setup(t, c10) {
 
 test('pre-uninstall waits for the stopped service, quarantines market content, drops the declarations and reports', async (t) => {
   const s = await setup(t, (req) => ({ status: 200, json: { results: req.json.items.map((_, index) => ({ index, outcome: 'recorded' })) } }));
+  s.fake.script('POST', C16, { status: 200, json: { accepted: 0, dropped: 0, unchanged: false } });
+  fs.mkdirSync(path.join(s.skillsDir, 'notes'));
+  fs.writeFileSync(path.join(s.skillsDir, 'notes', 'SKILL.md'), '---\nname: notes\n---\n');
   markedSkill(path.join(s.skillsDir, 'market--foreign'), U(3));
   fs.symlinkSync(path.join(s.skillsDir, 'market--foreign'), path.join(s.skillsDir, 'market--link'));
   fs.mkdirSync(QDIR(s.dataDir), { recursive: true });
@@ -69,10 +73,27 @@ test('pre-uninstall waits for the stopped service, quarantines market content, d
   assert.ok(Object.values(readSlots(s.dataDir)).every((v) => v === null));
   assert.deepEqual(fs.readdirSync(shardsDir(s.zylosDir)), ['other.json']);
   assert.deepEqual(s.fake.market().filter((r) => r.path === C10).map((r) => r.json), [{ items: [{ kind: 'client_uninstalled' }] }]);
+  const reports = s.fake.market().filter((r) => r.path === C16 || r.path === C10).map((r) => r.path);
+  assert.deepEqual(reports, [C16, C10], 'the empty local skill list goes before client_uninstalled');
+  const empty = s.fake.market().find((r) => r.path === C16).json;
+  assert.deepEqual({ ...empty, scanned_at: null }, { scanned_at: null, truncated: false, items: [] }, 'an empty list, whatever is on disk');
+  assert.ok(Number.isFinite(Date.parse(empty.scanned_at)));
   assert.ok(!fs.existsSync(path.join(s.dataDir, 'state', 'lock')), 'lock released');
   const st = openState(s.dataDir, { bffUrl: loadConfig(s.dataDir).bff_url, orgId: ORG, memberId: AGENT });
   assert.equal(st.read('adoptions', {})[ADOPTION].state, 'quarantined');
   st.close();
+});
+
+test('pre-uninstall still reports client_uninstalled when the empty local skill list fails', async (t) => {
+  const s = await setup(t, (req) => ({ status: 200, json: { results: req.json.items.map((_, index) => ({ index, outcome: 'recorded' })) } }));
+  s.fake.script('POST', C16, { status: 409, problem: { status: 409, code: 'CLIENT_VERSION_TOO_OLD', reason: 'below_min' } });
+  const lines = [];
+  s.state.close();
+  const ok = await preUninstall({ env: baseEnv(s.dataDir), dataDir: s.dataDir, zylosDir: s.zylosDir, log: (l) => lines.push(l), stop: () => {}, sync: () => {} });
+  assert.equal(ok, true);
+  assert.deepEqual(s.fake.market().filter((r) => r.path === C16 || r.path === C10).map((r) => r.path), [C16, C10]);
+  assert.ok(lines.some((l) => l.includes(`empty local skill list not reported to org ${ORG} (CLIENT_VERSION_TOO_OLD)`)));
+  assert.ok(lines.some((l) => l.includes(`reported client_uninstalled to org ${ORG}`)));
 });
 
 test('pre-uninstall bounds the report and leaves content in place while the lock stays held', async (t) => {

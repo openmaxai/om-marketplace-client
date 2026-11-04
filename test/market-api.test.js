@@ -162,3 +162,17 @@ test('"." and ".." org or agent ids are rejected before any request', async (t) 
   }
   assert.equal(fake.requests.length, 0);
 });
+
+test('local-skills:report sends the body as given and validates the answer', async (t) => {
+  const { fake, api } = await setup(t);
+  const C16 = `/api/v1/orgs/${ORG}/agents/${AGENT}/local-skills:report`;
+  const body = { scanned_at: '2026-11-05T08:00:00Z', truncated: false, items: [{ location_id: 'pdf-tools', source: 'git' }] };
+  fake.script('POST', C16, { status: 200, json: { accepted: 1, dropped: 0, unchanged: false, extra: 'x' } },
+    { status: 200, json: { accepted: -1, dropped: 0, unchanged: false } },
+    { status: 429, headers: { 'retry-after': '30' }, problem: { status: 429, code: 'RATE_LIMITED', reason: 'local_skill_report' } });
+  assert.deepEqual(await api.reportLocalSkills({ orgId: ORG, agentId: AGENT, body }), { accepted: 1, dropped: 0, unchanged: false });
+  assert.deepEqual(fake.market()[0].json, body);
+  await assert.rejects(api.reportLocalSkills({ orgId: ORG, agentId: AGENT, body }), (e) => e instanceof MarketError && e.code === 'RESPONSE_INVALID');
+  await assert.rejects(api.reportLocalSkills({ orgId: ORG, agentId: AGENT, body }),
+    (e) => e.status === 429 && e.reason === 'local_skill_report' && e.retryAfterMs === 30_000);
+});

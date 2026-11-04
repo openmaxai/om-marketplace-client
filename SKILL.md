@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.1.2
+version: 0.2.0
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after
@@ -67,6 +67,9 @@ Client side of Agent Market for zylos Agents.
 - Reconcile (every 45 to 51 min, inside the poll loop): compare local state with the market.
 - Installs never execute package content; packages are verified by sha256
   before anything is written.
+- Local skill report (at start, then with reconcile): directory name, frontmatter
+  name and version, and source of the skills the market did not install.
+  Metadata only; never file contents, paths or hashes.
 
 ## Configuration
 

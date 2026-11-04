@@ -234,6 +234,16 @@ export function createMarketApi({ http }) {
       });
     },
 
+    // C-16: metadata of the skills not installed by the market; body is sent as given.
+    async reportLocalSkills({ orgId, agentId, body, signal = null }) {
+      if (!isOrgOrMemberId(agentId)) throw new TypeError('invalid agentId');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/local-skills:report`, body, { cancel: signal });
+      return validated('local-skills:report', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        return pick(object(data, 'body'), 'body', { accepted: uint, dropped: uint, unchanged: bool });
+      });
+    },
+
     async pullRevocations({ orgId, cursor: from = null }) {
       if (from !== null && !isRevocationCursor(from)) throw new TypeError('cursor must be <epoch>:<seq> or null');
       const r = await http.request('POST', orgId, '/revocations:query', from === null ? {} : { cursor: from });

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
+### Added
+- Local skill report (C-16): the skills in the skills directory that the market
+  did not install are reported to each configured org as metadata only
+  (directory name, frontmatter `name` and `version`, source `zylos_component`,
+  `git` or `local`). Sent after start and with reconcile; an unchanged list is
+  sent again only once a day. `market--*`, dot directories, links and
+  directories without SKILL.md are skipped; at most 200 items.
+- Pre-uninstall reports an empty local skill list before `client_uninstalled`.
+
 ### Fixed
 - A picked-up install or upgrade whose version was revoked is now reported to the
   market as `failed`/`VERSION_REVOKED` after a restart, instead of being closed
@@ -20,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A template write answered `stale` by C-15 (first deploy or upgrade) is no
   longer kept: its slot is cleared, the new content is quarantined, and C-11 is
   pulled at once.
+
+### Upgrade Notes
+
+No action needed. The first local skill report is sent after the service restarts.
 
 ## [0.1.2] - 2026-10-21
 
