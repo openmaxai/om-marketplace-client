@@ -16,34 +16,42 @@ test('one poll round pulls revocations, then intents; a second runtime is locked
   const logger = { debug() {}, info() {}, warn: (l) => lines.push(l), error: (l) => lines.push(l) };
   const config = { bff_url: fake.url, api_key: FAKE_KEY, org_id: ORG, member_id: AGENT, orgs: { [ORG]: { member_id: AGENT } } };
   const dataDir = path.join(tmpHome(), 'd');
-  const rt = createRuntime({ config, dataDir, logger });
+  const zylosDir = path.join(tmpHome(), 'zylos');
+  const skillsDir = path.join(zylosDir, '.claude', 'skills');
+  fs.mkdirSync(path.join(skillsDir, 'notes'), { recursive: true });
+  fs.writeFileSync(path.join(skillsDir, 'notes', 'SKILL.md'), '---\nname: notes\n---\n');
+  const rt = createRuntime({ config, dataDir, logger, skillsDir, zylosDir });
   t.after(() => rt.state.close());
-  assert.throws(() => createRuntime({ config, dataDir, logger }), StateLockedError);
+  assert.throws(() => createRuntime({ config, dataDir, logger, skillsDir, zylosDir }), StateLockedError);
   fake.script('POST', `/api/v1/orgs/${ORG}/revocations:query`, { status: 200, json: { items: [], next_cursor: fakeCursor(0), has_more: false } });
   fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`,
     { status: 200, json: { items: [], has_more: false, next_after_seq: 3, policy_sha256: POLICY_SHA256 } });
   fake.script('GET', `/api/v1/orgs/${ORG}/agents/${AGENT}/skills`, { status: 200, json: { items: [] } });
+  fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/local-skills:report`, { status: 200, json: { accepted: 1, dropped: 0, unchanged: false } });
   const poll = buildTasks(logger, rt).find((x) => x.name === 'poll');
   await poll.run();
-  assert.deepEqual(fake.market().map((r) => r.path.split('/').at(-1)), ['revocations:query', 'install-intents:query', 'skills']);
+  assert.deepEqual(fake.market().map((r) => r.path.split('/').at(-1)), ['revocations:query', 'install-intents:query', 'skills', 'local-skills:report']);
+  assert.deepEqual(fake.market().at(-1).json.items, [{ location_id: 'notes', name: 'notes', source: 'local' }]);
   assert.equal(rt.state.read('intents', null).after_seq, 3);
   assert.deepEqual(Object.keys(rt.state.read('status', null).alerts), []);
   assert.equal(rt.state.read('status', null).runs.reconcile.outcome, 'ok');
   fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/install-intents:query`, { status: 204 });
   await poll.run();
   assert.equal(fake.market().filter((r) => r.path.endsWith('/skills')).length, 1, 'reconcile is not run every round');
+  assert.equal(fake.market().filter((r) => r.path.endsWith(':report')).length, 1, 'the local skill report is not sent every round');
 });
 
-test('a poll round reconciles after skill and template intents, also when they throw', async () => {
+test('a poll round reconciles after skill and template intents, then reports local skills, also when they throw', async () => {
   const calls = [];
   const logger = { debug() {}, info() {}, warn() {}, error() {} };
   const pull = { pull: async () => calls.push('pull') };
   const skills = { runRound: async () => { calls.push('skills'); throw new Error('boom'); } };
   const templates = { runNext: async () => calls.push('templates') };
-  const reconcile = { maybeRun: async () => calls.push('reconcile') };
-  const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates, reconcile }).find((x) => x.name === 'poll');
-  await assert.rejects(poll.run(), /boom/);
-  assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates', 'reconcile']);
+  const reconcile = { maybeRun: async () => { calls.push('reconcile'); throw new Error('reconcile'); } };
+  const localSkills = { maybeRun: async () => calls.push('local skills') };
+  const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates, reconcile, localSkills }).find((x) => x.name === 'poll');
+  await assert.rejects(poll.run(), /boom|reconcile/);
+  assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates', 'reconcile', 'local skills']);
 });
 
 test('revocations are enforced on skills, then templates; a failure in one still runs the other and is rethrown', async () => {

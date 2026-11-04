@@ -148,6 +148,43 @@ starting meanwhile waits for the lock.
 - `revocations ... STALE`: no successful revocation pull for over 24 hours.
 - Alerts stay listed until the condition clears.
 
+## Local skill report
+
+The client tells the market which skills this Agent has that the market did not
+install, so the owner sees them under "My skills". It reports **metadata only**:
+
+| Field | Value |
+|---|---|
+| `location_id` | The skill's directory name under the skills directory (one segment, never a path). |
+| `name` | `name` from the SKILL.md frontmatter, if any (at most 64 characters). |
+| `version` | `version` from the SKILL.md frontmatter as written, if any (at most 64 characters). |
+| `source` | `zylos_component` (a skill installed as a zylos component), `git` (the directory has `.git`) or `local`. |
+
+The request also carries the scan time and whether the list was cut. File
+contents, the SKILL.md body and description, absolute paths, git remotes and
+file hashes are never sent.
+
+- Only first-level directories of `~/zylos/.claude/skills` that contain a
+  SKILL.md are listed. `market--*` directories (market-managed), names starting
+  with `.`, symbolic links and names outside `[A-Za-z0-9._-]` (up to 128
+  characters) are skipped. Links are never followed and only the first 64 KiB
+  of SKILL.md is read, for the frontmatter.
+- A skill whose directory name, `name` or `version` looks like a credential
+  (the market's credential rules) is left out.
+- At most the first 1000 entries the skills directory lists are read, and at
+  most 200 skills (and 64 KiB) are sent; beyond that the list is marked as
+  truncated.
+- It is sent to each configured org with that org's token and member id: once
+  after start, then every 45 to 51 minutes. A list equal to the last one the
+  org accepted is not sent again, except every 12 hours. A list the market
+  refused is sent again only after 12 hours. One org failing does not
+  affect the other orgs, pulling or reconcile.
+- An Agent configured for several orgs has one skills directory, so every org
+  receives the same list: the Agent's owner in one org can see the directory
+  names of skills used for another org. This is accepted product behaviour.
+- The market shows the list only; it is never used to decide visibility,
+  installs or reconcile.
+
 ## Operational notes
 
 - One container per data directory. A lock file under `state/` admits one
@@ -174,7 +211,8 @@ starting meanwhile waits for the lock.
    place and the hook ends here;
 4. moves every market-managed skill and template into `quarantine/` in the
    data directory and clears the template slots;
-5. reports `client_uninstalled` to each configured org (at most 10 seconds).
+5. reports `client_uninstalled` (which also clears the local skill list) to
+   each configured org (at most 10 seconds).
 
 Failures are logged and never block the uninstall. Keep the data directory (no
 `--purge`) to keep the quarantined content and the revoked set.
