@@ -169,11 +169,13 @@ file hashes are never sent.
   with `.`, symbolic links and names outside `[A-Za-z0-9._-]` (up to 128
   characters) are skipped. Links are never followed and only the first 64 KiB
   of SKILL.md is read, for the frontmatter.
-- At most 200 skills (and 64 KiB) are sent; beyond that the list is marked as
+- At most the first 1000 entries of the skills directory are looked at, and at
+  most 200 skills (and 64 KiB) are sent; beyond that the list is marked as
   truncated.
 - It is sent to each configured org with that org's token and member id: once
   after start, then every 45 to 51 minutes. A list equal to the last one the
-  org accepted is not sent again, except once a day. One org failing does not
+  org accepted is not sent again, except every 12 hours. A list the market
+  refused is sent again only after 12 hours. One org failing does not
   affect the other orgs, pulling or reconcile.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
@@ -204,8 +206,8 @@ file hashes are never sent.
    place and the hook ends here;
 4. moves every market-managed skill and template into `quarantine/` in the
    data directory and clears the template slots;
-5. reports an empty local skill list, then `client_uninstalled`, to each
-   configured org (at most 10 seconds).
+5. reports `client_uninstalled` (which also clears the local skill list) to
+   each configured org (at most 10 seconds).
 
 Failures are logged and never block the uninstall. Keep the data directory (no
 `--purge`) to keep the quarantined content and the revoked set.

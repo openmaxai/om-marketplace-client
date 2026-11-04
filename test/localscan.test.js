@@ -5,7 +5,7 @@ import path from 'node:path';
 import { tmpHome } from './helpers.js';
 import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
 import {
-  HEARTBEAT_MS, MAX_REPORT_BYTES, MAX_REPORT_ITEMS, MAX_SKILL_MD_READ, MIN_CHANGE_INTERVAL_MS, REPORT_EVERY_MS, buildReport, cleanText,
+  HEARTBEAT_MS, MAX_REPORT_BYTES, MAX_SCAN_ENTRIES, MAX_REPORT_ITEMS, MAX_SKILL_MD_READ, MIN_CHANGE_INTERVAL_MS, REPORT_EVERY_MS, buildReport, cleanText,
   componentSkillNames, createLocalSkillReporter, parseFrontmatter, reportHash, scanLocalSkills,
 } from '../src/localscan.js';
 
@@ -53,7 +53,7 @@ test('the scan lists first-level skill directories only, never through links, an
     { location_id: 'plain', name: 'plain', version: '1.0.0', source: 'local' },
   ]);
   assert.equal(scan.skipped, 1, 'a name the market would drop is left out');
-  assert.deepEqual(scanLocalSkills({ skillsDir: path.join(skillsDir, 'missing'), zylosDir }), { items: [], skipped: 0 });
+  assert.deepEqual(scanLocalSkills({ skillsDir: path.join(skillsDir, 'missing'), zylosDir }), { items: [], skipped: 0, capped: false });
 });
 
 test('source: a zylos component skill, else a directory with .git, else local; .git remotes are never read', () => {
@@ -70,7 +70,7 @@ test('source: a zylos component skill, else a directory with .git, else local; .
     foreign: { skillDir: path.join(tmpHome(), 'mine') },
     'no-dir': { version: '1' },
   });
-  assert.deepEqual([...componentSkillNames(zylosDir, skillsDir)].sort(), ['comp', 'comp-git', 'no-dir', 'renamed']);
+  assert.deepEqual([...componentSkillNames(zylosDir, skillsDir)].sort(), ['comp', 'comp-git', 'renamed'], 'an entry without skillDir marks nothing');
   const sources = Object.fromEntries(scanLocalSkills({ skillsDir, zylosDir }).items.map((i) => [i.location_id, i.source]));
   assert.deepEqual(sources, {
     cloned: 'git', comp: 'zylos_component', 'comp-git': 'zylos_component', mine: 'local', renamed: 'zylos_component', worktree: 'git',
@@ -160,7 +160,7 @@ test('each org gets the report with its own token and member id; the body is met
   assert.equal(h.state.read('status', null).runs.local_skills.outcome, 'ok');
 });
 
-test('an unchanged report is skipped until 24 hours after the last success, also after a restart', async (t) => {
+test('an unchanged report is skipped until 12 hours after the last success, also after a restart', async (t) => {
   const h = await harness(t);
   h.fake.script('POST', C16(ORG), ok(1), ok(0, 0, true));
   h.fake.script('POST', C16(ORG2, AGENT2), ok(1), ok(0, 0, true));
@@ -173,7 +173,7 @@ test('an unchanged report is skipped until 24 hours after the last success, also
   assert.equal(h.sent(ORG).length, 1);
   h.clock.t += HEARTBEAT_MS;
   assert.deepEqual((await h.reporter().run()).orgs, { [ORG]: 'ok', [ORG2]: 'ok' });
-  assert.equal(h.sent(ORG).length, 2, 'sent once a day although unchanged');
+  assert.equal(h.sent(ORG).length, 2, 'sent every 12 hours although unchanged');
   assert.deepEqual(h.sent(ORG)[1].json.items, h.sent(ORG)[0].json.items);
 });
 
@@ -229,21 +229,23 @@ test('a 429 is honoured per its Retry-After, also across a restart', async (t) =
   assert.deepEqual((await r.maybeRun()).orgs, { [ORG]: 'ok', [ORG2]: 'unchanged' });
 });
 
-test('a 400 is logged and the same content is not resent; changed content is', async (t) => {
+test('a 400 is logged and the same content is resent only after the heartbeat; changed content is', async (t) => {
   const h = await harness(t);
-  h.fake.script('POST', C16(ORG), problem(400, 'VALIDATION_FAILED'), ok(2));
-  h.fake.script('POST', C16(ORG2, AGENT2), ok(1), ok(2));
+  h.fake.script('POST', C16(ORG), problem(400, 'VALIDATION_FAILED'), problem(400, 'VALIDATION_FAILED'), ok(2));
+  h.fake.script('POST', C16(ORG2, AGENT2), ok(1), ok(1), ok(2));
   const r = h.reporter();
   assert.deepEqual((await r.run()).orgs, { [ORG]: 'rejected', [ORG2]: 'ok' });
   assert.ok(h.lines.some((l) => l.includes(`local skill report to org ${ORG} rejected (VALIDATION_FAILED)`)));
-  h.clock.t += HEARTBEAT_MS;
+  h.clock.t += HEARTBEAT_MS - 1000;
+  assert.deepEqual((await r.run()).orgs, { [ORG]: 'rejected', [ORG2]: 'unchanged' });
+  assert.equal(h.sent(ORG).length, 1, 'not resent within the heartbeat');
+  h.clock.t += 2000;
   assert.deepEqual((await r.run()).orgs, { [ORG]: 'rejected', [ORG2]: 'ok' });
-  assert.equal(h.sent(ORG).length, 1);
+  assert.equal(h.sent(ORG).length, 2, 'resent once the heartbeat has passed');
   skill(h.skillsDir, 'more');
   h.clock.t += REPORT_EVERY_MS;
-  h.fake.script('POST', C16(ORG2, AGENT2), ok(2));
   assert.deepEqual((await r.run()).orgs, { [ORG]: 'ok', [ORG2]: 'ok' });
-  assert.equal(h.sent(ORG).length, 2);
+  assert.equal(h.sent(ORG).length, 3);
 });
 
 test('CLIENT_VERSION_TOO_OLD enters too-old mode; no report is sent while it lasts', async (t) => {
@@ -272,4 +274,19 @@ test('a scan failure or broken state never throws out of the reporter', async (t
     api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, skillsDir: file, zylosDir: h.zylosDir, now: h.now,
   }).maybeRun();
   assert.deepEqual(res, { outcome: 'scan_failed', orgs: {} });
+});
+
+test('the heartbeat stays below the market stale window of 24 hours by more than two report cycles', () => {
+  assert.ok(HEARTBEAT_MS + 2 * (REPORT_EVERY_MS + 6 * 60 * 1000) < 24 * 60 * 60 * 1000);
+});
+
+test('only the first MAX_SCAN_ENTRIES directory entries are looked at; the report is then truncated', () => {
+  const { zylosDir, skillsDir } = fakeZylosDir();
+  for (let i = 0; i < MAX_SCAN_ENTRIES; i += 1) fs.mkdirSync(path.join(skillsDir, `a${String(i).padStart(4, '0')}`));
+  skill(skillsDir, 'zz-last');
+  const scan = scanLocalSkills({ skillsDir, zylosDir });
+  assert.equal(scan.capped, true);
+  assert.deepEqual(scan.items, []);
+  assert.equal(buildReport(scan.items, 'now', { capped: scan.capped }).truncated, true);
+  assert.equal(buildReport([], 'now').truncated, false);
 });

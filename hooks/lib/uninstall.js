@@ -7,7 +7,6 @@ import { createLogger } from '../../src/logger.js';
 import { StateLockedError, lockDataDir, readJson, verifiedLockHolder } from '../../src/state.js';
 import { isCanonicalUuid } from '../../src/ids.js';
 import { SKILL_DIR_PREFIX } from '../../src/land.js';
-import { emptyReport } from '../../src/localscan.js';
 import { readMarker } from '../../src/skills.js';
 import { quarantine as quarantineTemplate } from '../../src/templates.js';
 import { SLOT_COUNT, declaration, defaultZylosDir, emptySlots, shardName, shardsDir, syncHooks, writeSlots } from '../../src/shards.js';
@@ -133,15 +132,6 @@ async function reportUninstalled(rt, abort, log, timeoutMs) {
       if (rt.orgs.isBlocked(orgId)) continue;
       try {
         const agentId = await rt.orgs.agentId(orgId);
-        try {
-          // Bounded on its own so client_uninstalled, which also clears the list, keeps most of the time.
-          await rt.api.reportLocalSkills({
-            orgId, agentId, body: emptyReport(new Date().toISOString()), signal: AbortSignal.timeout(Math.ceil(timeoutMs / 4)),
-          });
-          log(`reported an empty local skill list to org ${orgId}`);
-        } catch (err) {
-          log(`empty local skill list not reported to org ${orgId} (${err.code || err.status || err.message})`);
-        }
         await rt.api.reportReconcile({ orgId, agentId, items: [{ kind: 'client_uninstalled' }] });
         log(`reported client_uninstalled to org ${orgId}`);
       } catch (err) {
@@ -154,7 +144,7 @@ async function reportUninstalled(rt, abort, log, timeoutMs) {
 }
 
 // Stops the service, removes the slot declarations (no lock needed), then with the state lock quarantines market-managed
-// skills and templates and reports an empty local skill list, then client_uninstalled, to each org (best effort, bounded). When the lock cannot be taken, content is
+// skills and templates and reports client_uninstalled (best effort, bounded). When the lock cannot be taken, content is
 // left in place. Revoked set, inventory and quarantine stay in the data dir.
 export async function preUninstall({
   env = process.env, dataDir, zylosDir = defaultZylosDir(env), skillsDir = path.join(zylosDir, '.claude', 'skills'),

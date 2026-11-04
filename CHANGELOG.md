@@ -14,9 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did not install are reported to each configured org as metadata only
   (directory name, frontmatter `name` and `version`, source `zylos_component`,
   `git` or `local`). Sent after start and with reconcile; an unchanged list is
-  sent again only once a day. `market--*`, dot directories, links and
-  directories without SKILL.md are skipped; at most 200 items.
-- Pre-uninstall reports an empty local skill list before `client_uninstalled`.
+  sent again every 12 hours. `market--*`, dot directories, links and
+  directories without SKILL.md are skipped; at most 1000 directory entries are
+  looked at and at most 200 items sent.
 
 ### Fixed
 - A picked-up install or upgrade whose version was revoked is now reported to the

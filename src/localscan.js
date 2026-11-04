@@ -13,8 +13,11 @@ export const MAX_REPORT_BYTES = 64 * 1024;
 export const MAX_SKILL_MD_READ = 64 * 1024;
 export const MAX_TEXT_CHARS = 64;
 const MAX_COMPONENTS_BYTES = 1024 * 1024;
-// A report whose content is unchanged is still sent once this long after the last success, so the page never goes stale.
-export const HEARTBEAT_MS = 24 * 60 * 60 * 1000;
+// A report whose content is unchanged is still sent once this long after the last success. The market marks a report
+// stale after 24 hours; this stays well below that even when a send waits for the next cycle.
+export const HEARTBEAT_MS = 12 * 60 * 60 * 1000;
+// At most this many top-level entries of the skills directory are looked at (in name order); the report is then truncated.
+export const MAX_SCAN_ENTRIES = 1000;
 // The market refuses a changed report within this long of the previous changed one.
 export const MIN_CHANGE_INTERVAL_MS = 5 * 60 * 1000;
 export const REPORT_EVERY_MS = RECONCILE_EVERY_MS;
@@ -110,9 +113,7 @@ export function componentSkillNames(zylosDir, skillsDir) {
   const base = path.resolve(skillsDir);
   for (const [key, entry] of Object.entries(doc)) {
     const dir = entry && typeof entry === 'object' ? entry.skillDir : undefined;
-    if (typeof dir !== 'string') {
-      names.add(key);
-    } else if (path.dirname(path.resolve(dir)) === base) {
+    if (typeof dir === 'string' && path.dirname(path.resolve(dir)) === base) {
       names.add(path.basename(dir));
     }
   }
@@ -121,19 +122,21 @@ export function componentSkillNames(zylosDir, skillsDir) {
 
 // First-level directories of skillsDir with a SKILL.md, sorted by name. Skipped: market-managed (market--*), dot
 // entries, links (never followed), non-directories, directories without SKILL.md and names the market would drop.
-// Returns { items, skipped }; a missing skillsDir is an empty scan, any other read error is thrown.
+// Only the first MAX_SCAN_ENTRIES entries are looked at. Returns { items, skipped, capped }; a missing skillsDir is an empty scan, any other read error is thrown.
 export function scanLocalSkills({ skillsDir, zylosDir }) {
   let names;
   try {
     names = fs.readdirSync(skillsDir);
   } catch (err) {
-    if (err.code === 'ENOENT') return { items: [], skipped: 0 };
+    if (err.code === 'ENOENT') return { items: [], skipped: 0, capped: false };
     throw err;
   }
   const components = componentSkillNames(zylosDir, skillsDir);
   const items = [];
   let skipped = 0;
-  for (const name of names.sort()) {
+  names.sort();
+  const capped = names.length > MAX_SCAN_ENTRIES;
+  for (const name of names.slice(0, MAX_SCAN_ENTRIES)) {
     if (name.startsWith(SKILL_DIR_PREFIX) || name.startsWith('.')) continue;
     const dir = path.join(skillsDir, name);
     let st;
@@ -155,12 +158,12 @@ export function scanLocalSkills({ skillsDir, zylosDir }) {
     item.source = components.has(name) ? 'zylos_component' : lexists(path.join(dir, '.git')) ? 'git' : 'local';
     items.push(item);
   }
-  return { items, skipped };
+  return { items, skipped, capped };
 }
 
 // The C-16 body: at most MAX_REPORT_ITEMS items and MAX_REPORT_BYTES of JSON; anything beyond is left out and marked
-// truncated.
-export function buildReport(items, scannedAt) {
+// truncated, as is a capped scan.
+export function buildReport(items, scannedAt, { capped = false } = {}) {
   const limit = MAX_REPORT_BYTES - Buffer.byteLength(JSON.stringify({ scanned_at: scannedAt, truncated: true, items: [] }));
   const kept = [];
   let size = 0;
@@ -170,15 +173,15 @@ export function buildReport(items, scannedAt) {
     kept.push(it);
     size += n;
   }
-  return { scanned_at: scannedAt, truncated: kept.length < items.length, items: kept };
+  return { scanned_at: scannedAt, truncated: capped || kept.length < items.length, items: kept };
 }
 
 // sha256 of the reported content (items and truncated), without the scan time.
 export const reportHash = (body) => crypto.createHash('sha256').update(JSON.stringify({ items: body.items, truncated: body.truncated })).digest('hex');
 
 // Per configured org: scans once per run and reports with that org's token and member id. A report equal to the last
-// success of that org is skipped unless HEARTBEAT_MS has passed; a 429 waits for its Retry-After, a 400 is not resent
-// for the same content, a changed report waits MIN_CHANGE_INTERVAL_MS after the last changed one. The last success of
+// success of that org is skipped unless HEARTBEAT_MS has passed; a 429 waits for its Retry-After, content refused with a 400
+// is resent only after HEARTBEAT_MS, a changed report waits MIN_CHANGE_INTERVAL_MS after the last changed one. The last success of
 // each org is kept in the `local_skills` state document. Nothing here throws: failures are logged per org.
 export function createLocalSkillReporter({
   api, state, orgs, logger, skillsDir, zylosDir, now = Date.now, every = REPORT_EVERY_MS,
@@ -213,7 +216,7 @@ export function createLocalSkillReporter({
     if (orgs.isBlocked(orgId)) return { outcome: `org_${orgs.membership(orgId)}` };
     if (t < time(rec.blocked_until)) return { outcome: 'backoff', retryAt: time(rec.blocked_until) };
     if (rec.hash === hash && t - time(rec.at) < HEARTBEAT_MS) return { outcome: 'unchanged' };
-    if (rec.rejected_hash === hash) return { outcome: 'rejected' };
+    if (rec.rejected_hash === hash && t - time(rec.rejected_at) < HEARTBEAT_MS) return { outcome: 'rejected' };
     const changedAt = time(rec.changed_at);
     if (rec.hash !== hash && t - changedAt < MIN_CHANGE_INTERVAL_MS) return { outcome: 'deferred', retryAt: changedAt + MIN_CHANGE_INTERVAL_MS };
     let res;
@@ -241,8 +244,8 @@ export function createLocalSkillReporter({
         return { outcome: 'org_left' };
       }
       if (err.status === 400) {
-        saveOrg(orgId, { ...rec, rejected_hash: hash });
-        logger.error(`local skill report to org ${orgId} rejected (${code}); this content is not sent again`);
+        saveOrg(orgId, { ...rec, rejected_hash: hash, rejected_at: iso() });
+        logger.error(`local skill report to org ${orgId} rejected (${code}); this content is resent after ${HEARTBEAT_MS / 3600000} hours`);
         return { outcome: 'rejected' };
       }
       if (err.transient) {
@@ -278,7 +281,7 @@ export function createLocalSkillReporter({
         return { outcome, orgs: {} };
       }
       if (scan.skipped) logger.debug(`local skill scan: ${scan.skipped} directory name(s) the market would drop were left out`);
-      const body = buildReport(scan.items, iso(started));
+      const body = buildReport(scan.items, iso(started), { capped: scan.capped });
       const hash = reportHash(body);
       const results = {};
       for (const orgId of orgs.ids()) {
@@ -313,6 +316,3 @@ export function createLocalSkillReporter({
     },
   };
 }
-
-// The empty report pre-uninstall sends before client_uninstalled, so the market drops this Agent's local skills.
-export const emptyReport = (scannedAt) => ({ scanned_at: scannedAt, truncated: false, items: [] });
