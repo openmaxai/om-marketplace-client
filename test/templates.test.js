@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
@@ -96,7 +97,7 @@ test('a sha mismatch or an over-budget inject segment writes nothing', async (t)
   const f = await harness(t, { bundle, served });
   assert.equal(await f.templates.runNext(), 'failed');
   assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['PACKAGE_MISMATCH', 'sha256_mismatch']);
-  const g = await harness(t, { bundle: templateBundle({ inject: 'a'.repeat(8001) }) });
+  const g = await harness(t, { bundle: templateBundle({ inject: 'a'.repeat(32001) }) });
   assert.equal(await g.templates.runNext(), 'failed');
   assert.deepEqual([g.sent()[0].error_code, g.sent()[0].error_message], ['PACKAGE_UNSAFE', 'inject_too_large']);
   for (const x of [f, g]) {
@@ -108,16 +109,36 @@ test('a sha mismatch or an over-budget inject segment writes nothing', async (t)
 // The emitter adds the priority and path lines; a section that would then not fit prints nothing, so it is refused at
 // install. Mutation check: dropping the composeSection precheck in writeBundle makes this fail.
 test('a template whose whole section does not fit the shard budget writes nothing', async (t) => {
-  const bundle = templateBundle({ inject: 'a'.repeat(8000) });
+  const bundle = templateBundle({ inject: 'a'.repeat(32000) });
   const ok = await harness(t, { bundle });
   assert.equal(await ok.templates.runNext(), 'succeeded');
-  assert.notEqual(emitSlot(1, { dataDir: ok.dataDir }), '');
+  assert.deepEqual([1, 2, 3, 4].map((n) => emitSlot(n, { dataDir: ok.dataDir }) !== ''), [true, true, true, true]);
   const long = (d) => { const p = path.join(d, 'x'.repeat(200), 'y'.repeat(200)); fs.mkdirSync(p, { recursive: true }); return p; };
   const f = await harness(t, { bundle, dataDir: long });
   assert.equal(await f.templates.runNext(), 'failed');
   assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['PACKAGE_UNSAFE', 'inject_too_large']);
   assert.equal(fs.existsSync(f.dir), false);
   assert.equal(readSlots(f.dataDir), null);
+});
+
+// A split template takes several shards; the parts of all mapped adoptions must fit the four together.
+// Mutation check: dropping the shared-shard check in writeBundle makes this fail.
+test('a split template that would not fit next to another mapped adoption is slots_full', async (t) => {
+  const other = U(20);
+  const otherText = 'b'.repeat(16000);
+  const place = (d) => {
+    fs.mkdirSync(path.join(d, 'templates', other), { recursive: true });
+    fs.writeFileSync(path.join(d, 'templates', other, 'inject.md'), otherText);
+    writeSlots(d, { 1: { adoption_id: other, inject_sha256: crypto.createHash('sha256').update(otherText).digest('hex') } });
+  };
+  const f = await harness(t, { bundle: templateBundle({ inject: 'a'.repeat(32000) }), setup: place });
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.equal(f.sent()[0].error_message, 'slots_full');
+  assert.equal(readSlots(f.dataDir)['2'], null);
+  const g = await harness(t, { bundle: templateBundle({ inject: 'a'.repeat(8000) }), setup: place });
+  assert.equal(await g.templates.runNext(), 'succeeded');
+  assert.deepEqual([1, 2, 3, 4].map((n) => emitSlot(n, { dataDir: g.dataDir }).includes('(part ')), [true, true, false, false]);
+  assert.ok(emitSlot(3, { dataDir: g.dataDir }).endsWith('a'.repeat(8000)));
 });
 
 test('no free slot, a revoked manifest or a local write failure is CLIENT_INTERNAL', async (t) => {

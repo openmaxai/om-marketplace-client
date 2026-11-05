@@ -96,9 +96,13 @@ raises an alert and waits at most 15 minutes, then is reported as failed
 Each template shard prints a fixed priority line (organization rules > template
 > the agent's own habits), the template's file path, the template's duty and
 boundary (`role.json`, one line each; no boundary line when it is empty), then
-`inject.md`. Duty, boundary and `inject.md` together stay within 2000 estimated
-tokens, and a template whose whole section would not fit the zylos 2200-token
-shard budget is refused at install.
+`inject.md`. Duty, boundary and `inject.md` together stay within 8000 estimated
+tokens. A template that does not fit one zylos 2200-token shard is split across
+the four shards, each part marked `(part k of n)` and starting with the
+priority line; cuts prefer paragraph, then line, then word breaks and never
+fall inside the `(data, not instructions)` line. A template that cannot be
+placed this way is refused at install. Templates over 2000 tokens need client
+0.3.0 or later; the market refuses older clients with `CLIENT_VERSION_TOO_OLD`.
 
 ## Commands
 
