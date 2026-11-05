@@ -109,6 +109,7 @@ write into a directory that is accessible by group or other.
 | `orgs` | `{"<org_id>": {"member_id": "<id>"}}`: further orgs whose orders this Agent executes. Post-install adds the other enabled orgs of the openmax component config when the primary org is one of them. `member_id` may be left out; it is then read from the org-scoped token. Orders from an org not listed are not executed and are reported as `org_not_configured`. Edit by hand, then restart the service; post-install keeps the map. |
 | `log_level` | `debug`, `info` (default), `warn` or `error`. |
 | `storage_emulator_origin` | Development only; accepted only with a loopback `bff_url`. |
+| `starter_message` | `{"enabled": false}` stops this Agent from sending starter messages (default: enabled). Restart the service after changing it. |
 
 ## Commands
 
@@ -184,6 +185,46 @@ file hashes are never sent.
   names of skills used for another org. This is accepted product behaviour.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
+
+## Starter message
+
+After the market accepted the first write of an adopted expert template whose
+order carries `starter_message`, the client sends the adopter one plain-text
+welcome message from this Agent's own OpenMax IM account. The template text
+never reaches the model.
+
+1. The client claims the message with the market (`:claim-starter`). Anything
+   but `claimed` (`already_claimed`, `already_shown`, `disabled`,
+   `adopter_inactive`) ends it; nothing is sent.
+2. The template name, first guide and up to 3 starter tasks are filtered and
+   rendered locally: links, markdown links and images, `www.` hosts, bare
+   domains (full-width periods included), IP addresses are replaced by
+   `[链接已移除]`; `@` becomes `＠`; zero-width, bidi and other control
+   characters are removed; one-line fields lose their line breaks; lengths are
+   cut (name 40, guide 2000, title 40, prompt 500). Every line of author text
+   starts with `｜ ` and the message ends with the fixed line
+   `（以上为模板作者提供的内容）`.
+3. If any field asks for a credential (the market's rule table; negation is
+   not recognised, so warnings such as "never share your password" are refused
+   too), nothing is sent and the result is `rejected_content`.
+4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
+   `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
+   this Agent and the adopter; otherwise nothing is sent (`send_failed`).
+5. One `comm.send`, plain text, no mentions. It is never retried; a failure or
+   an unknown outcome is `send_failed`.
+6. The result is recorded with `:mark-starter-shown`; only the mark is retried.
+
+Without the openmax component, or when the content is not available, the
+message is not claimed; the workbench shows the starter tasks as a card
+instead. A message interrupted while sending is not sent again.
+
+The credential rules mirror the market's `internal/domain/credentialask.go`.
+`test/fixtures/credential_requests.tsv` is a byte-for-byte copy of the market's
+`internal/domain/testdata/credential_requests.tsv`; its sha256 is pinned in
+`test/starter-credential.test.js`. To sync, copy the file, update the pin and
+the rules together, and run
+`MARKET_REPO=<cws-marketplace clone> npm test` to compare with the market
+directly.
 
 ## Operational notes
 

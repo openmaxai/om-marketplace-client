@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Added
+- Starter message: after the market accepts the first write of an adopted
+  expert template whose order carries `starter_message`, the client claims the
+  message (`:claim-starter`), filters and renders the template's first guide
+  and starter tasks as plain text, checks that the DM is exactly this Agent and
+  the adopter, sends it once through the openmax component's IM and records the
+  result (`:mark-starter-shown`). A credential request in the content is never
+  sent (`rejected_content`). A send is never retried; only the mark is.
+- `starter_message.enabled` in `config.json` turns the starter message off on
+  this Agent.
+
+### Upgrade Notes
+
+No action needed. Starter messages are sent only for templates adopted after
+the upgrade, and only on an Agent with the openmax component.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

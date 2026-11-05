@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.2.0
+version: 0.3.0
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after

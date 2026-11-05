@@ -41,17 +41,18 @@ test('one poll round pulls revocations, then intents; a second runtime is locked
   assert.equal(fake.market().filter((r) => r.path.endsWith(':report')).length, 1, 'the local skill report is not sent every round');
 });
 
-test('a poll round reconciles after skill and template intents, then reports local skills, also when they throw', async () => {
+test('a poll round runs skill and template intents, then starter messages, then reconciles and reports local skills, also when they throw', async () => {
   const calls = [];
   const logger = { debug() {}, info() {}, warn() {}, error() {} };
   const pull = { pull: async () => calls.push('pull') };
   const skills = { runRound: async () => { calls.push('skills'); throw new Error('boom'); } };
-  const templates = { runNext: async () => calls.push('templates') };
+  const templates = { runNext: async () => { calls.push('templates'); throw new Error('templates'); } };
+  const starter = { runAll: async () => calls.push('starter') };
   const reconcile = { maybeRun: async () => { calls.push('reconcile'); throw new Error('reconcile'); } };
   const localSkills = { maybeRun: async () => calls.push('local skills') };
-  const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates, reconcile, localSkills }).find((x) => x.name === 'poll');
-  await assert.rejects(poll.run(), /boom|reconcile/);
-  assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates', 'reconcile', 'local skills']);
+  const poll = buildTasks(logger, { revocations: pull, intents: pull, skills, templates, starter, reconcile, localSkills }).find((x) => x.name === 'poll');
+  await assert.rejects(poll.run(), /boom|templates|reconcile/);
+  assert.deepEqual(calls, ['pull', 'pull', 'skills', 'templates', 'starter', 'reconcile', 'local skills']);
 });
 
 test('revocations are enforced on skills, then templates; a failure in one still runs the other and is rethrown', async () => {

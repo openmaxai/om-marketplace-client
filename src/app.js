@@ -13,6 +13,8 @@ import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
 import { createSkills } from './skills.js';
 import { createTemplates } from './templates.js';
+import { createStarter } from './starter.js';
+import { createOpenmaxIm } from './starter/im.js';
 import { createReconciler } from './reconcile.js';
 import { createLocalSkillReporter } from './localscan.js';
 import { defaultZylosDir } from './shards.js';
@@ -20,10 +22,10 @@ import { vendoredPolicyMatchesPin } from './policy/pin.js';
 import { EXIT, execute, spool } from './commands.js';
 
 // Revocations are pulled before intents in every round so that a later install sees the newest revoked set; then the
-// queued skill intents run, then at most one template intent, then reconcile when it is due (reconcile.maybeRun), so
-// a scan never runs alongside an install; the local skill report comes last, on the same cadence. A round is skipped
-// while the token's member id contradicts the configured one.
-export function pollRound(logger, { revocations, intents, skills, templates, reconcile, localSkills, identity, now = Date.now } = {}) {
+// queued skill intents run, then at most one template intent, then the queued starter messages, then reconcile when it
+// is due (reconcile.maybeRun), so a scan never runs alongside an install; the local skill report comes last, on the
+// same cadence. A round is skipped while the token's member id contradicts the configured one.
+export function pollRound(logger, { revocations, intents, skills, templates, starter, reconcile, localSkills, identity, now = Date.now } = {}) {
   return async () => {
     if (!revocations || !intents) return logger.debug('poll: not wired');
     if (identity && !(await identity())) return undefined;
@@ -36,7 +38,11 @@ export function pollRound(logger, { revocations, intents, skills, templates, rec
       try {
         await skills?.runRound();
       } finally {
-        await templates?.runNext();
+        try {
+          await templates?.runNext();
+        } finally {
+          await starter?.runAll();
+        }
       }
     } finally {
       try {
@@ -145,8 +151,11 @@ export function createRuntime({
     });
     let templates = null;
     const revocations = createRevocationPuller({ api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates }) });
+    const starter = createStarter({
+      api, state, orgs, logger, im: createOpenmaxIm({ zylosDir }), enabled: config.starter_message?.enabled !== false,
+    });
     templates = createTemplates({
-      api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
+      api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal, starter,
     });
     return {
       state,
@@ -157,6 +166,7 @@ export function createRuntime({
       intents: createIntentPuller({ api, state, orgs, logger }),
       revocations,
       templates,
+      starter,
       reconcile: createReconciler({ api, state, orgs, skills, templates, logger }),
       localSkills: createLocalSkillReporter({ api, state, orgs, logger, skillsDir, zylosDir }),
     };

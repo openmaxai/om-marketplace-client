@@ -33,7 +33,7 @@ test('install-intents:query sends the pending query and returns only validated k
   fake.script('POST', INTENTS, { status: 200, json: page([{ ...intent(), extra: 'x' }, tpl], { has_more: true }) }, { status: 204 });
   const got = await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 4, limit: 50 });
   assert.deepEqual(fake.market()[0].json, { status: 'pending', after_seq: 4, limit: 50 });
-  assert.deepEqual(got, page([intent(), tpl], { has_more: true }));
+  assert.deepEqual(got, page([intent(), { ...tpl, starter_message: false, adopted_by_member_id: null }], { has_more: true }));
   assert.equal(await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 9 }), null);
   assert.deepEqual(fake.market()[1].json, { status: 'pending', after_seq: 9, limit: 100 });
 });
@@ -52,6 +52,8 @@ test('install-intents:query rejects malformed responses as RESPONSE_INVALID', as
     page([intent({ skill_id: null })]),
     page([intent({ expires_at: 'tomorrow' })]),
     page([intent({ discard_local_changes: 'no' })]),
+    page([intent({ op: 'write_template', skill_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA, starter_message: 'yes' })]),
+    page([intent({ op: 'write_template', skill_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA, adopted_by_member_id: '../x' })]),
     page(Array.from({ length: 3 }, (_, i) => intent({ seq: 5 + i })), {}),
     { items: [], has_more: false, next_after_seq: 4 },
     [],
@@ -175,4 +177,46 @@ test('local-skills:report sends the body as given and validates the answer', asy
   await assert.rejects(api.reportLocalSkills({ orgId: ORG, agentId: AGENT, body }), (e) => e instanceof MarketError && e.code === 'RESPONSE_INVALID');
   await assert.rejects(api.reportLocalSkills({ orgId: ORG, agentId: AGENT, body }),
     (e) => e.status === 429 && e.reason === 'local_skill_report' && e.retryAfterMs === 30_000);
+});
+
+test('install-intents:query keeps starter_message and adopted_by_member_id of a write_template order', async (t) => {
+  const { fake, api } = await setup(t);
+  const tpl = intent({
+    op: 'write_template', skill_id: null, skill_version_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA,
+    starter_message: true, adopted_by_member_id: U(10),
+  });
+  fake.script('POST', INTENTS, { status: 200, json: page([tpl]) });
+  const got = await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 4 });
+  assert.equal(got.items[0].starter_message, true);
+  assert.equal(got.items[0].adopted_by_member_id, U(10));
+});
+
+test(':claim-starter and :mark-starter-shown send the documented bodies and validate the answers', async (t) => {
+  const { fake, api } = await setup(t);
+  const B = `/api/v1/orgs/${ORG}/agents/${AGENT}/adoptions/${U(9)}`;
+  fake.script('POST', `${B}:claim-starter`,
+    { status: 200, json: { adoption_id: U(9), result: 'claimed', starter_state: 'claimed', claimed_at: '2026-01-02T03:04:05Z' } },
+    { status: 200, json: { adoption_id: U(9), result: 'disabled', starter_state: 'pending', claimed_at: null } },
+    { status: 200, json: { adoption_id: U(8), result: 'claimed', starter_state: 'claimed', claimed_at: null } },
+    { status: 200, json: { adoption_id: U(9), result: 'sent', starter_state: 'claimed', claimed_at: null } },
+    { status: 403, problem: { status: 403, code: 'AGENT_NOT_SELF' } });
+  assert.deepEqual(await api.claimStarter({ orgId: ORG, agentId: AGENT, adoptionId: U(9) }),
+    { adoption_id: U(9), result: 'claimed', starter_state: 'claimed', claimed_at: '2026-01-02T03:04:05Z' });
+  assert.equal((await api.claimStarter({ orgId: ORG, agentId: AGENT, adoptionId: U(9) })).result, 'disabled');
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(api.claimStarter({ orgId: ORG, agentId: AGENT, adoptionId: U(9) }), { code: 'RESPONSE_INVALID' });
+  }
+  await assert.rejects(api.claimStarter({ orgId: ORG, agentId: AGENT, adoptionId: U(9) }), { code: 'AGENT_NOT_SELF', transient: false });
+
+  fake.script('POST', `${B}:mark-starter-shown`,
+    { status: 200, json: { adoption_id: U(9), result: 'sent', result_at: '2026-01-02T03:04:05Z', starter_tasks_shown_at: '2026-01-02T03:04:05Z' } },
+    { status: 200, json: { adoption_id: U(9), result: 'claimed', result_at: '2026-01-02T03:04:05Z', starter_tasks_shown_at: null } });
+  assert.equal((await api.markStarterShown({ orgId: ORG, agentId: AGENT, adoptionId: U(9), result: 'sent' })).result, 'sent');
+  await assert.rejects(api.markStarterShown({ orgId: ORG, agentId: AGENT, adoptionId: U(9), result: 'send_failed' }), { code: 'RESPONSE_INVALID' });
+  await assert.rejects(api.markStarterShown({ orgId: ORG, agentId: AGENT, adoptionId: U(9), result: 'claimed' }), TypeError);
+  await assert.rejects(api.claimStarter({ orgId: ORG, agentId: AGENT, adoptionId: 'x' }), TypeError);
+  assert.deepEqual(fake.market().map((r) => [r.path.slice(B.length), r.json]), [
+    ...Array(5).fill([':claim-starter', {}]),
+    [':mark-starter-shown', { result: 'sent' }], [':mark-starter-shown', { result: 'send_failed' }],
+  ]);
 });

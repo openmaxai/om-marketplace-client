@@ -31,7 +31,7 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller } = {}) {
+async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller, starter = null } = {}) {
   const h = await pullHarness(t, { orgs });
   if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
@@ -47,7 +47,7 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const revocations = puller ?? createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
   const make = () => createTemplates({
     api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir, revocations, emulatorOrigin: storage.origin,
-    now: h.now, sleep: async () => {},
+    now: h.now, sleep: async () => {}, starter,
   });
   const templates = make();
   setup?.(h.dataDir, h.state);
@@ -792,4 +792,23 @@ test('a sha_block hitting a record still in writing quarantines it', async (t) =
   assert.equal(f.state.read('adoptions', {})[ADOPTION].state, 'quarantined');
   f.templates.sweepRevoked();
   assert.deepEqual(quarantinedCopies(f), [ADOPTION]);
+});
+
+// A write order with starter_message queues the adoption's starter message only once the market applied the write.
+test('the starter message is queued after an applied first write, never after a stale, failed or plain write', async (t) => {
+  const ADOPTER = U(30);
+  const cases = [
+    ['applied', { starter_message: true, adopted_by_member_id: ADOPTER }, applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER }]],
+    ['no starter message', { starter_message: false, adopted_by_member_id: ADOPTER }, applied, []],
+    ['no adopter', { starter_message: true, adopted_by_member_id: null }, applied, []],
+    ['stale', { starter_message: true, adopted_by_member_id: ADOPTER }, stale('active'), []],
+    ['failed', { starter_message: true, adopted_by_member_id: ADOPTER }, { status: 200, json: { adoption_id: ADOPTION, status: 'failed', outcome: 'applied' } }, []],
+  ];
+  for (const [name, over, answer, want] of cases) {
+    const bundle = templateBundle();
+    const queued = [];
+    const f = await harness(t, { bundle, items: [intent({ bundle_sha256: bundle.sha, ...over })], c15: [answer], starter: { enqueue: (x) => queued.push(x) } });
+    await f.templates.runNext();
+    assert.deepEqual(queued, want, name);
+  }
 });
