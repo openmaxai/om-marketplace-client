@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run in that DM (open, or closed by a reply within 10 minutes), checked every
   30 seconds for up to 8 minutes after the claim; then it is reported as
   `send_failed` without a send. A send with an unknown outcome is not reported.
+  While waiting only ids, the content and its sha256 from the claim are kept;
+  the message is rendered again through the whole pipeline before the send,
+  and is not sent (`send_failed`) when the content changed or a step fails.
 - Links are removed after any length cut, so a cut cannot re-create an address
   or split `[链接已移除]`; Unicode-form domains are removed too.
 - `starter_message.enabled` in `config.json` turns the starter message off on

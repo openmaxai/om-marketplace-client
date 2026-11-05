@@ -23,8 +23,9 @@ variables below first.
 The short name (`zylos add om-marketplace-client`) works once the component is
 listed in the Zylos component registry.
 
-New Workspace-native Agents get the client during provisioning; no action is
-needed for them.
+The client is installed automatically the first time the Agent's owner installs
+a skill or hires an expert template from Agent Market. It can also be installed
+manually with `zylos add openmaxai/om-marketplace-client`.
 
 ### Steps
 
@@ -219,6 +220,12 @@ never reaches the model.
    An openmax release with `noRun` on `comm.send` (from the version set in
    `OPENMAX_NORUN_MIN_VERSION`, not released yet) skips the wait and sends with
    `noRun: true`.
+   While waiting, the client keeps only ids, the `starter_content` and its
+   sha256 (canonical JSON, recorded at the claim); never the rendered text or
+   the adopter's name. Right before the send it checks the DM again and renders
+   the message again through the whole pipeline (filter, size fit, credential
+   check including the adopter's name, byte limit). A changed content hash, a
+   changed DM or any failing step means no send and `send_failed`.
 6. One `comm.send`, plain text, no mentions, never retried. A refused send is
    `send_failed`. A send whose outcome is unknown (timeout, server error) is
    not reported at all, so it is not counted as failed.
@@ -254,6 +261,12 @@ the rules together, and run
 directly. CI cannot reach the market repository, so run this before every
 release. With `OPENMAX_DIR=<zylos-openmax checkout>` the run check is also
 tested against the real openmax run selection.
+
+Release checklist:
+- `MARKET_REPO=<cws-marketplace clone> npm test` before every release.
+- `OPENMAX_DIR=<zylos-openmax checkout at that version> node --test test/starter-im.test.js`
+  against each new openmax version, since the run check loads openmax's own
+  activity modules.
 
 ## Operational notes
 

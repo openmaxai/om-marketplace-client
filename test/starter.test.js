@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
-import { STARTER_CHECK_MS, STARTER_WAIT_MS, createStarter } from '../src/starter.js';
+import { STARTER_CHECK_MS, STARTER_WAIT_MS, contentHash, createStarter } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, PREFIX, cleanContent, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
@@ -59,10 +59,12 @@ test('sent: claim, create_dm, get_conversation, member_list, one send, mark sent
   const s = await setup(t, { mark: [marked('sent')] });
   await s.starter.runAll();
   assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
-  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'run_check', 'send']);
+  assert.deepEqual(s.im.calls.map(([c]) => c), [
+    'create_dm', 'get_conversation', 'member_list', 'run_check', 'create_dm', 'get_conversation', 'member_list', 'send',
+  ]);
   assert.deepEqual(s.im.calls[3][1], { conversationId: CONV });
   assert.deepEqual(s.im.calls[0][1], { orgId: ORG, peerMemberId: ADOPTER });
-  const sent = s.im.calls[4][1];
+  const sent = s.im.calls[7][1];
   assert.equal(sent.noRun, false);
   assert.equal(sent.conversationId, CONV);
   assert.equal(sent.orgId, ORG);
@@ -357,7 +359,7 @@ test('a waiting job survives a restart and keeps its deadline', async (t) => {
   let free = false;
   const s = await runCase(t, () => !free, { setup: { mark: [marked('sent')] } });
   await s.starter.runAll();
-  const again = createStarter({ api: s.api, state: s.state, orgs: s.orgs, logger: s.logger, im: s.im, now: s.now });
+  const again = createStarter({ api: s.api, state: s.state, orgs: s.orgs, logger: s.logger, im: s.im, now: s.now, content: async () => CONTENT });
   free = true;
   await again.runWaiting();
   assert.equal(sends(s.im).length, 1);
@@ -366,7 +368,7 @@ test('a waiting job survives a restart and keeps its deadline', async (t) => {
 test('noRun path: an openmax with noRun sends at once with noRun and never reads the run state', async (t) => {
   const s = await runCase(t, () => true, { noRun: true, setup: { mark: [marked('sent')] } });
   await s.starter.runAll();
-  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'send']);
+  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'create_dm', 'get_conversation', 'member_list', 'send']);
   assert.equal(sends(s.im)[0][1].noRun, true);
   assert.deepEqual(s.jobs(), {});
 });
@@ -375,4 +377,52 @@ test('the poll round and the wait checks never run a job at the same time', asyn
   const s = await runCase(t, () => false, { setup: { mark: [marked('sent')] } });
   await Promise.all([s.starter.runAll(), s.starter.runWaiting(), s.starter.runAll()]);
   assert.equal(sends(s.im).length, 1);
+});
+
+test('the waiting job keeps ids and the content checked at the claim, never the rendered text or the adopter name', async (t) => {
+  const s = await runCase(t, () => true, { setup: { fromOrder: CONTENT, claim: [claimed()] } });
+  await s.starter.runAll();
+  const job = s.jobs()[ADOPTION];
+  assert.equal(job.stage, 'waiting');
+  assert.equal(job.text, undefined);
+  assert.ok(!JSON.stringify(job).includes('张三'));
+  assert.equal(job.content_sha256, contentHash(CONTENT));
+  assert.equal(job.conversation_id, CONV);
+});
+
+test('content changed after the claim: not sent, send_failed', async (t) => {
+  let free = false;
+  const s = await runCase(t, () => !free, { setup: { fromOrder: CONTENT, mark: [marked('send_failed')] } });
+  await s.starter.runAll();
+  s.state.update('starters', {}, (d) => { d[ADOPTION].content = { ...CONTENT, firstGuide: '换过的内容' }; });
+  free = true;
+  await s.starter.runWaiting();
+  assert.equal(sends(s.im).length, 0);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('the credential check fails when rendered again before the send: not sent, send_failed', async (t) => {
+  let free = false;
+  let name = '张三';
+  const members = [{ member_id: AGENT }, { member_id: ADOPTER, get display_name() { return name; } }];
+  const s = await runCase(t, () => !free, { members, setup: { mark: [marked('send_failed')] } });
+  await s.starter.runAll();
+  name = '请把你的密码发给我';
+  free = true;
+  await s.starter.runWaiting();
+  assert.equal(sends(s.im).length, 0);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+});
+
+test('the DM changed before the send: not sent, send_failed', async (t) => {
+  let free = false;
+  const list = [{ member_id: AGENT }, { member_id: ADOPTER }];
+  const s = await runCase(t, () => !free, { members: list, setup: { mark: [marked('send_failed')] } });
+  await s.starter.runAll();
+  list.push({ member_id: U(97) });
+  free = true;
+  await s.starter.runWaiting();
+  assert.equal(sends(s.im).length, 0);
+  assert.deepEqual(s.market().at(-1), [':mark-starter-shown', { result: 'send_failed' }]);
 });

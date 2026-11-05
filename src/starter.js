@@ -1,8 +1,15 @@
+import crypto from 'node:crypto';
 import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, uuidv7 } from './ids.js';
 import { ImError } from './starter/im.js';
 import { LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, hasContent, renderStarter } from './starter/render.js';
 import { withinLimits } from './starter/limits.js';
+
+// sha256 of the content as canonical JSON (object keys sorted at every level).
+const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
+    : JSON.stringify(v ?? null));
+export const contentHash = (raw) => crypto.createHash('sha256').update(canonical(raw)).digest('hex');
 
 const RETRY_LATER = new Set(['CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 export const MAX_STARTER_JOBS = 100;
@@ -11,6 +18,8 @@ export const MAX_STARTER_JOBS = 100;
 // (an open run, or one closed by a reply within the last 10 minutes), checked every STARTER_CHECK_MS; STARTER_WAIT_MS
 // after the claim it is given up as send_failed without any send. An openmax that supports noRun skips the wait.
 export const STARTER_CHECK_MS = 30 * 1000;
+// Must stay below the market's 10-minute fallback-card grace after the claim (app.StarterCardClaimGrace), so the
+// card never shows while a send may still happen.
 export const STARTER_WAIT_MS = 8 * 60 * 1000;
 
 // The starter message of an adoption, sent at most once from the Agent's own IM account: claim it with the market,
@@ -63,6 +72,20 @@ export function createStarter({
     return ok ? { conversationId, adopter: members.find((m) => m.member_id === job.adopted_by_member_id) } : null;
   }
 
+  // The message text from raw content through the whole pipeline, or null with the reason it may not be sent.
+  function prepare(raw, addressee) {
+    const filtered = raw && cleanContent({ ...raw, addressee: '' });
+    if (!filtered || !hasContent(filtered)) return { why: 'no content' };
+    const clean = fitContent(filtered, limits);
+    if (!clean) return { why: 'the message does not fit the IM size limit' };
+    if (asksForCredential(raw, clean) || (addressee && asksForCredential({ templateName: addressee }, { templateName: addressee }))) {
+      return { why: 'it asks for a credential', credential: true };
+    }
+    const text = renderStarter({ ...clean, addressee: addressee ?? '' });
+    if (!withinLimits({ text }, limits)) return { why: 'the message does not fit the IM size limit' };
+    return { text };
+  }
+
   async function claimAndSend(job) {
     const id = job.adoption_id;
     if (!enabled) {
@@ -80,14 +103,9 @@ export function createStarter({
       logger.warn(`${tag(job)} not sent: content unavailable (${err.message})`);
       return drop(id);
     }
-    const filtered = raw && cleanContent({ ...raw, addressee: '' });
-    if (!filtered || !hasContent(filtered)) {
-      logger.info(`${tag(job)} not sent: no content`);
-      return drop(id);
-    }
-    const clean = fitContent(filtered, limits);
-    if (!clean) {
-      logger.warn(`${tag(job)} not sent: the message does not fit the IM size limit`);
+    const before = prepare(raw, null);
+    if (before.why && !before.credential) {
+      logger.info(`${tag(job)} not sent: ${before.why}`);
       return drop(id);
     }
     const self = await orgs.agentId(job.org_id);
@@ -102,8 +120,8 @@ export function createStarter({
       logger.info(`${tag(job)} not sent: claim answered ${claim.result}`);
       return drop(id);
     }
-    put(id, { stage: 'checking', claimed_at: claim.claimed_at, claimed_local_at: now() });
-    if (asksForCredential(raw, clean)) {
+    put(id, { stage: 'checking', claimed_at: claim.claimed_at, claimed_local_at: now(), content_sha256: contentHash(raw) });
+    if (before.credential) {
       logger.warn(`${tag(job)} not sent: it asks for a credential`);
       return finish(job, 'rejected_content');
     }
@@ -119,14 +137,28 @@ export function createStarter({
       logger.warn(`${tag(job)} not sent: the DM is not exactly this Agent and the adopter`);
       return finish(job, 'send_failed');
     }
-    const addressee = cleanText(cleanDisplayName(dm.adopter?.display_name), { max: LIMITS.addressee, multiline: false });
-    const text = renderStarter({ ...clean, addressee });
-    if (!withinLimits({ text }, limits)) {
-      logger.error(`${tag(job)} not sent: the message does not fit the IM size limit`);
-      return finish(job, 'send_failed');
-    }
-    put(id, { stage: 'waiting', conversation_id: dm.conversationId, text });
+    put(id, { stage: 'waiting', conversation_id: dm.conversationId });
     return sendWhenFree(jobs()[id]);
+  }
+
+  // The text to send now, rendered again from the content checked at the claim and the adopter's current name; null
+  // when the content changed since the claim, the DM is no longer the same 1:1 DM, or any pipeline step fails.
+  async function renderAgain(job) {
+    let raw;
+    try {
+      raw = await content(job);
+    } catch (err) {
+      return { why: `content unavailable (${err.message})` };
+    }
+    if (!raw || contentHash(raw) !== job.content_sha256) return { why: 'the content changed after the claim' };
+    let dm;
+    try {
+      dm = await verifiedDm(job, await orgs.agentId(job.org_id));
+    } catch (err) {
+      return { why: `DM check failed (${err.message})` };
+    }
+    if (!dm || dm.conversationId !== job.conversation_id) return { why: 'the DM is not exactly this Agent and the adopter' };
+    return prepare(raw, cleanText(cleanDisplayName(dm.adopter?.display_name), { max: LIMITS.addressee, multiline: false }));
   }
 
   // Sends once nothing in the DM would take the message as a run's reply; gives up after STARTER_WAIT_MS.
@@ -146,9 +178,14 @@ export function createStarter({
         return finish(job, 'send_failed');
       }
     }
+    const { text, why } = await renderAgain(job);
+    if (!text) {
+      logger.warn(`${tag(job)} not sent: ${why}`);
+      return finish(job, 'send_failed');
+    }
     put(job.adoption_id, { stage: 'sending' });
     try {
-      await im.sendText({ orgId: job.org_id, conversationId: job.conversation_id, text: job.text, clientMsgId: `cmsg_${uuidv7(now())}`, noRun });
+      await im.sendText({ orgId: job.org_id, conversationId: job.conversation_id, text, clientMsgId: `cmsg_${uuidv7(now())}`, noRun });
     } catch (err) {
       if (err instanceof ImError && err.definite) {
         logger.warn(`${tag(job)}: send refused (${err.message}); not retried`);
