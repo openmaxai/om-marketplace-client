@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-05
+
+### Changed
+- One expert template may now have up to 8000 estimated tokens (duty and
+  boundary lines plus `inject.md`), up from 2000. A template that does not fit
+  one 2200-token zylos shard is split across the four `market-template-*`
+  shards; every part starts with the priority line and carries
+  `(part k of n)`. Cuts prefer paragraph, then line, then word breaks and never
+  fall inside the generated `customizations.json` file-list line. Each shard
+  stays within the zylos budget next to the zylos header.
+- Shards print the mapped templates in slot order instead of one slot per
+  shard. A write whose parts would not fit next to the other mapped templates is
+  reported as `CLIENT_INTERNAL` (`slots_full`).
+- The market serves templates over 2000 tokens only to this version or later.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

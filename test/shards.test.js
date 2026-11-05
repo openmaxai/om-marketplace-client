@@ -8,7 +8,7 @@ import {
   SHARD_BUDGET, SHARD_HEADER_RESERVE, declaration, declarationsReady, ensureDeclarations, estimateTokens, findHookSyncScript, hooksPresent,
   parseRole, readSlots, roleLines, shardName, shardsDir, syncHooks, writeSlots,
 } from '../src/shards.js';
-import { PRIORITY_LINE, composeSection, emitSlot } from '../src/shard-emitter.js';
+import { DATA_LABEL, DATA_LINE, PRIORITY_LINE, composeParts, emitSlot } from '../src/shard-emitter.js';
 import { installShards } from '../hooks/lib/shards.js';
 import { fakeZylos, writeSlotHooks } from './fake/zylos.js';
 
@@ -26,6 +26,10 @@ test('token estimate follows zylos: ceil(ascii/4 + other/1.3) over code points',
   assert.equal(estimateTokens('\u{1F600}'), 1);
   assert.equal(estimateTokens('a'.repeat(8000)), 2000);
   assert.equal(estimateTokens('a'.repeat(8001)), 2001);
+  assert.equal(estimateTokens('a'.repeat(32000)), 8000);
+  assert.equal(estimateTokens('a'.repeat(32001)), 8001);
+  assert.equal(estimateTokens('中'.repeat(10400)), 8000);
+  assert.equal(estimateTokens('中'.repeat(10401)), 8001);
 });
 
 test('the four declarations are written once, match zylos rules and leave other files alone', () => {
@@ -175,18 +179,24 @@ test('the emitter prints nothing on a sha mismatch, links, a malformed map or an
   fs.writeFileSync(path.join(bad, 'slots.json'), 'not json');
   assert.equal(emitSlot(1, { dataDir: bad }), '');
 
-  assert.notEqual(emitSlot(1, { dataDir: slotted('a'.repeat(8000)) }), '');
-  assert.equal(emitSlot(1, { dataDir: slotted('a'.repeat(8001)) }), '');
+  assert.notEqual(emitSlot(1, { dataDir: slotted('a'.repeat(32000)) }), '');
+  assert.equal(emitSlot(1, { dataDir: slotted('a'.repeat(32001)) }), '');
 });
 
-test('each slot entry file emits its own slot through the data dir of the environment', async (t) => {
+test('each shard entry file emits its own part of the plan through the data dir of the environment', async (t) => {
   const d = slotted('slot three\n');
-  writeSlots(d, { 3: readSlots(d)['1'] });
+  writeSlots(d, { 1: null, 3: readSlots(d)['1'] });
   const prev = process.env.OM_MARKETPLACE_CLIENT_HOME;
   process.env.OM_MARKETPLACE_CLIENT_HOME = d;
   t.after(() => { if (prev === undefined) delete process.env.OM_MARKETPLACE_CLIENT_HOME; else process.env.OM_MARKETPLACE_CLIENT_HOME = prev; });
-  const out = await Promise.all([1, 2, 3, 4].map(async (n) => (await import(`../src/shards/market-template-${n}.js`)).emit()));
-  assert.deepEqual(out.map((o) => o.endsWith('slot three\n')), [false, false, true, false]);
+  const emitAll = () => Promise.all([1, 2, 3, 4].map(async (n) => (await import(`../src/shards/market-template-${n}.js`)).emit()));
+  assert.deepEqual((await emitAll()).map((o) => o.endsWith('slot three\n')), [true, false, false, false]);
+  const big = `${'x'.repeat(6000)}\n\n${'y'.repeat(6000)}\n`;
+  fs.writeFileSync(path.join(d, 'templates', ID, 'inject.md'), big);
+  writeSlots(d, { 3: { adoption_id: ID, inject_sha256: sha(Buffer.from(big)) } });
+  const out = await emitAll();
+  assert.deepEqual(out.map((o) => o.includes(' (part ')), [true, true, false, false]);
+  assert.ok(out[0].endsWith(`\n\n${'x'.repeat(6000)}\n\n`) && out[1].endsWith(`\n\n${'y'.repeat(6000)}\n`));
 });
 
 test('role lines match the server rendering; the boundary line is left out when empty', () => {
@@ -217,7 +227,8 @@ test('parseRole rejects line breaks, control characters and duplicate keys', () 
 test('the priority line is fixed and comes first', () => {
   assert.match(PRIORITY_LINE, /^Priority: organization rules > this template > your own habits\./);
   assert.ok(!PRIORITY_LINE.includes('\n'));
-  assert.ok(composeSection('/d', 'x').startsWith(`${PRIORITY_LINE}\n`));
+  assert.ok(composeParts('/d', 'x')[0].startsWith(`${PRIORITY_LINE}\n`));
+  for (const part of composeParts('/d', 'x'.repeat(20000))) assert.ok(part.startsWith(`${PRIORITY_LINE}\n`));
 });
 
 // A data dir with slot 1 mapped to a render version 2 template: inject.md plus role.json.
@@ -244,27 +255,119 @@ test('the emitter prints the role lines between the path line and the inject seg
 // The longest header zylos prepends (session-start-orchestrator.js shardHeader, with a predecessor wait note).
 const worstHeader = (name) => `=== ZYLOS STARTUP CONTEXT [99/99] ${name} (predecessor "${'p'.repeat(64)}" not ready after 999999ms, continued) ===\n`;
 
-test('a template at the 2000-token limit still fits the zylos shard budget with the client lines and the header', () => {
+// A realistic data dir: /home/<user>/zylos/components/om-marketplace-client.
+const realDir = () => path.join(tmpHome(), 'home', 'agent-user', 'zylos', 'components', 'om-marketplace-client');
+// The template text carried by a part: what follows the client's two lines and the blank line.
+const body = (part) => part.slice(part.indexOf('\n\n') + 2);
+const withinShard = (part, n) => {
+  const shard = `${worstHeader(shardName(n))}${part}`;
+  return estimateTokens(shard) <= SHARD_BUDGET.maxTokens && shard.length <= SHARD_BUDGET.maxChars;
+};
+
+// 2000 and 2001 tokens straddle the single-shard limit; 8000 is the most one template may have, 8001 is refused.
+// Every shard stays within the zylos budget with the worst header in front, and the parts reassemble the text exactly.
+test('a template up to 8000 tokens fits the four zylos shards with the client lines and the header', () => {
   const role = { boundary: 'Never send mail without approval.', duty: 'Inbox triage.' };
   const lines = roleLines(role);
-  const header = worstHeader(shardName(4));
-  assert.ok(estimateTokens(header) <= SHARD_HEADER_RESERVE.maxTokens && header.length <= SHARD_HEADER_RESERVE.maxChars);
+  assert.ok(estimateTokens(worstHeader(shardName(4))) <= SHARD_HEADER_RESERVE.maxTokens && worstHeader(shardName(4)).length <= SHARD_HEADER_RESERVE.maxChars);
   for (const unit of ['a', '中']) {
-    let inject = '';
-    while (estimateTokens(`${lines}${inject}${unit}`) <= 2000) inject += unit;
-    assert.equal(estimateTokens(lines + inject), 2000, unit);
-    // A realistic data dir: /home/<user>/zylos/components/om-marketplace-client.
-    const d = slottedRole(inject, role, { d: path.join(tmpHome(), 'home', 'agent-user', 'zylos', 'components', 'om-marketplace-client') });
-    const shard = `${header}${emitSlot(1, { dataDir: d })}`;
-    assert.ok(shard.startsWith(`${header}${PRIORITY_LINE}\n`), unit);
-    assert.ok(estimateTokens(shard) <= SHARD_BUDGET.maxTokens && shard.length <= SHARD_BUDGET.maxChars, `${unit}: ${estimateTokens(shard)}`);
-    const over = slottedRole(`${inject}${unit}`, role);
-    assert.equal(emitSlot(1, { dataDir: over }), '', `${unit}: one over`);
+    const at = (limit) => {
+      let inject = '';
+      const step = unit.repeat(64);
+      while (estimateTokens(`${lines}${inject}${step}`) <= limit) inject += step;
+      while (estimateTokens(`${lines}${inject}${unit}`) <= limit) inject += unit;
+      assert.equal(estimateTokens(lines + inject), limit, unit);
+      return inject;
+    };
+    for (const [limit, shards] of [[2000, 1], [2001, 1], [8000, 4]]) {
+      const inject = limit === 2001 ? `${at(2000)}${unit === 'a' ? 'aaaa' : '中'}` : at(limit);
+      assert.equal(estimateTokens(lines + inject), limit, `${unit} ${limit}`);
+      const d = slottedRole(inject, role, { d: realDir() });
+      const out = [1, 2, 3, 4].map((n) => emitSlot(n, { dataDir: d }));
+      assert.equal(out.filter(Boolean).length, shards, `${unit} ${limit}`);
+      out.filter(Boolean).forEach((part, i) => {
+        assert.ok(part.startsWith(`${PRIORITY_LINE}\n`), `${unit} ${limit} part ${i + 1}`);
+        assert.ok(withinShard(part, i + 1), `${unit} ${limit} part ${i + 1}: ${estimateTokens(part)}`);
+        assert.equal(part.includes(` (part ${i + 1} of ${shards})`), shards > 1);
+      });
+      assert.equal(out.filter(Boolean).map(body).join(''), lines + inject, `${unit} ${limit}`);
+    }
+    const over = slottedRole(`${at(8000)}${unit === 'a' ? 'aaaa' : '中'}`, role, { d: realDir() });
+    assert.deepEqual([1, 2, 3, 4].map((n) => emitSlot(n, { dataDir: over })), ['', '', '', ''], `${unit}: one over`);
   }
 });
 
 test('a section that would not fit next to the zylos header is not printed', () => {
-  assert.notEqual(composeSection('/d', 'a'.repeat(8000)), null);
-  assert.equal(composeSection('/d', 'a'.repeat(8001)), null);
-  assert.equal(composeSection(`/${'中'.repeat(200)}`, 'a'.repeat(8000)), null);
+  assert.equal(composeParts('/d', 'a'.repeat(8000)).length, 1);
+  assert.equal(composeParts('/d', 'a'.repeat(8001)).length, 1);
+  assert.equal(composeParts('/d', 'a'.repeat(9000)).length, 2);
+  assert.equal(composeParts('/d', 'a'.repeat(32000)).length, 4);
+  assert.equal(composeParts('/d', 'a'.repeat(32001)), null);
+  assert.equal(composeParts(`/${'中'.repeat(200)}`, 'a'.repeat(32000)), null);
+  // The split starts exactly where one shard (worst zylos header included) would go over 2200 tokens.
+  const dir = path.join(realDir(), 'templates', ID);
+  let n = 8000;
+  while (composeParts(dir, 'a'.repeat(n + 1)).length === 1) n++;
+  assert.ok(withinShard(composeParts(dir, 'a'.repeat(n))[0], 4));
+  assert.ok(!withinShard(`${composeParts(dir, 'a'.repeat(n))[0]}a`, 4) || `${composeParts(dir, 'a'.repeat(n))[0]}a`.length > SHARD_BUDGET.maxChars - SHARD_HEADER_RESERVE.maxChars
+    || estimateTokens(`${composeParts(dir, 'a'.repeat(n))[0]}a`) > SHARD_BUDGET.maxTokens - SHARD_HEADER_RESERVE.maxTokens);
+  assert.equal(composeParts(dir, 'a'.repeat(n + 1)).length, 2);
+});
+
+// Cuts fall on paragraph breaks when they can, and never inside the line that marks customizations.json as data.
+// Mutation check: dropping the DATA_LABEL guard or the boundary ranking makes this fail.
+test('a split cuts at paragraph breaks and never inside the data label line', () => {
+  const para = (c) => `${c.repeat(3000)}\n`;
+  const text = `${para('a')}\n${para('b')}\n${para('c')}\n${para('d')}`;
+  const parts = composeParts('/d', text);
+  assert.deepEqual(parts.map(body), [`${para('a')}\n${para('b')}\n`, `${para('c')}\n${para('d')}`]);
+
+  const label = `${DATA_LINE}\n`;
+  const room = composeParts('/d', 'a'.repeat(20000)).map(body)[0].length;
+  for (let shift = 0; shift < label.length; shift++) {
+    const t = `${'a'.repeat(room - shift - 1)}\n${label}${'b'.repeat(4000)}`;
+    const ps = composeParts('/d', t).map(body);
+    assert.ok(ps.some((p) => p.includes(label)), `shift ${shift}`);
+    assert.equal(ps.join(''), t);
+  }
+  const long = `${'a'.repeat(9000)} ${DATA_LABEL}\n`;
+  assert.equal(composeParts('/d', long).map(body).join(''), long);
+});
+
+// Author lines that carry the label are not guarded: only the generated customizations.json line is. 45 short CJK lines
+// each ending in the label stay placeable.
+// Mutation check: guarding every line that contains DATA_LABEL makes this fail.
+test('author lines carrying the data label do not block a split', () => {
+  const text = `${'中'.repeat(220)} ${DATA_LABEL}\n`.repeat(45);
+  assert.ok(estimateTokens(text) > 7800 && estimateTokens(text) <= 8000, `${estimateTokens(text)}`);
+  const parts = composeParts(path.join(realDir(), 'templates', ID), text);
+  assert.ok(parts && parts.length <= 4);
+  parts.forEach((p, i) => assert.ok(withinShard(p, i + 1)));
+  assert.equal(parts.map(body).join(''), text);
+});
+
+// Random mixes of ASCII, CJK, emoji, spaces and line breaks up to 8000 tokens always place, every part fits a shard
+// next to the worst header, and the parts reassemble the text.
+test('any template up to 8000 tokens splits into at most four shards that fit', () => {
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const units = ['a', 'b ', '中', '文', '\u{1F600}', '\n', '\n\n', `${DATA_LINE}\n`, `x ${DATA_LABEL}\n`];
+  const dir = path.join(realDir(), 'templates', ID);
+  for (let k = 0; k < 40; k++) {
+    let t = '';
+    let a = 0;
+    let o = 0;
+    const limit = 2000 + rnd(6001);
+    for (;;) {
+      const u = units[rnd(units.length)].repeat(1 + rnd(40));
+      const ua = [...u].filter((c) => c.codePointAt(0) <= 0x7f).length;
+      if (Math.ceil((a + ua) / 4 + (o + [...u].length - ua) / 1.3) > limit) break;
+      t += u; a += ua; o += [...u].length - ua;
+    }
+    assert.ok(estimateTokens(t) <= limit);
+    const parts = composeParts(dir, t);
+    assert.ok(parts && parts.length <= 4, `case ${k}: ${estimateTokens(t)} tokens`);
+    parts.forEach((p, i) => assert.ok(withinShard(p, i + 1), `case ${k} part ${i + 1}`));
+    assert.equal(parts.map(body).join(''), t, `case ${k}`);
+  }
 });

@@ -9,7 +9,8 @@ import { readJson, writeJsonAtomic } from './state.js';
 
 export const SLOT_COUNT = 4;
 export const SLOTS_FILE = 'slots.json';
-export const INJECT_MAX_TOKENS = 2000;
+// One template's text (role lines + inject.md); it is split across all SLOT_COUNT shards when it does not fit one.
+export const INJECT_MAX_TOKENS = 8000;
 export const SHARD_BUDGET = Object.freeze({ maxChars: 10000, maxTokens: 2200 });
 // Room kept for the header line zylos prepends to each shard (worst case incl. its "predecessor not ready" note).
 export const SHARD_HEADER_RESERVE = Object.freeze({ maxChars: 200, maxTokens: 50 });

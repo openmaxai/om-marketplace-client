@@ -11,8 +11,8 @@ import { failureFor, scan, writeConfined } from './land.js';
 import { discard, fsyncDir, leftInTrash } from './trash.js';
 import { INJECT, ROLE, inspectBundle } from './pkg/bundle.js';
 import { PackageError } from './pkg/zip.js';
-import { declarationsReady, emptySlots, readSlots, roleLines, runtimeOf, writeSlots } from './shards.js';
-import { composeSection } from './shard-emitter.js';
+import { SLOT_COUNT, declarationsReady, emptySlots, readSlots, roleLines, runtimeOf, writeSlots } from './shards.js';
+import { composeParts, slotParts } from './shard-emitter.js';
 import { JITTER_RATIO, POLL_INTERVAL_MS } from './scheduler.js';
 
 export const MAX_TOMBSTONES = 1000;
@@ -214,10 +214,12 @@ export function createTemplates({
       emulatorOrigin, fetchImpl, now, sleep, signal,
     });
     const bundle = inspectBundle(bytes);
-    // The whole section the emitter will print (priority and path lines included) must fit, or the slot would print nothing.
-    if (composeSection(dir(id), (bundle.role ? roleLines(bundle.role) : '') + bundle.inject) === null) {
-      throw new PackageError('inject_too_large', 'template section does not fit the shard budget');
-    }
+    // Every part the emitter will print (priority and path lines included) must fit a shard, or nothing would be printed.
+    const parts = composeParts(dir(id), (bundle.role ? roleLines(bundle.role) : '') + bundle.inject);
+    if (parts === null) throw new PackageError('inject_too_large', 'template section does not fit the shard budget');
+    // The parts of the other mapped adoptions and this one share the SLOT_COUNT shards.
+    const taken = Object.values(slots).filter((s) => s && s.adoption_id !== id).reduce((k, s) => k + (slotParts(dataDir, s)?.length ?? 0), 0);
+    if (taken + parts.length > SLOT_COUNT) throw internal('slots_full');
     const revoked = revokedSet(state);
     const manifestSha = bundle.index.manifest_sha256;
     if (revoked.has('manifest_sha256', manifestSha) || revoked.blocksSha(manifestSha) || revoked.blocksSha(it.bundle_sha256)) {

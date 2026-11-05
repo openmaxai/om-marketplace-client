@@ -26,12 +26,12 @@ test('a render version 2 bundle from the server is accepted with its role', () =
   assert.equal(roleLines(b.role), 'Duty: Inbox triage and scheduling.\n\n');
 });
 
-test('the inject segment is held to 2000 estimated tokens', () => {
-  assert.equal(inspectBundle(templateBundle({ inject: 'a'.repeat(8000) }).zip).inject.length, 8000);
-  assert.throws(() => inspectBundle(templateBundle({ inject: 'a'.repeat(8001) }).zip), unsafe('inject_too_large'));
-  assert.ok(inspectBundle(templateBundle({ inject: '中'.repeat(2600) }).zip));
-  assert.throws(() => inspectBundle(templateBundle({ inject: '中'.repeat(2601) }).zip), unsafe('inject_too_large'));
-  assert.equal(inspectBundle(templateBundle({ inject: '\u{1F600}'.repeat(2600) }).zip).index.manifest_sha256, MANIFEST_SHA);
+test('the inject segment is held to 8000 estimated tokens', () => {
+  for (const n of [2000, 2001, 8000]) assert.equal(inspectBundle(templateBundle({ inject: 'a'.repeat(4 * n) }).zip).inject.length, 4 * n, `${n}`);
+  assert.throws(() => inspectBundle(templateBundle({ inject: 'a'.repeat(32001) }).zip), unsafe('inject_too_large'));
+  assert.ok(inspectBundle(templateBundle({ inject: '中'.repeat(10400) }).zip));
+  assert.throws(() => inspectBundle(templateBundle({ inject: '中'.repeat(10401) }).zip), unsafe('inject_too_large'));
+  assert.equal(inspectBundle(templateBundle({ inject: '\u{1F600}'.repeat(10400) }).zip).index.manifest_sha256, MANIFEST_SHA);
 });
 
 test('only the fixed bundle paths are accepted', () => {
@@ -74,9 +74,9 @@ test('role.json must be exactly {boundary, duty} with a non-blank duty', () => {
   assert.throws(() => inspectBundle(v2({ files: { 'role.json': Buffer.from([0xff]) } }).zip), unsafe('role_invalid'));
 });
 
-test('the 2000-token budget covers the role lines and the inject segment together', () => {
+test('the 8000-token budget covers the role lines and the inject segment together', () => {
   const lines = roleLines({ duty: 'Inbox triage.', boundary: 'Never send mail.' });
-  const room = 8000 - lines.length;
+  const room = 32000 - lines.length;
   assert.ok(inspectBundle(v2({ inject: 'a'.repeat(room) }).zip));
   assert.throws(() => inspectBundle(v2({ inject: 'a'.repeat(room + 1) }).zip), unsafe('inject_too_large'));
   assert.ok(inspectBundle(templateBundle({ inject: 'a'.repeat(room + 1) }).zip), 'version 1 has no role lines');
