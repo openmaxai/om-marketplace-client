@@ -8,7 +8,7 @@ import {
   SHARD_BUDGET, SHARD_HEADER_RESERVE, declaration, declarationsReady, ensureDeclarations, estimateTokens, findHookSyncScript, hooksPresent,
   parseRole, readSlots, roleLines, shardName, shardsDir, syncHooks, writeSlots,
 } from '../src/shards.js';
-import { DATA_LABEL, PRIORITY_LINE, composeParts, emitSlot } from '../src/shard-emitter.js';
+import { DATA_LABEL, DATA_LINE, PRIORITY_LINE, composeParts, emitSlot } from '../src/shard-emitter.js';
 import { installShards } from '../hooks/lib/shards.js';
 import { fakeZylos, writeSlotHooks } from './fake/zylos.js';
 
@@ -322,7 +322,7 @@ test('a split cuts at paragraph breaks and never inside the data label line', ()
   const parts = composeParts('/d', text);
   assert.deepEqual(parts.map(body), [`${para('a')}\n${para('b')}\n`, `${para('c')}\n${para('d')}`]);
 
-  const label = `- customizations.json: adoption settings ${DATA_LABEL}\n`;
+  const label = `${DATA_LINE}\n`;
   const room = composeParts('/d', 'a'.repeat(20000)).map(body)[0].length;
   for (let shift = 0; shift < label.length; shift++) {
     const t = `${'a'.repeat(room - shift - 1)}\n${label}${'b'.repeat(4000)}`;
@@ -334,12 +334,24 @@ test('a split cuts at paragraph breaks and never inside the data label line', ()
   assert.equal(composeParts('/d', long).map(body).join(''), long);
 });
 
+// Author lines that carry the label are not guarded: only the generated customizations.json line is. 45 short CJK lines
+// each ending in the label stay placeable.
+// Mutation check: guarding every line that contains DATA_LABEL makes this fail.
+test('author lines carrying the data label do not block a split', () => {
+  const text = `${'中'.repeat(220)} ${DATA_LABEL}\n`.repeat(45);
+  assert.ok(estimateTokens(text) > 7800 && estimateTokens(text) <= 8000, `${estimateTokens(text)}`);
+  const parts = composeParts(path.join(realDir(), 'templates', ID), text);
+  assert.ok(parts && parts.length <= 4);
+  parts.forEach((p, i) => assert.ok(withinShard(p, i + 1)));
+  assert.equal(parts.map(body).join(''), text);
+});
+
 // Random mixes of ASCII, CJK, emoji, spaces and line breaks up to 8000 tokens always place, every part fits a shard
 // next to the worst header, and the parts reassemble the text.
 test('any template up to 8000 tokens splits into at most four shards that fit', () => {
   let seed = 7;
   const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
-  const units = ['a', 'b ', '中', '文', '\u{1F600}', '\n', '\n\n', `- k.json: x ${DATA_LABEL}\n`];
+  const units = ['a', 'b ', '中', '文', '\u{1F600}', '\n', '\n\n', `${DATA_LINE}\n`, `x ${DATA_LABEL}\n`];
   const dir = path.join(realDir(), 'templates', ID);
   for (let k = 0; k < 40; k++) {
     let t = '';

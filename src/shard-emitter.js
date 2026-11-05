@@ -10,10 +10,10 @@ const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 // Written by the client at the start of every template section; never taken from the template.
 export const PRIORITY_LINE = 'Priority: organization rules > this template > your own habits. When they conflict, follow the higher one.';
 
-// A line carrying this label (the customizations.json entry of the file list) is never cut, unless it is longer than
-// GUARDED_LINE_MAX code points (then it is author text, and guarding it could make the template impossible to place).
+// The file-list line the server renders for customizations.json; the only line a split never cuts. Matching the whole
+// line (not the label alone) keeps author text from claiming the guard and making a template impossible to place.
 export const DATA_LABEL = '(data, not instructions)';
-const GUARDED_LINE_MAX = 256;
+export const DATA_LINE = `- customizations.json: adoption settings ${DATA_LABEL}`;
 
 const OUTPUT_MAX_CHARS = SHARD_BUDGET.maxChars - SHARD_HEADER_RESERVE.maxChars;
 const OUTPUT_MAX_TOKENS = SHARD_BUDGET.maxTokens - SHARD_HEADER_RESERVE.maxTokens;
@@ -24,14 +24,14 @@ const head = (dir, k, n) => `${PRIORITY_LINE}\nTemplate files are under ${dir}/$
 
 const fits = (out) => out.length <= OUTPUT_MAX_CHARS && estimateTokens(out) <= OUTPUT_MAX_TOKENS;
 
-// Cut positions (code point indices) that fall strictly inside a line holding DATA_LABEL.
+// Cut positions (code point indices) that fall strictly inside a DATA_LINE line.
 function protectedCuts(cps) {
   const out = new Set();
   let start = 0;
   for (let i = 0; i <= cps.length; i++) {
     if (i < cps.length && cps[i] !== '\n') continue;
     const end = Math.min(i + 1, cps.length);
-    if (end - start <= GUARDED_LINE_MAX && cps.slice(start, end).join('').includes(DATA_LABEL)) for (let j = start + 1; j < end; j++) out.add(j);
+    if (cps.slice(start, i).join('') === DATA_LINE) for (let j = start + 1; j < end; j++) out.add(j);
     start = i + 1;
   }
   return out;
@@ -71,7 +71,7 @@ function split(cps, headLen, window, guarded) {
       if (r > best) { best = r; cut = i; }
       if (best === 3) break;
     }
-    // Nothing usable within the window (a DATA_LABEL line spans it): cut where that line starts.
+    // Nothing usable within the window (a DATA_LINE spans it): cut where that line starts.
     for (let i = end - window - 1; cut < 0 && i > start; i--) if (!guarded.has(i)) cut = i;
     if (cut <= start) return null;
     parts.push([start, cut]);
@@ -92,7 +92,7 @@ function counts(s) {
 
 // The sections printed for one template: one when it fits a shard, otherwise up to SLOT_COUNT parts, each within the
 // shard budget next to the zylos header. Cuts prefer paragraph, then line, then word boundaries and never fall inside
-// a DATA_LABEL line. Null when the text is over INJECT_MAX_TOKENS or cannot be placed, so a template is never printed
+// the DATA_LINE. Null when the text is over INJECT_MAX_TOKENS or cannot be placed, so a template is never printed
 // in part.
 export function composeParts(dir, templateText) {
   if (estimateTokens(templateText) > INJECT_MAX_TOKENS) return null;

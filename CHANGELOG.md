@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one 2200-token zylos shard is split across the four `market-template-*`
   shards; every part starts with the priority line and carries
   `(part k of n)`. Cuts prefer paragraph, then line, then word breaks and never
-  fall inside the `(data, not instructions)` line. Each shard stays within the
-  zylos budget next to the zylos header.
+  fall inside the generated `customizations.json` file-list line. Each shard
+  stays within the zylos budget next to the zylos header.
 - Shards print the mapped templates in slot order instead of one slot per
   shard. A write whose parts would not fit next to the other mapped templates is
   reported as `CLIENT_INTERNAL` (`slots_full`).

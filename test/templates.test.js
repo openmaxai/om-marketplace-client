@@ -835,3 +835,26 @@ test('the starter message is queued after an applied first write, never after a 
     assert.deepEqual(queued, want, name);
   }
 });
+
+// C-04 answering 409 CLIENT_VERSION_TOO_OLD (split_inject_required, a template this client version cannot print) only
+// defers the template intent: no too-old mode, no write result, the intent is retried next round, and once the market
+// closes the adoption C-04 answers 404 and the intent is dropped.
+test('a C-04 refusal with CLIENT_VERSION_TOO_OLD defers the template intent without entering too-old mode', async (t) => {
+  const refused = { status: 409, problem: { type: 'about:blank', title: 'CLIENT_VERSION_TOO_OLD', status: 409, code: 'CLIENT_VERSION_TOO_OLD',
+    reason: 'split_inject_required', min_version: '0.4.0' } };
+  const gone = { status: 404, problem: { type: 'about:blank', title: 'NOT_FOUND', status: 404, code: 'NOT_FOUND' } };
+  const f = await harness(t, { c04: [refused, refused, gone] });
+  const live = () => f.state.read('intents', null).queue.filter((q) => q.id === INTENT).map((q) => q.status);
+  for (let round = 0; round < 2; round++) {
+    assert.equal(await f.templates.runNext(), 'deferred');
+    assert.equal(f.state.read('gate', null)?.too_old ?? null, null);
+    assert.deepEqual(f.state.alertKeys('client_too_old'), []);
+    assert.deepEqual(f.sent(), []);
+    assert.deepEqual(live(), ['running']);
+  }
+  assert.equal(f.fake.requests.filter((r) => r.path === C04).length, 2);
+  f.fake.script('POST', C01, { status: 200, json: { items: [], has_more: false, next_after_seq: 1, policy_sha256: POLICY_SHA256 } });
+  assert.equal(await f.templates.runNext(), 'closed');
+  assert.deepEqual(live(), []);
+  assert.deepEqual(f.sent(), []);
+});
