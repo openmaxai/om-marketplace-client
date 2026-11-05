@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.3.0
+version: 0.4.0
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after
@@ -102,7 +102,7 @@ the four shards, each part marked `(part k of n)` and starting with the
 priority line; cuts prefer paragraph, then line, then word breaks and never
 fall inside the `(data, not instructions)` line. A template that cannot be
 placed this way is refused at install. Templates over 2000 tokens need client
-0.3.0 or later; the market refuses older clients with `CLIENT_VERSION_TOO_OLD`.
+0.4.0 or later; the market refuses older clients with `CLIENT_VERSION_TOO_OLD`.
 
 ## Commands
 
