@@ -111,6 +111,7 @@ export function cleanLeftovers(dataDir) {
 // template_reports and resent unchanged first.
 export function createTemplates({
   api, state, orgs, logger, dataDir, zylosDir, revocations = null, emulatorOrigin = null, fetchImpl, now = Date.now, sleep, signal = null,
+  starter = null,
 }) {
   const iso = () => new Date(now()).toISOString();
   const adoptions = () => state.read('adoptions', {});
@@ -375,8 +376,12 @@ export function createTemplates({
     // A stale answer means the market did not take this write (revoked, blocked or timed out meanwhile), also when the
     // adoption stays active on its previous version: what landed is never kept.
     const stale = wrote && res.outcome === 'stale';
+    const closedFailed = wrote && res.status === 'failed';
     if (stale) revoke(r.adoption_id, 'market did not accept the write (stale)');
-    else if (wrote && res.status === 'failed' && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
+    else if (closedFailed && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
+    else if (wrote && !closedFailed && r.starter_adopted_by) starter?.enqueue({
+      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, content: r.starter_content ?? null,
+    });
     state.update('template_reports', {}, (d) => { delete d[requestId]; });
     setIntent(r.intent_id, null);
     // The report is already settled; a failed pull only delays the sweep to the next round.
@@ -429,7 +434,11 @@ export function createTemplates({
         const base = { request_id: requestId, intent_id: it.id, kind: it.op === 'write_template' ? 'write' : 'uninstall' };
         const body = it.op === 'write_template' ? await write(it, base, queue) : remove(it, base);
         if (typeof body === 'string') return body;
-        state.update('template_reports', {}, (d) => { d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body }; });
+        const starterOf = it.op === 'write_template' && it.starter_message === true && it.adopted_by_member_id && body.status === 'succeeded'
+          ? { starter_adopted_by: it.adopted_by_member_id, starter_content: it.starter_content ?? null } : {};
+        state.update('template_reports', {}, (d) => {
+          d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body, ...starterOf };
+        });
         return send(requestId);
       }
       return null;

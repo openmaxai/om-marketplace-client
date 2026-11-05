@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Added
+- Starter message: after the market accepts the first write of an adopted
+  expert template whose order carries `starter_message`, the client claims the
+  message (`:claim-starter`), filters and renders the template's first guide
+  and starter tasks as plain text, checks that the DM is exactly this Agent and
+  the adopter, sends it once through the openmax component's IM and records the
+  result (`:mark-starter-shown`). A credential request in the content is never
+  sent (`rejected_content`). A send is never retried; only the mark is.
+- The starter message content is read from `starter_content` on the write
+  order; without it the message is not claimed. The message is kept within
+  16384 UTF-8 bytes (fallback text 8192): a first guide that does not fit is
+  cut with `…（完整内容见 Agent 详情）`, and a message that still does not fit
+  is not claimed.
+- The starter message is held back while the openmax activity store shows a
+  run in that DM (open, or closed by a reply within 10 minutes), checked every
+  30 seconds for up to 8 minutes after the claim; then it is reported as
+  `send_failed` without a send. A send with an unknown outcome is not reported.
+  While waiting only ids, the content and its sha256 from the claim are kept;
+  the message is rendered again through the whole pipeline before the send,
+  and is not sent (`send_failed`) when the content changed or a step fails.
+- Links are removed after any length cut, so a cut cannot re-create an address
+  or split `[链接已移除]`; Unicode-form domains are removed too.
+- Credential rules: spaced-out single letters are joined from three letters on
+  ("c a t"), as in the market.
+- `starter_message.enabled` in `config.json` turns the starter message off on
+  this Agent.
+
+### Upgrade Notes
+
+No action needed. Starter messages are sent only for templates adopted after
+the upgrade, and only on an Agent with the openmax component.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

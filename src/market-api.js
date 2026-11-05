@@ -7,6 +7,8 @@ export const REVOCATION_KINDS = new Set(['version_revoke', 'template_revoke', 's
 export const MAX_INTENT_LIMIT = 100;
 const INSTALL_STATES = new Set(['installing', 'installed', 'failed']);
 const RECONCILE_OUTCOMES = new Set(['recorded', 'skipped']);
+export const STARTER_CLAIM_RESULTS = new Set(['claimed', 'already_claimed', 'already_shown', 'disabled', 'adopter_inactive']);
+export const STARTER_RESULTS = new Set(['sent', 'rejected_content', 'send_failed']);
 // <revocation log epoch (canonical UUID)>:<seq as int64 decimal without leading zeros>, as the server writes it.
 const CURSOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:(0|[1-9]\d{0,18})$/;
 const INT64_MAX = 2n ** 63n - 1n;
@@ -27,6 +29,7 @@ const time = (v, p) => (typeof v === 'string' && RFC3339_RE.test(v) && !Number.i
 export const isRevocationCursor = (v) => typeof v === 'string' && CURSOR_RE.test(v) && BigInt(v.slice(37)) <= INT64_MAX;
 const cursor = (v, p) => (isRevocationCursor(v) ? v : fail(p, 'must be an <epoch>:<seq> cursor'));
 const orgId = (v, p) => (isOrgOrMemberId(v) ? v : fail(p, 'must be an org id'));
+const memberId = (v, p) => (isOrgOrMemberId(v) ? v : fail(p, 'must be a member id'));
 const oneOf = (set) => (v, p) => (set.has(v) ? v : fail(p, 'has an unknown value'));
 const text = (max) => (v, p) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : fail(p, 'must be a non-empty string'));
 const slug = (v, p) => (typeof v === 'string' && validSlug(v) ? v : fail(p, 'must be a skill slug'));
@@ -39,6 +42,21 @@ function pick(src, p, spec) {
   return out;
 }
 
+const runes = (v) => [...v].length;
+const textUpTo = (v, max) => typeof v === 'string' && runes(v) <= max;
+
+// starter_content of a write_template order ({template_name, first_guide, starter_tasks: [{title, prompt}]}) at the
+// market's manifest limits; null when absent or not in that shape, so the starter message is not claimed.
+export function parseStarterContent(v) {
+  if (!isObject(v) || !textUpTo(v.template_name, 100) || !(v.first_guide == null || textUpTo(v.first_guide, 20000))) return null;
+  const tasks = v.starter_tasks ?? [];
+  if (!Array.isArray(tasks) || tasks.length > 10) return null;
+  if (!tasks.every((x) => isObject(x) && textUpTo(x.title, 40) && textUpTo(x.prompt, 1000))) return null;
+  return {
+    templateName: v.template_name, firstGuide: v.first_guide ?? '', starterTasks: tasks.map((x) => ({ title: x.title, prompt: x.prompt })),
+  };
+}
+
 function parseIntent(raw, p) {
   const it = pick(object(raw, p), p, {
     id: uuid, org_id: orgId, op: oneOf(INTENT_OPS),
@@ -49,6 +67,10 @@ function parseIntent(raw, p) {
   if (it.op === 'write_template') {
     it.bundle_sha256 = sha(raw.bundle_sha256, `${p}.bundle_sha256`);
     if (!it.template_id || !it.adoption_id) fail(p, 'write_template needs template_id and adoption_id');
+    // Absent from markets without the starter message.
+    it.starter_message = raw.starter_message == null ? false : bool(raw.starter_message, `${p}.starter_message`);
+    it.adopted_by_member_id = nullable(memberId)(raw.adopted_by_member_id, `${p}.adopted_by_member_id`);
+    it.starter_content = parseStarterContent(raw.starter_content);
   } else {
     if (raw.bundle_sha256 != null) fail(`${p}.bundle_sha256`, `must be absent for ${it.op}`);
     if (!it.skill_id && !(it.template_id && it.adoption_id)) fail(p, 'needs skill_id or template_id and adoption_id');
@@ -201,6 +223,34 @@ export function createMarketApi({ http }) {
         const out = pick(object(data, 'body'), 'body', { adoption_id: uuid, status: text(64), outcome: oneOf(new Set(['applied', 'stale'])) });
         if (out.adoption_id !== adoptionId) fail('body.adoption_id', 'does not match the request');
         out.error_code = typeof data.error_code === 'string' ? data.error_code : null;
+        return out;
+      });
+    },
+
+    // :claim-starter: claims the adoption's starter message; only result claimed allows sending it.
+    async claimStarter({ orgId, agentId, adoptionId }) {
+      if (!isOrgOrMemberId(agentId) || !isCanonicalUuid(adoptionId)) throw new TypeError('invalid agentId or adoptionId');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/adoptions/${adoptionId}:claim-starter`, {});
+      return validated('claim-starter', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const out = pick(object(data, 'body'), 'body', {
+          adoption_id: uuid, result: oneOf(STARTER_CLAIM_RESULTS), starter_state: text(32), claimed_at: nullable(time),
+        });
+        if (out.adoption_id !== adoptionId) fail('body.adoption_id', 'does not match the request');
+        return out;
+      });
+    },
+
+    // :mark-starter-shown: records how the starter message ended; the market keeps the first result.
+    async markStarterShown({ orgId, agentId, adoptionId, result }) {
+      if (!isOrgOrMemberId(agentId) || !isCanonicalUuid(adoptionId) || !STARTER_RESULTS.has(result)) throw new TypeError('invalid mark call');
+      const r = await http.request('POST', orgId, `/agents/${encodeURIComponent(agentId)}/adoptions/${adoptionId}:mark-starter-shown`, { result });
+      return validated('mark-starter-shown', r, (data) => {
+        if (r.status !== 200) fail('status', `${r.status} is not expected`);
+        const out = pick(object(data, 'body'), 'body', {
+          adoption_id: uuid, result: oneOf(STARTER_RESULTS), result_at: time, starter_tasks_shown_at: nullable(time),
+        });
+        if (out.adoption_id !== adoptionId) fail('body.adoption_id', 'does not match the request');
         return out;
       });
     },

@@ -119,3 +119,20 @@ test('rewriting the config keeps the extra orgs and drops a stale primary entry'
   writeConfig({ ...VALID_ENV, COCO_API_KEY: 'rotated' }, dataDir);
   assert.deepEqual(Object.keys(loadConfig(dataDir).orgs), [VALID_ENV.COCO_ORG_ID, 'org-2']);
 });
+
+test('starter_message.enabled is optional, boolean only', () => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV }, dataDir);
+  const file = path.join(dataDir, 'config.json');
+  const base = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const put = (extra) => fs.writeFileSync(file, JSON.stringify({ ...base, ...extra }), { mode: 0o600 });
+  assert.equal(loadConfig(dataDir).starter_message, undefined);
+  put({ starter_message: { enabled: false } });
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: false });
+  put({ starter_message: {} });
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: true });
+  for (const bad of [{ enabled: 'no' }, { enabled: true, other: 1 }, [], 'off']) {
+    put({ starter_message: bad });
+    assert.throws(() => loadConfig(dataDir), /starter_message/);
+  }
+});

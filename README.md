@@ -23,8 +23,9 @@ variables below first.
 The short name (`zylos add om-marketplace-client`) works once the component is
 listed in the Zylos component registry.
 
-New Workspace-native Agents get the client during provisioning; no action is
-needed for them.
+The client is installed automatically the first time the Agent's owner installs
+a skill or hires an expert template from Agent Market. It can also be installed
+manually with `zylos add openmaxai/om-marketplace-client`.
 
 ### Steps
 
@@ -109,6 +110,7 @@ write into a directory that is accessible by group or other.
 | `orgs` | `{"<org_id>": {"member_id": "<id>"}}`: further orgs whose orders this Agent executes. Post-install adds the other enabled orgs of the openmax component config when the primary org is one of them. `member_id` may be left out; it is then read from the org-scoped token. Orders from an org not listed are not executed and are reported as `org_not_configured`. Edit by hand, then restart the service; post-install keeps the map. |
 | `log_level` | `debug`, `info` (default), `warn` or `error`. |
 | `storage_emulator_origin` | Development only; accepted only with a loopback `bff_url`. |
+| `starter_message` | `{"enabled": false}` stops this Agent from sending starter messages (default: enabled). Restart the service after changing it. |
 
 ## Commands
 
@@ -184,6 +186,87 @@ file hashes are never sent.
   names of skills used for another org. This is accepted product behaviour.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
+
+## Starter message
+
+After the market accepted the first write of an adopted expert template whose
+order carries `starter_message`, the client sends the adopter one plain-text
+welcome message from this Agent's own OpenMax IM account. The template text
+never reaches the model.
+
+1. The client claims the message with the market (`:claim-starter`). Anything
+   but `claimed` (`already_claimed`, `already_shown`, `disabled`,
+   `adopter_inactive`) ends it; nothing is sent.
+2. The template name, first guide and up to 3 starter tasks are filtered and
+   rendered locally: links, markdown links and images, `www.` hosts, bare
+   domains (full-width periods included), IP addresses are replaced by
+   `[链接已移除]`; `@` becomes `＠`; zero-width, bidi and other control
+   characters are removed; one-line fields lose their line breaks; lengths are
+   cut (name 40, guide 2000, title 40, prompt 500). Every line of author text
+   starts with `｜ ` and the message ends with the fixed line
+   `（以上为模板作者提供的内容）`.
+3. If any field asks for a credential (the market's rule table; negation is
+   not recognised, so warnings such as "never share your password" are refused
+   too), nothing is sent and the result is `rejected_content`.
+4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
+   `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
+   this Agent and the adopter; otherwise nothing is sent (`send_failed`).
+5. The send waits while a message into that DM would be taken as a run's
+   reply: the client asks the openmax component's own activity store and run
+   selection (`src/lib/activity/run-store.js`, `reply.js` `selectRun`, the code
+   `comm.send` uses), so an open run, or a run closed by a reply within the
+   last 10 minutes, holds the message back. It is checked every 30 seconds; 8
+   minutes after the claim it is given up as `send_failed` with no send made.
+   An openmax release with `noRun` on `comm.send` (from the version set in
+   `OPENMAX_NORUN_MIN_VERSION`, not released yet) skips the wait and sends with
+   `noRun: true`.
+   While waiting, the client keeps only ids, the `starter_content` and its
+   sha256 (canonical JSON, recorded at the claim); never the rendered text or
+   the adopter's name. Right before the send it checks the DM again and renders
+   the message again through the whole pipeline (filter, size fit, credential
+   check including the adopter's name, byte limit). A changed content hash, a
+   changed DM or any failing step means no send and `send_failed`.
+6. One `comm.send`, plain text, no mentions, never retried. A refused send is
+   `send_failed`. A send whose outcome is unknown (timeout, server error) is
+   not reported at all, so it is not counted as failed.
+7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
+
+The content is the `starter_content` the market puts on the write order
+(`{template_name, first_guide, starter_tasks}`). Without it, without the
+openmax component, or when the message does not fit the IM limits, the message
+is not claimed; the workbench shows the starter tasks as a card instead. A
+message interrupted while sending is not sent again.
+
+The workbench shows the card when the market has no result 10 minutes after the
+claim, or the result is `send_failed`. So the adopter may see both the message
+and the card when a send's outcome was unknown, or when the client stopped
+between a successful send and recording the stage after it. A claim answer the
+client cannot read (for example a new `result` value) ends the job without a
+send; the card covers it.
+
+Size limits (`src/starter/limits.js`, UTF-8 bytes): the message body at most
+16384, any fallback text at most 8192; the IM service refuses a larger message
+rather than cutting it. Both are checked before the claim, with room for the
+longest adopter name. When the message is too large, the first guide is cut at
+a character boundary and ends with `…（完整内容见 Agent 详情）`; when it still
+does not fit, nothing is claimed. The message never carries the reserved
+metadata keys `agent_run` and `cap_notice`.
+
+The credential rules mirror the market's `internal/domain/credentialask.go`.
+`test/fixtures/credential_requests.tsv` is a byte-for-byte copy of the market's
+`internal/domain/testdata/credential_requests.tsv`; its sha256 is pinned in
+`test/starter-credential.test.js`. To sync, copy the file, update the pin and
+the rules together, and run
+`MARKET_REPO=<cws-marketplace clone> npm test` to compare with the market
+directly. CI cannot reach the market repository, so run this before every
+release. With `OPENMAX_DIR=<zylos-openmax checkout>` the run check is also
+tested against the real openmax run selection.
+
+Release checklist:
+- `MARKET_REPO=<cws-marketplace clone> npm test` before every release.
+- `OPENMAX_DIR=<zylos-openmax checkout at that version> node --test test/starter-im.test.js`
+  against each new openmax version, since the run check loads openmax's own
+  activity modules.
 
 ## Operational notes
 
