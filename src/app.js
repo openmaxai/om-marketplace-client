@@ -13,7 +13,7 @@ import { createIntentPuller } from './intents.js';
 import { createRevocationPuller } from './revocations.js';
 import { createSkills } from './skills.js';
 import { createTemplates } from './templates.js';
-import { createStarter } from './starter.js';
+import { STARTER_CHECK_MS, createStarter } from './starter.js';
 import { createOpenmaxIm } from './starter/im.js';
 import { createReconciler } from './reconcile.js';
 import { createLocalSkillReporter } from './localscan.js';
@@ -58,7 +58,9 @@ export function pollRound(logger, { revocations, intents, skills, templates, sta
 // CLI requests waiting in `commands` run first, one at a time; a sync request is answered when the round ends.
 export function buildTasks(logger, runtime = {}, commands = null) {
   const round = pollRound(logger, runtime);
+  const starterTask = runtime.starter ? [{ name: 'starter', baseMs: STARTER_CHECK_MS, run: () => runtime.starter.runWaiting() }] : [];
   return [
+    ...starterTask,
     {
       name: 'poll',
       baseMs: POLL_INTERVAL_MS,

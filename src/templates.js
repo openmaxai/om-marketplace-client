@@ -379,7 +379,9 @@ export function createTemplates({
     const closedFailed = wrote && res.status === 'failed';
     if (stale) revoke(r.adoption_id, 'market did not accept the write (stale)');
     else if (closedFailed && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
-    else if (wrote && !closedFailed && r.starter_adopted_by) starter?.enqueue({ orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by });
+    else if (wrote && !closedFailed && r.starter_adopted_by) starter?.enqueue({
+      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, content: r.starter_content ?? null,
+    });
     state.update('template_reports', {}, (d) => { delete d[requestId]; });
     setIntent(r.intent_id, null);
     // The report is already settled; a failed pull only delays the sweep to the next round.
@@ -433,7 +435,7 @@ export function createTemplates({
         const body = it.op === 'write_template' ? await write(it, base, queue) : remove(it, base);
         if (typeof body === 'string') return body;
         const starterOf = it.op === 'write_template' && it.starter_message === true && it.adopted_by_member_id && body.status === 'succeeded'
-          ? { starter_adopted_by: it.adopted_by_member_id } : {};
+          ? { starter_adopted_by: it.adopted_by_member_id, starter_content: it.starter_content ?? null } : {};
         state.update('template_reports', {}, (d) => {
           d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body, ...starterOf };
         });

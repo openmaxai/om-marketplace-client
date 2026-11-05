@@ -1,8 +1,12 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { RESERVED_METADATA_KEYS } from './limits.js';
 
 export const IM_TIMEOUT_MS = 30_000;
+// First openmax release whose comm.send takes noRun; null until it is released.
+export const OPENMAX_NORUN_MIN_VERSION = null;
 const MAX_OUTPUT = 1024 * 1024;
 
 export class ImError extends Error {
@@ -15,7 +19,18 @@ export class ImError extends Error {
   }
 }
 
-export const openmaxCommCli = (zylosDir) => path.join(zylosDir, '.claude', 'skills', 'openmax', 'src', 'cli', 'comm.js');
+export const openmaxDir = (zylosDir) => path.join(zylosDir, '.claude', 'skills', 'openmax');
+export const openmaxCommCli = (zylosDir) => path.join(openmaxDir(zylosDir), 'src', 'cli', 'comm.js');
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)/;
+// True when version a is at least b (major.minor.patch; anything unparsable is false).
+export function versionAtLeast(a, b) {
+  const x = SEMVER.exec(String(a ?? ''));
+  const y = SEMVER.exec(String(b ?? ''));
+  if (!x || !y) return false;
+  for (let i = 1; i <= 3; i++) if (Number(x[i]) !== Number(y[i])) return Number(x[i]) > Number(y[i]);
+  return true;
+}
 
 const unwrap = (v) => (v && typeof v === 'object' && !Array.isArray(v) && 'data' in v ? v.data : v);
 
@@ -27,9 +42,25 @@ function errorOf(err, stderr) {
   return new ImError(why, { status, definite });
 }
 
+// Refuses a send body that carries a metadata key the IM service reserves.
+export function assertNoReservedMetadata(body) {
+  const meta = body?.metadata;
+  const bad = RESERVED_METADATA_KEYS.filter((k) => (meta && typeof meta === 'object' && Object.hasOwn(meta, k)) || Object.hasOwn(body ?? {}, k));
+  if (bad.length) throw new ImError(`reserved metadata key ${bad.join(', ')}`, { definite: true });
+}
+
+export function sendParams({ orgId, conversationId, text, clientMsgId, noRun = false }) {
+  const body = { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text }, attachments: [] } };
+  assertNoReservedMetadata(body);
+  return { org: orgId, conversationId, clientMsgId, body, ...(noRun ? { noRun: true } : {}) };
+}
+
 // The Agent's own OpenMax IM through the openmax component CLI, one process per call; every call names the org.
-export function createOpenmaxIm({ zylosDir, timeoutMs = IM_TIMEOUT_MS, run = execFile }) {
+export function createOpenmaxIm({
+  zylosDir, timeoutMs = IM_TIMEOUT_MS, run = execFile, noRunMinVersion = OPENMAX_NORUN_MIN_VERSION, now = Date.now,
+}) {
   const cli = openmaxCommCli(zylosDir);
+  const activity = path.join(openmaxDir(zylosDir), 'src', 'lib', 'activity');
   const call = (command, params) => new Promise((resolve, reject) => {
     run(process.execPath, [cli, command, JSON.stringify(params)], {
       cwd: path.dirname(path.dirname(path.dirname(cli))), timeout: timeoutMs, maxBuffer: MAX_OUTPUT, windowsHide: true,
@@ -56,12 +87,26 @@ export function createOpenmaxIm({ zylosDir, timeoutMs = IM_TIMEOUT_MS, run = exe
       if (!list) throw new ImError('member_list returned no list');
       return list;
     },
+    // True when the installed openmax is at least noRunMinVersion.
+    supportsNoRun() {
+      if (!noRunMinVersion) return false;
+      try {
+        return versionAtLeast(JSON.parse(fs.readFileSync(path.join(openmaxDir(zylosDir), 'package.json'), 'utf8')).version, noRunMinVersion);
+      } catch { return false; }
+    },
+    // True when comm.send into the conversation would be taken as a run's reply: the run comm.send would select, read
+    // from openmax's own activity store with its own selection code.
+    async runInProgress({ conversationId }) {
+      const { createRunStore } = await import(pathToFileURL(path.join(activity, 'run-store.js')).href);
+      const { selectRun } = await import(pathToFileURL(path.join(activity, 'reply.js')).href);
+      const store = createRunStore();
+      const active = store.readActive();
+      if (!active) return false;
+      return Boolean(selectRun({ store, active, convId: conversationId, now: now() }).run);
+    },
     // Plain text, no mentions: the message body is passed whole so the CLI resolves no @name.
-    async sendText({ orgId, conversationId, text, clientMsgId }) {
-      return call('comm.send', {
-        org: orgId, conversationId, clientMsgId,
-        body: { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text }, attachments: [] } },
-      });
+    async sendText({ orgId, conversationId, text, clientMsgId, noRun = false }) {
+      return call('comm.send', sendParams({ orgId, conversationId, text, clientMsgId, noRun }));
     },
   };
 }

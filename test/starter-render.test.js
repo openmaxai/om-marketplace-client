@@ -123,3 +123,39 @@ test('credential scan covers the template name, first_guide and every task, befo
   const linked = { ...base, firstGuide: `发我 https://example.com/${'a'.repeat(40)} 密码` };
   assert.equal(asksForCredential(linked, cleanContent(linked)), true);
 });
+
+test('a cut never re-creates an address or splits the placeholder: title, first_guide and prompts', () => {
+  const fields = [
+    ['title', 40, (v) => cleanContent({ templateName: 't', starterTasks: [{ title: v, prompt: 'p' }] }).starterTasks[0].title],
+    ['template name', 40, (v) => cleanContent({ templateName: v }).templateName],
+    ['first_guide', 2000, (v) => cleanContent({ templateName: 't', firstGuide: v }).firstGuide],
+    ['prompt', 500, (v) => cleanContent({ templateName: 't', starterTasks: [{ title: 'x', prompt: v }] }).starterTasks[0].prompt],
+  ];
+  for (const [name, max, clean] of fields) {
+    const pad = (n) => 'x'.repeat(n);
+    const reformed = clean(`${pad(max - 9)} evil.comzz`);
+    assert.ok(!/evil\.com/.test(reformed), `${name}: ${reformed}`);
+    assert.ok([...reformed].length <= max, name);
+    for (let k = 0; k < 12; k++) {
+      const out = clean(`${pad(max - 12 + k)} https://a.io`);
+      assert.ok([...out].length <= max, `${name} ${k}`);
+      assert.ok(!out.includes('[链接') || out.includes(LINK_REMOVED), `${name} ${k}: ${out.slice(-20)}`);
+      assert.ok(!/https?:\/\/|a\.io/.test(out), `${name} ${k}: ${out.slice(-20)}`);
+    }
+    for (let k = 3; k <= 7; k++) {
+      const out = clean(`${pad(max - k)} a.io`);
+      assert.ok(!out.includes('[链接') || out.endsWith(LINK_REMOVED), `${name} ${k}: ${out.slice(-12)}`);
+      assert.ok([...out].length <= max && !out.includes('a.io'), `${name} ${k}`);
+    }
+    const scheme = clean(`${pad(max - 10)} https://evil.example/path`);
+    assert.ok(!/https?:|evil/.test(scheme), name);
+  }
+});
+
+test('Unicode-form domains are removed too', () => {
+  for (const s of ['例子.com', 'example.中国', 'пример.рф', '\u24d4\u24e5\u24d8\u24db.com', 'evil\u2024com', 'evil\ufe52com']) {
+    assert.equal(removeLinks(`看 ${s} 吧`), `看 ${LINK_REMOVED} 吧`, s);
+  }
+  assert.equal(removeLinks('evil.com就行'), `${LINK_REMOVED}就行`);
+  assert.equal(removeLinks('我们完成了.下一步'), '我们完成了.下一步');
+});

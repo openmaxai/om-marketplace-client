@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the adopter, sends it once through the openmax component's IM and records the
   result (`:mark-starter-shown`). A credential request in the content is never
   sent (`rejected_content`). A send is never retried; only the mark is.
+- The starter message content is read from `starter_content` on the write
+  order; without it the message is not claimed. The message is kept within
+  16384 UTF-8 bytes (fallback text 8192): a first guide that does not fit is
+  cut with `…（完整内容见 Agent 详情）`, and a message that still does not fit
+  is not claimed.
+- The starter message is held back while the openmax activity store shows a
+  run in that DM (open, or closed by a reply within 10 minutes), checked every
+  30 seconds for up to 8 minutes after the claim; then it is reported as
+  `send_failed` without a send. A send with an unknown outcome is not reported.
+- Links are removed after any length cut, so a cut cannot re-create an address
+  or split `[链接已移除]`; Unicode-form domains are removed too.
 - `starter_message.enabled` in `config.json` turns the starter message off on
   this Agent.
 

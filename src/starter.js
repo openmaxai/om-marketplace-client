@@ -1,18 +1,27 @@
 import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, uuidv7 } from './ids.js';
 import { ImError } from './starter/im.js';
-import { LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, renderStarter } from './starter/render.js';
+import { LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, hasContent, renderStarter } from './starter/render.js';
+import { withinLimits } from './starter/limits.js';
 
 const RETRY_LATER = new Set(['CLIENT_VERSION_TOO_OLD', 'MEMBER_LEFT_ORG']);
 export const MAX_STARTER_JOBS = 100;
 
+// After a claim the message waits while the openmax activity store says a send into the DM would be a run's reply
+// (an open run, or one closed by a reply within the last 10 minutes), checked every STARTER_CHECK_MS; STARTER_WAIT_MS
+// after the claim it is given up as send_failed without any send. An openmax that supports noRun skips the wait.
+export const STARTER_CHECK_MS = 30 * 1000;
+export const STARTER_WAIT_MS = 8 * 60 * 1000;
+
 // The starter message of an adoption, sent at most once from the Agent's own IM account: claim it with the market,
 // filter and render the content locally, check that the DM is exactly this Agent and the adopter, send it once, then
-// mark the result. Jobs live in state document `starters`, keyed by adoption id, with stage claim -> sending -> mark.
-// A job found in stage sending was interrupted mid-send and is dropped: nothing is sent again and nothing is marked.
-// content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available.
+// mark the result. Jobs live in state document `starters`, keyed by adoption id, with stage
+// claim -> checking -> waiting -> sending -> mark. After a restart a checking job is marked send_failed (nothing was
+// sent), a waiting job keeps waiting, and a sending job is dropped unmarked (delivery unknown, never sent again).
+// content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available;
+// by default it is the starter_content the market put on the write order.
 export function createStarter({
-  api, state, orgs, logger, im, content = async () => null, enabled = true, now = Date.now,
+  api, state, orgs, logger, im, content = async (job) => job.content ?? null, enabled = true, now = Date.now, limits = {},
 }) {
   const iso = () => new Date(now()).toISOString();
   const jobs = () => state.read('starters', {});
@@ -71,9 +80,14 @@ export function createStarter({
       logger.warn(`${tag(job)} not sent: content unavailable (${err.message})`);
       return drop(id);
     }
-    const clean = raw && cleanContent({ ...raw, addressee: '' });
-    if (!clean || !hasContent(clean)) {
+    const filtered = raw && cleanContent({ ...raw, addressee: '' });
+    if (!filtered || !hasContent(filtered)) {
       logger.info(`${tag(job)} not sent: no content`);
+      return drop(id);
+    }
+    const clean = fitContent(filtered, limits);
+    if (!clean) {
+      logger.warn(`${tag(job)} not sent: the message does not fit the IM size limit`);
       return drop(id);
     }
     const self = await orgs.agentId(job.org_id);
@@ -88,7 +102,7 @@ export function createStarter({
       logger.info(`${tag(job)} not sent: claim answered ${claim.result}`);
       return drop(id);
     }
-    put(id, { stage: 'sending', claimed_at: claim.claimed_at });
+    put(id, { stage: 'checking', claimed_at: claim.claimed_at, claimed_local_at: now() });
     if (asksForCredential(raw, clean)) {
       logger.warn(`${tag(job)} not sent: it asks for a credential`);
       return finish(job, 'rejected_content');
@@ -107,25 +121,95 @@ export function createStarter({
     }
     const addressee = cleanText(cleanDisplayName(dm.adopter?.display_name), { max: LIMITS.addressee, multiline: false });
     const text = renderStarter({ ...clean, addressee });
-    try {
-      await im.sendText({ orgId: job.org_id, conversationId: dm.conversationId, text, clientMsgId: `cmsg_${uuidv7(now())}` });
-    } catch (err) {
-      const known = err instanceof ImError && err.definite;
-      logger.warn(`${tag(job)}: send failed (${err.message})${known ? '' : '; delivery unknown'}; not retried`);
+    if (!withinLimits({ text }, limits)) {
+      logger.error(`${tag(job)} not sent: the message does not fit the IM size limit`);
       return finish(job, 'send_failed');
+    }
+    put(id, { stage: 'waiting', conversation_id: dm.conversationId, text });
+    return sendWhenFree(jobs()[id]);
+  }
+
+  // Sends once nothing in the DM would take the message as a run's reply; gives up after STARTER_WAIT_MS.
+  async function sendWhenFree(job) {
+    const noRun = im.supportsNoRun();
+    if (!noRun) {
+      let busy;
+      try {
+        busy = await im.runInProgress({ conversationId: job.conversation_id });
+      } catch (err) {
+        logger.warn(`${tag(job)}: run state unreadable (${err.message})`);
+        busy = true;
+      }
+      if (busy) {
+        if (now() - job.claimed_local_at < STARTER_WAIT_MS) return undefined;
+        logger.warn(`${tag(job)} not sent: the DM still had an active run ${STARTER_WAIT_MS / 60000} minutes after the claim`);
+        return finish(job, 'send_failed');
+      }
+    }
+    put(job.adoption_id, { stage: 'sending' });
+    try {
+      await im.sendText({ orgId: job.org_id, conversationId: job.conversation_id, text: job.text, clientMsgId: `cmsg_${uuidv7(now())}`, noRun });
+    } catch (err) {
+      if (err instanceof ImError && err.definite) {
+        logger.warn(`${tag(job)}: send refused (${err.message}); not retried`);
+        return finish(job, 'send_failed');
+      }
+      logger.warn(`${tag(job)}: send outcome unknown (${err.message}); not retried and not reported`);
+      return drop(job.adoption_id);
     }
     logger.info(`${tag(job)} sent`);
     return finish(job, 'sent');
   }
 
+  async function step(job) {
+    if (job.stage === 'mark') return mark(job);
+    if (job.stage === 'waiting') return sendWhenFree(job);
+    return claimAndSend(job);
+  }
+
+  // One run at a time, so the poll round and the wait checks never work on a job together.
+  let chain = Promise.resolve();
+  const serial = (fn) => {
+    const p = chain.then(fn);
+    chain = p.catch(() => {});
+    return p;
+  };
+
+  async function runJobs(onlyWaiting) {
+    for (const job of Object.values(jobs())) {
+      if (onlyWaiting && job.stage !== 'waiting') continue;
+      if (job.stage === 'sending') {
+        logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
+        drop(job.adoption_id);
+        continue;
+      }
+      if (job.stage === 'checking') {
+        logger.warn(`${tag(job)} was interrupted before sending; reported as send_failed`);
+        await finish(job, 'send_failed');
+        continue;
+      }
+      if (!orgs.mayContact(job.org_id)) continue;
+      try {
+        await step(job);
+      } catch (err) {
+        logger.error(`${tag(job)}: ${err.message}`);
+        const cur = jobs()[job.adoption_id];
+        if (cur?.stage === 'sending') drop(job.adoption_id);
+        else if (cur?.stage === 'checking') await finish(cur, 'send_failed');
+      }
+    }
+  }
+
   return {
     // Queues the starter message of an adoption whose first write the market accepted; a known adoption is not queued again.
-    enqueue({ orgId, adoptionId, adoptedBy }) {
+    enqueue({ orgId, adoptionId, adoptedBy, content = null }) {
       if (!isOrgOrMemberId(orgId) || !isCanonicalUuid(adoptionId) || !isOrgOrMemberId(adoptedBy)) return false;
       let added = false;
       state.update('starters', {}, (d) => {
         if (d[adoptionId] || Object.keys(d).length >= MAX_STARTER_JOBS) return;
-        d[adoptionId] = { org_id: orgId, adoption_id: adoptionId, adopted_by_member_id: adoptedBy, stage: 'claim', created_at: iso(), updated_at: iso() };
+        d[adoptionId] = {
+          org_id: orgId, adoption_id: adoptionId, adopted_by_member_id: adoptedBy, content, stage: 'claim', created_at: iso(), updated_at: iso(),
+        };
         added = true;
       });
       if (!added) logger.warn(`starter message of adoption ${adoptionId} not queued`);
@@ -133,22 +217,9 @@ export function createStarter({
     },
 
     // Runs every queued job once.
-    async runAll() {
-      for (const job of Object.values(jobs())) {
-        if (job.stage === 'sending') {
-          logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
-          drop(job.adoption_id);
-          continue;
-        }
-        if (!orgs.mayContact(job.org_id)) continue;
-        try {
-          if (job.stage === 'mark') await mark(job);
-          else await claimAndSend(job);
-        } catch (err) {
-          logger.error(`${tag(job)}: ${err.message}`);
-          if (jobs()[job.adoption_id]?.stage === 'sending') drop(job.adoption_id);
-        }
-      }
-    },
+    runAll: () => serial(() => runJobs(false)),
+
+    // Checks the jobs waiting for the DM to be free.
+    runWaiting: () => serial(() => runJobs(true)),
   };
 }

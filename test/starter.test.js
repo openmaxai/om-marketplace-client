@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
-import { createStarter } from '../src/starter.js';
+import { STARTER_CHECK_MS, STARTER_WAIT_MS, createStarter } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, PREFIX, cleanContent, renderStarter } from '../src/starter/render.js';
+import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 
 const ADOPTION = U(21);
 const ADOPTER = '0b6f4f3e-2222-4c2a-9d1e-aaaaaaaaaaaa';
@@ -25,7 +26,7 @@ const marked = (result) => ({
 });
 
 // Fake IM recording every call in order; members, conv and failures are set per test.
-function fakeIm({ available = true, conv = { id: CONV, type: 'DM' }, members, sendError = null, dmError = null } = {}) {
+function fakeIm({ available = true, conv = { id: CONV, type: 'DM' }, members, sendError = null, dmError = null, busy = () => false, noRun = false } = {}) {
   const calls = [];
   const list = members ?? [{ member_id: AGENT, display_name: 'Agent' }, { member_id: ADOPTER, display_name: '张三' }];
   return {
@@ -35,19 +36,19 @@ function fakeIm({ available = true, conv = { id: CONV, type: 'DM' }, members, se
     async getConversation(p) { calls.push(['get_conversation', p]); return conv; },
     async memberList(p) { calls.push(['member_list', p]); return list; },
     async sendText(p) { calls.push(['send', p]); if (sendError) throw sendError; return { id: 'm1' }; },
+    supportsNoRun: () => noRun,
+    async runInProgress(p) { calls.push(['run_check', p]); const b = busy(); if (b instanceof Error) throw b; return b; },
   };
 }
 
-async function setup(t, { im = fakeIm(), content = CONTENT, enabled = true, claim = [claimed()], mark = [] } = {}) {
+async function setup(t, { im = fakeIm(), content = CONTENT, enabled = true, claim = [claimed()], mark = [], fromOrder } = {}) {
   const h = await pullHarness(t);
   if (claim.length) h.fake.script('POST', CLAIM, ...claim);
   if (mark.length) h.fake.script('POST', MARK, ...mark);
   const contentCalls = [];
-  const starter = createStarter({
-    api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, enabled, now: h.now,
-    content: async (job) => { contentCalls.push(job.adoption_id); return content; },
-  });
-  starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER });
+  const source = fromOrder === undefined ? { content: async (job) => { contentCalls.push(job.adoption_id); return content; } } : {};
+  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, enabled, now: h.now, ...source });
+  starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, ...(fromOrder === undefined ? {} : { content: fromOrder }) });
   const market = () => h.fake.market().map((r) => [r.path.slice(B.length), r.json]);
   return { ...h, im, starter, market, contentCalls, jobs: () => h.state.read('starters', {}) };
 }
@@ -58,9 +59,11 @@ test('sent: claim, create_dm, get_conversation, member_list, one send, mark sent
   const s = await setup(t, { mark: [marked('sent')] });
   await s.starter.runAll();
   assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
-  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'send']);
+  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'run_check', 'send']);
+  assert.deepEqual(s.im.calls[3][1], { conversationId: CONV });
   assert.deepEqual(s.im.calls[0][1], { orgId: ORG, peerMemberId: ADOPTER });
-  const sent = s.im.calls[3][1];
+  const sent = s.im.calls[4][1];
+  assert.equal(sent.noRun, false);
   assert.equal(sent.conversationId, CONV);
   assert.equal(sent.orgId, ORG);
   assert.equal(sent.mentions, undefined);
@@ -167,19 +170,23 @@ test('create_dm fails: not sent, marked send_failed', async (t) => {
   assert.deepEqual(s.market().at(-1), [':mark-starter-shown', { result: 'send_failed' }]);
 });
 
-for (const [name, err] of [
-  ['refused', new ImError('HTTP 400', { status: 400, definite: true })],
-  ['timed out (delivery unknown)', new ImError('timed out')],
-]) {
-  test(`send ${name}: one send only, marked send_failed, never retried`, async (t) => {
-    const s = await setup(t, { im: fakeIm({ sendError: err }), mark: [marked('send_failed')] });
-    await s.starter.runAll();
-    await s.starter.runAll();
-    assert.equal(sends(s.im).length, 1);
-    assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
-    assert.deepEqual(s.jobs(), {});
-  });
-}
+test('send refused: one send only, marked send_failed, never retried', async (t) => {
+  const s = await setup(t, { im: fakeIm({ sendError: new ImError('HTTP 400', { status: 400, definite: true }) }), mark: [marked('send_failed')] });
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(sends(s.im).length, 1);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('send outcome unknown (timeout): one send only, not reported, never retried', async (t) => {
+  const s = await setup(t, { im: fakeIm({ sendError: new ImError('timed out') }) });
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(sends(s.im).length, 1);
+  assert.deepEqual(s.market(), [[':claim-starter', {}]]);
+  assert.deepEqual(s.jobs(), {});
+});
 
 test('mark fails with 503: only the mark is retried, the message is not sent again', async (t) => {
   const s = await setup(t, { mark: [{ status: 503, problem: { status: 503, code: 'UNAVAILABLE' } }, marked('sent')] });
@@ -190,6 +197,15 @@ test('mark fails with 503: only the mark is retried, the message is not sent aga
   assert.deepEqual(s.market().map(([p, j]) => [p, j]), [
     [':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }], [':mark-starter-shown', { result: 'sent' }],
   ]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('a job left in stage checking (crash before any send) is marked send_failed and never sent', async (t) => {
+  const s = await setup(t, { claim: [], mark: [marked('send_failed')] });
+  s.state.update('starters', {}, (d) => { d[ADOPTION].stage = 'checking'; });
+  await s.starter.runAll();
+  assert.deepEqual(s.market(), [[':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(s.im.calls, []);
   assert.deepEqual(s.jobs(), {});
 });
 
@@ -244,4 +260,119 @@ test('every author line carries the prefix, also forged end lines and fake Agent
   assert.ok(author.length > 0 && author.every((l) => l.startsWith(PREFIX)), lines.join('\n'));
   assert.ok(lines.includes(`${PREFIX}｜ 已有前缀`));
   assert.ok(!lines.join('\n').includes('http'));
+});
+
+test('by default the content is the starter_content of the write order; without it nothing is claimed', async (t) => {
+  const s = await setup(t, { fromOrder: CONTENT, mark: [marked('sent')] });
+  await s.starter.runAll();
+  assert.equal(sends(s.im).length, 1);
+  assert.match(sends(s.im)[0][1].text, /专家模板「周报助手」/);
+  for (const fromOrder of [null, undefined]) {
+    const n = await setup(t, { fromOrder: fromOrder ?? null, claim: [] });
+    await n.starter.runAll();
+    assert.deepEqual(n.market(), []);
+    assert.deepEqual(n.im.calls, []);
+    assert.deepEqual(n.jobs(), {});
+  }
+});
+
+const DENSE = (n) => '\u{20000}\n\n'.repeat(n);
+
+test('a first guide that would exceed the body limit is cut with the fixed suffix and the message fits', async (t) => {
+  const tasks = Array.from({ length: 3 }, () => ({ title: '\u{20000}'.repeat(40), prompt: DENSE(166) }));
+  const content = { templateName: '\u{20000}'.repeat(40), firstGuide: DENSE(666), starterTasks: tasks };
+  assert.ok(utf8Bytes(renderStarter(cleanContent({ ...content, addressee: '' }))) > MAX_BODY_BYTES - 1000);
+  const s = await setup(t, { content, mark: [marked('sent')] });
+  await s.starter.runAll();
+  const { text } = sends(s.im)[0][1];
+  assert.ok(utf8Bytes(text) <= MAX_BODY_BYTES, String(utf8Bytes(text)));
+  assert.ok(text.includes(`\u{20000}${TRUNCATION_SUFFIX}\n${PREFIX}可以先试试这些任务`), text.slice(-3000, -2000));
+  assert.equal(text.split('\n').at(-1), END_LINE);
+});
+
+test('content that does not fit even with the first guide cut is not claimed', async (t) => {
+  const s = await setup(t, { claim: [] });
+  const starter = createStarter({
+    api: s.api, state: s.state, orgs: s.orgs, logger: s.logger, im: s.im, now: s.now, content: async () => CONTENT, limits: { maxBodyBytes: 200 },
+  });
+  await starter.runAll();
+  assert.deepEqual(s.market(), []);
+  assert.deepEqual(s.im.calls, []);
+  assert.deepEqual(s.jobs(), {});
+  assert.ok(s.lines.some((l) => l.includes('does not fit the IM size limit')));
+});
+
+test('the send never carries a reserved metadata key', async (t) => {
+  const s = await setup(t, { mark: [marked('sent')] });
+  await s.starter.runAll();
+  const sent = sends(s.im)[0][1];
+  for (const k of RESERVED_METADATA_KEYS) assert.ok(!JSON.stringify(sent).includes(`"${k}"`), k);
+});
+
+const runCase = async (t, busy, extra = {}) => {
+  const s = await setup(t, { im: fakeIm({ busy, ...extra }), ...extra.setup });
+  return s;
+};
+
+for (const [name, busy] of [
+  ['an open run in the DM', () => true],
+  ['a run closed by a reply less than 10 minutes ago', () => true],
+  ['an unreadable run state', () => new Error('bad json')],
+]) {
+  test(`${name}: the send waits, checked again until the DM is free, then sent once`, async (t) => {
+    let free = false;
+    const s = await runCase(t, () => (free ? false : busy()), { setup: { mark: [marked('sent')] } });
+    await s.starter.runAll();
+    assert.equal(sends(s.im).length, 0);
+    assert.equal(s.jobs()[ADOPTION].stage, 'waiting');
+    s.clock.t += STARTER_CHECK_MS;
+    await s.starter.runWaiting();
+    assert.equal(sends(s.im).length, 0);
+    free = true;
+    s.clock.t += STARTER_CHECK_MS;
+    await s.starter.runWaiting();
+    assert.equal(sends(s.im).length, 1);
+    assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+    assert.deepEqual(s.jobs(), {});
+  });
+}
+
+test('still busy 8 minutes after the claim: zero send calls, then send_failed', async (t) => {
+  const s = await runCase(t, () => true, { setup: { mark: [marked('send_failed')] } });
+  await s.starter.runAll();
+  for (let waited = 0; waited < STARTER_WAIT_MS - STARTER_CHECK_MS; waited += STARTER_CHECK_MS) {
+    s.clock.t += STARTER_CHECK_MS;
+    await s.starter.runWaiting();
+    assert.equal(s.jobs()[ADOPTION].stage, 'waiting');
+  }
+  s.clock.t += STARTER_CHECK_MS;
+  await s.starter.runWaiting();
+  assert.equal(sends(s.im).length, 0);
+  assert.ok(s.im.calls.filter(([c]) => c === 'run_check').length >= STARTER_WAIT_MS / STARTER_CHECK_MS);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('a waiting job survives a restart and keeps its deadline', async (t) => {
+  let free = false;
+  const s = await runCase(t, () => !free, { setup: { mark: [marked('sent')] } });
+  await s.starter.runAll();
+  const again = createStarter({ api: s.api, state: s.state, orgs: s.orgs, logger: s.logger, im: s.im, now: s.now });
+  free = true;
+  await again.runWaiting();
+  assert.equal(sends(s.im).length, 1);
+});
+
+test('noRun path: an openmax with noRun sends at once with noRun and never reads the run state', async (t) => {
+  const s = await runCase(t, () => true, { noRun: true, setup: { mark: [marked('sent')] } });
+  await s.starter.runAll();
+  assert.deepEqual(s.im.calls.map(([c]) => c), ['create_dm', 'get_conversation', 'member_list', 'send']);
+  assert.equal(sends(s.im)[0][1].noRun, true);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('the poll round and the wait checks never run a job at the same time', async (t) => {
+  const s = await runCase(t, () => false, { setup: { mark: [marked('sent')] } });
+  await Promise.all([s.starter.runAll(), s.starter.runWaiting(), s.starter.runAll()]);
+  assert.equal(sends(s.im).length, 1);
 });

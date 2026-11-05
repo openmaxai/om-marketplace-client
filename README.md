@@ -210,13 +210,40 @@ never reaches the model.
 4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
    `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
    this Agent and the adopter; otherwise nothing is sent (`send_failed`).
-5. One `comm.send`, plain text, no mentions. It is never retried; a failure or
-   an unknown outcome is `send_failed`.
-6. The result is recorded with `:mark-starter-shown`; only the mark is retried.
+5. The send waits while a message into that DM would be taken as a run's
+   reply: the client asks the openmax component's own activity store and run
+   selection (`src/lib/activity/run-store.js`, `reply.js` `selectRun`, the code
+   `comm.send` uses), so an open run, or a run closed by a reply within the
+   last 10 minutes, holds the message back. It is checked every 30 seconds; 8
+   minutes after the claim it is given up as `send_failed` with no send made.
+   An openmax release with `noRun` on `comm.send` (from the version set in
+   `OPENMAX_NORUN_MIN_VERSION`, not released yet) skips the wait and sends with
+   `noRun: true`.
+6. One `comm.send`, plain text, no mentions, never retried. A refused send is
+   `send_failed`. A send whose outcome is unknown (timeout, server error) is
+   not reported at all, so it is not counted as failed.
+7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
 
-Without the openmax component, or when the content is not available, the
-message is not claimed; the workbench shows the starter tasks as a card
-instead. A message interrupted while sending is not sent again.
+The content is the `starter_content` the market puts on the write order
+(`{template_name, first_guide, starter_tasks}`). Without it, without the
+openmax component, or when the message does not fit the IM limits, the message
+is not claimed; the workbench shows the starter tasks as a card instead. A
+message interrupted while sending is not sent again.
+
+The workbench shows the card when the market has no result 10 minutes after the
+claim, or the result is `send_failed`. So the adopter may see both the message
+and the card when a send's outcome was unknown, or when the client stopped
+between a successful send and recording the stage after it. A claim answer the
+client cannot read (for example a new `result` value) ends the job without a
+send; the card covers it.
+
+Size limits (`src/starter/limits.js`, UTF-8 bytes): the message body at most
+16384, any fallback text at most 8192; the IM service refuses a larger message
+rather than cutting it. Both are checked before the claim, with room for the
+longest adopter name. When the message is too large, the first guide is cut at
+a character boundary and ends with `…（完整内容见 Agent 详情）`; when it still
+does not fit, nothing is claimed. The message never carries the reserved
+metadata keys `agent_run` and `cap_notice`.
 
 The credential rules mirror the market's `internal/domain/credentialask.go`.
 `test/fixtures/credential_requests.tsv` is a byte-for-byte copy of the market's
@@ -224,7 +251,9 @@ The credential rules mirror the market's `internal/domain/credentialask.go`.
 `test/starter-credential.test.js`. To sync, copy the file, update the pin and
 the rules together, and run
 `MARKET_REPO=<cws-marketplace clone> npm test` to compare with the market
-directly.
+directly. CI cannot reach the market repository, so run this before every
+release. With `OPENMAX_DIR=<zylos-openmax checkout>` the run check is also
+tested against the real openmax run selection.
 
 ## Operational notes
 

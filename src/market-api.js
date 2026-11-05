@@ -42,6 +42,21 @@ function pick(src, p, spec) {
   return out;
 }
 
+const runes = (v) => [...v].length;
+const textUpTo = (v, max) => typeof v === 'string' && runes(v) <= max;
+
+// starter_content of a write_template order ({template_name, first_guide, starter_tasks: [{title, prompt}]}) at the
+// market's manifest limits; null when absent or not in that shape, so the starter message is not claimed.
+export function parseStarterContent(v) {
+  if (!isObject(v) || !textUpTo(v.template_name, 100) || !(v.first_guide == null || textUpTo(v.first_guide, 20000))) return null;
+  const tasks = v.starter_tasks ?? [];
+  if (!Array.isArray(tasks) || tasks.length > 10) return null;
+  if (!tasks.every((x) => isObject(x) && textUpTo(x.title, 40) && textUpTo(x.prompt, 1000))) return null;
+  return {
+    templateName: v.template_name, firstGuide: v.first_guide ?? '', starterTasks: tasks.map((x) => ({ title: x.title, prompt: x.prompt })),
+  };
+}
+
 function parseIntent(raw, p) {
   const it = pick(object(raw, p), p, {
     id: uuid, org_id: orgId, op: oneOf(INTENT_OPS),
@@ -55,6 +70,7 @@ function parseIntent(raw, p) {
     // Absent from markets without the starter message.
     it.starter_message = raw.starter_message == null ? false : bool(raw.starter_message, `${p}.starter_message`);
     it.adopted_by_member_id = nullable(memberId)(raw.adopted_by_member_id, `${p}.adopted_by_member_id`);
+    it.starter_content = parseStarterContent(raw.starter_content);
   } else {
     if (raw.bundle_sha256 != null) fail(`${p}.bundle_sha256`, `must be absent for ${it.op}`);
     if (!it.skill_id && !(it.template_id && it.adoption_id)) fail(p, 'needs skill_id or template_id and adoption_id');

@@ -1,3 +1,4 @@
+import { STARTER_CHECK_MS } from '../src/starter.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -157,4 +158,15 @@ test('SIGTERM during an in-flight pull aborts it and exits promptly', async (t) 
   assert.deepEqual(await exited, { code: 0, signal: null });
   assert.ok(Date.now() - sent < 2000, 'in-flight pull aborted, not awaited');
   assert.equal(fs.existsSync(path.join(dataDir, 'state', 'lock')), false);
+});
+
+test('starter messages waiting for a free DM are checked by their own task', async () => {
+  const logger = { debug() {}, info() {}, warn() {}, error() {} };
+  let waited = 0;
+  const tasks = buildTasks(logger, { starter: { runWaiting: async () => { waited++; } } });
+  const task = tasks.find((x) => x.name === 'starter');
+  assert.equal(task.baseMs, STARTER_CHECK_MS);
+  await task.run();
+  assert.equal(waited, 1);
+  assert.equal(buildTasks(logger, {}).some((x) => x.name === 'starter'), false);
 });

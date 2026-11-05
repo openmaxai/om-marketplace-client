@@ -798,7 +798,9 @@ test('a sha_block hitting a record still in writing quarantines it', async (t) =
 test('the starter message is queued after an applied first write, never after a stale, failed or plain write', async (t) => {
   const ADOPTER = U(30);
   const cases = [
-    ['applied', { starter_message: true, adopted_by_member_id: ADOPTER }, applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER }]],
+    ['applied', { starter_message: true, adopted_by_member_id: ADOPTER }, applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: null }]],
+    ['applied with content', { starter_message: true, adopted_by_member_id: ADOPTER, starter_content: { template_name: 't', first_guide: 'g', starter_tasks: [] } },
+      applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: { templateName: 't', firstGuide: 'g', starterTasks: [] } }]],
     ['no starter message', { starter_message: false, adopted_by_member_id: ADOPTER }, applied, []],
     ['no adopter', { starter_message: true, adopted_by_member_id: null }, applied, []],
     ['stale', { starter_message: true, adopted_by_member_id: ADOPTER }, stale('active'), []],

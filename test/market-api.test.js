@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { VALID_ENV } from './helpers.js';
 import { REVOCATION_EPOCH, fakeCursor, marketHarness } from './fake/market.js';
-import { createMarketApi } from '../src/market-api.js';
+import { createMarketApi, parseStarterContent } from '../src/market-api.js';
 import { MarketError } from '../src/http.js';
 
 const ORG = VALID_ENV.COCO_ORG_ID;
@@ -33,7 +33,7 @@ test('install-intents:query sends the pending query and returns only validated k
   fake.script('POST', INTENTS, { status: 200, json: page([{ ...intent(), extra: 'x' }, tpl], { has_more: true }) }, { status: 204 });
   const got = await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 4, limit: 50 });
   assert.deepEqual(fake.market()[0].json, { status: 'pending', after_seq: 4, limit: 50 });
-  assert.deepEqual(got, page([intent(), { ...tpl, starter_message: false, adopted_by_member_id: null }], { has_more: true }));
+  assert.deepEqual(got, page([intent(), { ...tpl, starter_message: false, adopted_by_member_id: null, starter_content: null }], { has_more: true }));
   assert.equal(await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 9 }), null);
   assert.deepEqual(fake.market()[1].json, { status: 'pending', after_seq: 9, limit: 100 });
 });
@@ -189,6 +189,18 @@ test('install-intents:query keeps starter_message and adopted_by_member_id of a 
   const got = await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 4 });
   assert.equal(got.items[0].starter_message, true);
   assert.equal(got.items[0].adopted_by_member_id, U(10));
+  assert.equal(got.items[0].starter_content, null);
+});
+
+test('starter_content of a write order is kept in its documented shape; anything else is null', () => {
+  const ok = { template_name: '周报', first_guide: '先说说团队。', starter_tasks: [{ title: '汇总', prompt: '写周报' }] };
+  assert.deepEqual(parseStarterContent(ok), { templateName: '周报', firstGuide: '先说说团队。', starterTasks: [{ title: '汇总', prompt: '写周报' }] });
+  assert.deepEqual(parseStarterContent({ template_name: 't', first_guide: null }), { templateName: 't', firstGuide: '', starterTasks: [] });
+  for (const bad of [
+    undefined, null, 'x', [], {}, { ...ok, template_name: 1 }, { ...ok, template_name: '名'.repeat(101) }, { ...ok, first_guide: 3 },
+    { ...ok, first_guide: 'g'.repeat(20001) }, { ...ok, starter_tasks: {} }, { ...ok, starter_tasks: Array(11).fill({ title: 'a', prompt: 'b' }) },
+    { ...ok, starter_tasks: [{ title: 'a' }] }, { ...ok, starter_tasks: [{ title: 't'.repeat(41), prompt: '' }] },
+  ]) assert.equal(parseStarterContent(bad), null, JSON.stringify(bad));
 });
 
 test(':claim-starter and :mark-starter-shown send the documented bodies and validate the answers', async (t) => {
