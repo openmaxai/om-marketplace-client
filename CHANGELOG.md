@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is not sent (`send_failed`) when the content changed or a step fails.
 - Links are removed after any length cut, so a cut cannot re-create an address
   or split `[链接已移除]`; Unicode-form domains are removed too.
+- Credential rules: spaced-out single letters are joined from three letters on
+  ("c a t"), as in the market.
 - `starter_message.enabled` in `config.json` turns the starter message off on
   this Agent.
 

@@ -43,3 +43,10 @@ test('every sample of the table gets the market answer', () => {
   });
   assert.ok(counts.hit > 0 && counts.pass > 0 && counts.known_false_hit > 0, JSON.stringify(counts));
 });
+
+test('three or more spaced single letters are joined before matching', () => {
+  assert.equal(credentialRequest('send me your p w d'), false);
+  assert.equal(credentialRequest('send me the o t p'), true);
+  assert.equal(credentialRequest('请把 p i n 码发给我'), true);
+  assert.equal(credentialRequest('send me the o t'), false);
+});

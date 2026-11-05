@@ -61,7 +61,8 @@ const qualifiedEN = new RegExp(`\\b(?:passwords?|passcodes?|pins?|tokens?|keys?|
 const qualifiedCJK = new RegExp('(?:密码|密碼|验证码|驗證碼|口令|令牌|密钥|密鑰|token|key)[^。！？；，,\\n]{0,6}?'
   + '(?:有效|位数|位數|位|长度|長度|强度|強度|规则|規則|策略|过期|過期|期限|管理器|用量)', 'gu');
 const sentenceEnd = new RegExp(`[。！？；!?;\\n]|\\.(?:${S}|$)`, 'gu');
-const singleLetters = /\b(?:[a-z] ){3,}[a-z]\b/g;
+// At least three single letters separated by spaces ("p a s s w o r d", "c a t").
+const singleLetters = /\b(?:[a-z] ){2,}[a-z]\b/g;
 
 const CONFUSABLES = new Map(Object.entries({
   'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x', 'і': 'i', 'ѕ': 's',

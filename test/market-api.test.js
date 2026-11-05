@@ -196,6 +196,7 @@ test('starter_content of a write order is kept in its documented shape; anything
   const ok = { template_name: '周报', first_guide: '先说说团队。', starter_tasks: [{ title: '汇总', prompt: '写周报' }] };
   assert.deepEqual(parseStarterContent(ok), { templateName: '周报', firstGuide: '先说说团队。', starterTasks: [{ title: '汇总', prompt: '写周报' }] });
   assert.deepEqual(parseStarterContent({ template_name: 't', first_guide: null }), { templateName: 't', firstGuide: '', starterTasks: [] });
+  assert.deepEqual(parseStarterContent({ template_name: 't', first_guide: '', starter_tasks: [] }), { templateName: 't', firstGuide: '', starterTasks: [] });
   for (const bad of [
     undefined, null, 'x', [], {}, { ...ok, template_name: 1 }, { ...ok, template_name: '名'.repeat(101) }, { ...ok, first_guide: 3 },
     { ...ok, first_guide: 'g'.repeat(20001) }, { ...ok, starter_tasks: {} }, { ...ok, starter_tasks: Array(11).fill({ title: 'a', prompt: 'b' }) },
