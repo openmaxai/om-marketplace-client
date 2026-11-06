@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it in a template field is refused as a credential request.
 
 ### Fixed
-- Credential rules: Chinese clause boundary also at ASCII punctuation and
-  white space, as in the market.
+- Credential rules: Chinese clause boundary also at ASCII punctuation, colon,
+  enumeration comma and white space, as in the market.
 
 ### Upgrade Notes
 

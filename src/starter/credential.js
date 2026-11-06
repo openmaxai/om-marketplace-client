@@ -58,8 +58,9 @@ const enRules = [
 const qualifiedEN = new RegExp(`\\b(?:passwords?|passcodes?|pins?|tokens?|keys?|credentials?|cookies?|codes?)${S}+(?:policy|policies|`
   + `hygiene|managers?|expires?|expired|expiry|expiration|rotation|strength|requirements?|rules?|length|usage|limits?|resets?${S}+(?:links?|emails?|pages?|process|instructions|flow)|`
   + 'are stored|is stored|stored)\\b', 'giu');
-// The topic word must sit in the same clause: full-width or ASCII clause punctuation and any white space end it.
-const qualifiedCJK = new RegExp(`(?:密码|密碼|验证码|驗證碼|口令|令牌|密钥|密鑰|token|key)[^。！？；，,.!?;${NS}\\v\\u0085\\p{Z}]{0,6}?`
+// The topic word must sit in the same clause: full-width or ASCII clause punctuation, colon, enumeration comma and any
+// white space end it.
+const qualifiedCJK = new RegExp(`(?:密码|密碼|验证码|驗證碼|口令|令牌|密钥|密鑰|token|key)[^。！？；，、,.!?;:${NS}\\v\\u0085\\p{Z}]{0,6}?`
   + '(?:有效|位数|位數|位|长度|長度|强度|強度|规则|規則|策略|过期|過期|期限|管理器|用量)', 'gu');
 const sentenceEnd = new RegExp(`[。！？；!?;\\n]|\\.(?:${S}|$)`, 'gu');
 // At least three single letters separated by spaces ("p a s s w o r d", "c a t").
