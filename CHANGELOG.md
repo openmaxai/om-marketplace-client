@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-07
+
+### Changed
+- Starter message: with openmax 2.32.0 or later the message is sent at once
+  with `noRun: true` instead of waiting for the DM to have no open run.
+
 ## [0.5.2] - 2026-11-07
 
 ### Fixed

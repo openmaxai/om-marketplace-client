@@ -5,8 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { RESERVED_METADATA_KEYS } from './limits.js';
 
 export const IM_TIMEOUT_MS = 30_000;
-// First openmax release whose comm.send takes noRun; null until it is released.
-export const OPENMAX_NORUN_MIN_VERSION = null;
+// First openmax release whose comm.send takes noRun.
+export const OPENMAX_NORUN_MIN_VERSION = '2.32.0';
 const MAX_OUTPUT = 1024 * 1024;
 
 export class ImError extends Error {
