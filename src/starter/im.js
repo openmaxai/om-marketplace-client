@@ -34,6 +34,11 @@ export function versionAtLeast(a, b) {
 
 const unwrap = (v) => (v && typeof v === 'object' && !Array.isArray(v) && 'data' in v ? v.data : v);
 
+// The CLI's JSON answer; openmax may also print request trace lines ("[rpc] ...") to stdout, which are skipped.
+export function parseCliOutput(stdout) {
+  return JSON.parse(String(stdout).split('\n').filter((line) => !line.startsWith('[rpc] ')).join('\n'));
+}
+
 function errorOf(err, stderr) {
   let status = null;
   try { status = Number(JSON.parse(String(stderr).trim().split('\n').at(-1)).status) || null; } catch { /* no JSON */ }
@@ -64,9 +69,10 @@ export function createOpenmaxIm({
   const call = (command, params) => new Promise((resolve, reject) => {
     run(process.execPath, [cli, command, JSON.stringify(params)], {
       cwd: path.dirname(path.dirname(path.dirname(cli))), timeout: timeoutMs, maxBuffer: MAX_OUTPUT, windowsHide: true,
+      env: { ...process.env, COCO_RPC_LOG: '0' },
     }, (err, stdout, stderr) => {
       if (err) return reject(errorOf(err, stderr));
-      try { resolve(unwrap(JSON.parse(stdout))); } catch { reject(new ImError('unreadable output')); }
+      try { resolve(unwrap(parseCliOutput(stdout))); } catch { reject(new ImError('unreadable output')); }
     });
   });
   return {

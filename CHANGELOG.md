@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-07
+
+### Fixed
+- Starter message: the openmax CLI could print request trace lines to stdout
+  before its JSON answer, so the DM check failed as unreadable output and the
+  message was reported as send_failed. The client now turns the trace off for
+  its CLI calls and skips such lines when reading the answer.
+
 ## [0.5.0] - 2026-11-06
 
 ### Added

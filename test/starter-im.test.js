@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
-import { ImError, OPENMAX_NORUN_MIN_VERSION, createOpenmaxIm, openmaxCommCli, sendParams, versionAtLeast } from '../src/starter/im.js';
+import { ImError, OPENMAX_NORUN_MIN_VERSION, createOpenmaxIm, openmaxCommCli, parseCliOutput, sendParams, versionAtLeast } from '../src/starter/im.js';
 
 const ORG = '0b6f4f3e-1111-4c2a-9d1e-cccccccccccc';
 
@@ -138,4 +138,15 @@ test('real openmax run selection: open run, reply-closed run within and after 10
   assert.equal(await im.runInProgress({ conversationId: 'recent' }), true);
   assert.equal(await im.runInProgress({ conversationId: 'old' }), false);
   assert.equal(await im.runInProgress({ conversationId: 'other' }), false);
+});
+
+test('turns off the CLI request trace and reads the answer past any trace lines on stdout', async () => {
+  const trace = '[rpc] \u2192 POST https://example.test/api/v1/conversations/dm  req: {"peer_member_id":"b"}\n'
+    + '[rpc] \u2190 POST https://example.test/api/v1/conversations/dm resp 200: {"data":{"id":"cv-1"}}\n';
+  const f = fakeRun({ 'comm.create_dm': { stdout: `${trace}${JSON.stringify({ id: 'cv-1', type: 'DM' }, null, 2)}\n` } });
+  const im = createOpenmaxIm({ zylosDir: tmpHome(), run: f.run });
+  assert.equal(await im.createDm({ orgId: ORG, peerMemberId: 'b' }), 'cv-1');
+  assert.equal(f.calls[0].opts.env.COCO_RPC_LOG, '0');
+  assert.deepEqual(parseCliOutput(`${trace}[1,2]`), [1, 2]);
+  assert.throws(() => parseCliOutput(trace), SyntaxError);
 });
