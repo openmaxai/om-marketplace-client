@@ -80,9 +80,11 @@ export function createOpenmaxIm({
       try { return fs.statSync(cli).isFile(); } catch { return false; }
     },
     async createDm({ orgId, peerMemberId }) {
+      // The service answers {conversation: {id, ...}, created}; a bare conversation is accepted too.
       const c = await call('comm.create_dm', { org: orgId, peerMemberId });
-      if (typeof c?.id !== 'string' || !c.id) throw new ImError('create_dm returned no conversation id');
-      return c.id;
+      const id = c?.conversation?.id ?? c?.id;
+      if (typeof id !== 'string' || !id) throw new ImError('create_dm returned no conversation id');
+      return id;
     },
     async getConversation({ orgId, conversationId }) {
       return call('comm.get_conversation', { org: orgId, conversationId });

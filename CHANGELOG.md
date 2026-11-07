@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-07
+
+### Fixed
+- Starter message: create_dm answers with the conversation nested under
+  `conversation`, so the client found no conversation id and reported the
+  message as send_failed without sending it. The id is now read from
+  `conversation.id`, with a bare conversation still accepted.
+
 ## [0.5.1] - 2026-11-07
 
 ### Fixed

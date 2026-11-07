@@ -150,3 +150,18 @@ test('turns off the CLI request trace and reads the answer past any trace lines 
   assert.deepEqual(parseCliOutput(`${trace}[1,2]`), [1, 2]);
   assert.throws(() => parseCliOutput(trace), SyntaxError);
 });
+
+test('reads the service answer shapes of create_dm, get_conversation and member_list', async () => {
+  const conv = { id: 'cv-9', type: 'DM', member_count: 2, dm: { peer_member_id: 'b', peer_kind: 'human', can_send: true } };
+  const f = fakeRun({
+    'comm.create_dm': { stdout: JSON.stringify({ data: { conversation: conv, created: false } }) },
+    'comm.get_conversation': { stdout: JSON.stringify({ data: conv }) },
+    'comm.member_list': { stdout: JSON.stringify({ data: [{ member_id: 'a', role: 'MEMBER', kind: 'agent' }, { member_id: 'b', role: 'MEMBER', kind: 'human' }] }) },
+  });
+  const im = createOpenmaxIm({ zylosDir: tmpHome(), run: f.run });
+  assert.equal(await im.createDm({ orgId: ORG, peerMemberId: 'b' }), 'cv-9');
+  assert.equal((await im.getConversation({ orgId: ORG, conversationId: 'cv-9' })).type, 'DM');
+  assert.deepEqual((await im.memberList({ orgId: ORG, conversationId: 'cv-9' })).map((m) => m.member_id), ['a', 'b']);
+  const empty = createOpenmaxIm({ zylosDir: tmpHome(), run: fakeRun({ 'comm.create_dm': { stdout: '{"data":{"conversation":{},"created":true}}' } }).run });
+  await assert.rejects(empty.createDm({ orgId: ORG, peerMemberId: 'b' }), ImError);
+});
