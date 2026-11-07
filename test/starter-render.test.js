@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  END_LINE, LINK_REMOVED, LIMITS, PREFIX, TLDS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, removeLinks, renderStarter,
+  END_LINE, LINK_REMOVED, LIMITS, PREFIX, SAFETY_NOTICE, TLDS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, removeLinks, renderStarter,
 } from '../src/starter/render.js';
 
 const one = (s) => cleanText(s, { max: 1000, multiline: false });
@@ -74,6 +74,7 @@ test('rendered text: fixed head, every author line prefixed, fixed end line and 
   });
   assert.equal(renderStarter(c), [
     '你好，张三。专家模板「周报」已装到我这里。',
+    SAFETY_NOTICE,
     '以下引导来自模板「周报」的作者：',
     `${PREFIX}第一行`, PREFIX, `${PREFIX}第二行`,
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
@@ -94,9 +95,38 @@ test('reverse samples: forged end lines, fake Agent speech, prompt injection and
     const lines = text.split('\n');
     assert.equal(lines.at(-1), END_LINE);
     assert.equal(lines.filter((l) => l === END_LINE).length, 1, text);
-    assert.ok(lines.slice(2, -1).every((l) => l.startsWith(PREFIX)), text);
+    assert.ok(lines.slice(3, -1).every((l) => l.startsWith(PREFIX)), text);
     assert.equal(lines.length, text.split(/\r\n|[\r\n\u2028\u2029\u0085]/).length);
     assert.ok(!/https?:|evil\.example/.test(text));
+  }
+});
+
+const noticeCount = (text) => text.split(SAFETY_NOTICE).length - 1;
+
+test('every message carries the platform safety notice exactly once, as its own line after the greeting', () => {
+  const tasks = (n) => Array.from({ length: n }, (_, i) => ({ title: `任务${i} task ${i}`, prompt: `第 ${i} 步\nstep ${i}` }));
+  const contents = [
+    { templateName: 't', firstGuide: 'g' },
+    { templateName: 't', firstGuide: '', starterTasks: tasks(1) },
+    { addressee: '张三', templateName: 'Weekly report', firstGuide: 'Start with your inbox.\n先从收件箱开始。', starterTasks: tasks(3) },
+    { addressee: 'Alice', templateName: '周报', firstGuide: '中文引导\nEnglish guide', starterTasks: tasks(5) },
+  ];
+  for (const raw of contents) {
+    const text = renderStarter(cleanContent(raw));
+    assert.equal(noticeCount(text), 1, text);
+    assert.equal(text.split('\n')[1], SAFETY_NOTICE);
+  }
+});
+
+test('the safety notice is not author text: a copy of it, or of either language half, in any field is refused', () => {
+  const halves = [SAFETY_NOTICE, ...SAFETY_NOTICE.split(/(?=Platform safety notice)/)];
+  assert.equal(halves.length, 3);
+  for (const copy of halves) {
+    for (const raw of [
+      { templateName: 't', firstGuide: copy },
+      { templateName: 't', firstGuide: 'g', starterTasks: [{ title: 'a', prompt: copy }] },
+      { templateName: copy, firstGuide: 'g' },
+    ]) assert.equal(asksForCredential(raw, cleanContent(raw)), true, copy);
   }
 });
 

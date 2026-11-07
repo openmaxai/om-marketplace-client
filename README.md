@@ -204,10 +204,14 @@ never reaches the model.
    characters are removed; one-line fields lose their line breaks; lengths are
    cut (name 40, guide 2000, title 40, prompt 500). Every line of author text
    starts with `｜ ` and the message ends with the fixed line
-   `（以上为模板作者提供的内容）`.
+   `（以上为模板作者提供的内容）`. The line after the greeting is the fixed
+   platform safety notice (`SAFETY_NOTICE` in `src/starter/render.js`, Chinese
+   and English on one line): client text, never taken from the template, not
+   run through the credential rules, exactly once in every message.
 3. If any field asks for a credential (the market's rule table; negation is
    not recognised, so warnings such as "never share your password" are refused
-   too), nothing is sent and the result is `rejected_content`.
+   too, and so is a copy of the safety notice), nothing is sent and the result
+   is `rejected_content`. Authors leave reminders to the platform notice.
 4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
    `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
    this Agent and the adopter; otherwise nothing is sent (`send_failed`).
@@ -253,12 +257,14 @@ does not fit, nothing is claimed. The message never carries the reserved
 metadata keys `agent_run` and `cap_notice`.
 
 The credential rules mirror the market's `internal/domain/credentialask.go`.
-`test/fixtures/credential_requests.tsv` is a byte-for-byte copy of the market's
-`internal/domain/testdata/credential_requests.tsv`; its sha256 is pinned in
-`test/starter-credential.test.js`. To sync, copy the file, update the pin and
-the rules together, and run
+`test/fixtures/credential_requests.tsv` is the market's
+`internal/domain/testdata/credential_requests.tsv` up to its `# private` line,
+byte for byte; the rows after that line are kept in the market repository
+only. Its sha256 and row counts are pinned in
+`test/starter-credential.test.js`. To sync, copy that part of the file, update
+the pins and the rules together, and run
 `MARKET_REPO=<cws-marketplace clone> npm test` to compare with the market
-directly. CI cannot reach the market repository, so run this before every
+directly and to run the private rows through the client rules. CI cannot reach the market repository, so run this before every
 release. With `OPENMAX_DIR=<zylos-openmax checkout>` the run check is also
 tested against the real openmax run selection.
 

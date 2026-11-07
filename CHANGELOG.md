@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-06
+
+### Added
+- Every starter message carries a fixed platform safety notice, in Chinese and
+  English on one line, right after the greeting. It is client text, never
+  taken from the template and not run through the credential rules; a copy of
+  it in a template field is refused as a credential request.
+
+### Fixed
+- Credential rules: Chinese clause boundary also at ASCII punctuation, colon,
+  enumeration comma and white space, as in the market.
+
+### Upgrade Notes
+
+No action needed. The market does not require this version.
+
 ## [0.4.0] - 2026-11-05
 
 ### Changed

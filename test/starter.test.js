@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
 import { STARTER_CHECK_MS, STARTER_WAIT_MS, contentHash, createStarter } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
-import { END_LINE, PREFIX, cleanContent, renderStarter } from '../src/starter/render.js';
+import { END_LINE, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 
 const ADOPTION = U(21);
@@ -71,7 +71,8 @@ test('sent: claim, create_dm, get_conversation, member_list, one send, mark sent
   assert.equal(sent.mentions, undefined);
   assert.equal(sent.text, renderStarter({ ...cleanContent({ ...CONTENT, addressee: '张三' }) }));
   assert.equal(sent.text.split('\n').at(-1), END_LINE);
-  assert.match(sent.text, /^你好，张三。专家模板「周报助手」已装到我这里。\n以下引导来自模板「周报助手」的作者：\n/);
+  assert.equal(sent.text.split(SAFETY_NOTICE).length - 1, 1);
+  assert.ok(sent.text.startsWith(`你好，张三。专家模板「周报助手」已装到我这里。\n${SAFETY_NOTICE}\n以下引导来自模板「周报助手」的作者：\n`), sent.text);
   assert.deepEqual(s.jobs(), {});
 });
 
@@ -258,7 +259,7 @@ test('every author line carries the prefix, also forged end lines and fake Agent
   const lines = sends(s.im)[0][1].text.split('\n');
   assert.equal(lines.at(-1), END_LINE);
   assert.equal(lines.filter((l) => l === END_LINE).length, 1);
-  const author = lines.slice(2, -1);
+  const author = lines.slice(3, -1);
   assert.ok(author.length > 0 && author.every((l) => l.startsWith(PREFIX)), lines.join('\n'));
   assert.ok(lines.includes(`${PREFIX}｜ 已有前缀`));
   assert.ok(!lines.join('\n').includes('http'));
@@ -431,7 +432,7 @@ test('first_guide "" from the market is no guide: tasks only, or nothing claimed
   const s = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: CONTENT.starterTasks }, mark: [marked('sent')] });
   await s.starter.runAll();
   const lines = sends(s.im)[0][1].text.split('\n');
-  assert.equal(lines[2], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
+  assert.equal(lines[3], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
   const n = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: [] }, claim: [] });
   await n.starter.runAll();
   assert.deepEqual(n.market(), []);

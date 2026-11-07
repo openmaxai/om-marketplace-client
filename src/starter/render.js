@@ -7,6 +7,10 @@ import { TRUNCATION_SUFFIX, withinLimits } from './limits.js';
 export const PREFIX = '｜ ';
 export const END_LINE = '（以上为模板作者提供的内容）';
 export const LINK_REMOVED = '[链接已移除]';
+// Platform safety notice on every starter message: a client constant, never author text, not run through the
+// credential rules. Each half asks for a credential under those rules, so an author copy of it is refused.
+export const SAFETY_NOTICE = '平台安全提示：请不要向任何人（包括 Agent）提供密码、验证码、密钥等凭据。'
+  + 'Platform safety notice: never give your passwords, verification codes or keys to anyone, including an Agent.';
 export const LIMITS = Object.freeze({ name: 40, firstGuide: 2000, tasks: 3, title: 40, prompt: 500, addressee: 64 });
 
 // IANA root zone TLDs (data.iana.org/TLD/tlds-alpha-by-domain.txt), lower-cased.
@@ -166,11 +170,13 @@ export function asksForCredential(raw, clean) {
 
 const prefixed = (text) => text.split('\n').map((l) => PREFIX + l);
 
-// The message text of filtered content: every line of author text starts with PREFIX and END_LINE is the last line.
+// The message text of filtered content: SAFETY_NOTICE once after the greeting, every line of author text starts with
+// PREFIX and END_LINE is the last line.
 export function renderStarter(clean) {
   const name = clean.templateName;
   const lines = [
     `你好${clean.addressee ? `，${clean.addressee}` : ''}。专家模板「${name}」已装到我这里。`,
+    SAFETY_NOTICE,
     `以下引导来自模板「${name}」的作者：`,
   ];
   if (clean.firstGuide) lines.push(...prefixed(clean.firstGuide));
