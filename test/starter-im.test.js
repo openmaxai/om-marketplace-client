@@ -109,8 +109,9 @@ test('noRun is used only from the configured openmax version on', () => {
   assert.equal(versionAtLeast('3.0.0', '2.31.0'), true);
   assert.equal(versionAtLeast('2.30.9', '2.31.0'), false);
   assert.equal(versionAtLeast('x', '2.31.0'), false);
-  assert.equal(OPENMAX_NORUN_MIN_VERSION, null);
-  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '9.9.9' }) }).supportsNoRun(), false);
+  assert.equal(OPENMAX_NORUN_MIN_VERSION, '2.32.0');
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.32.0' }) }).supportsNoRun(), true);
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.31.0' }) }).supportsNoRun(), false);
   assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.31.0' }), noRunMinVersion: '2.31.0' }).supportsNoRun(), true);
   assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.30.0' }), noRunMinVersion: '2.31.0' }).supportsNoRun(), false);
   assert.equal(createOpenmaxIm({ zylosDir: tmpHome(), noRunMinVersion: '2.31.0' }).supportsNoRun(), false);

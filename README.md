@@ -221,9 +221,8 @@ never reaches the model.
    `comm.send` uses), so an open run, or a run closed by a reply within the
    last 10 minutes, holds the message back. It is checked every 30 seconds; 8
    minutes after the claim it is given up as `send_failed` with no send made.
-   An openmax release with `noRun` on `comm.send` (from the version set in
-   `OPENMAX_NORUN_MIN_VERSION`, not released yet) skips the wait and sends with
-   `noRun: true`.
+   With openmax 2.32.0 or later (`OPENMAX_NORUN_MIN_VERSION`), whose `comm.send`
+   takes `noRun`, the client skips the wait and sends with `noRun: true`.
    While waiting, the client keeps only ids, the `starter_content` and its
    sha256 (canonical JSON, recorded at the claim); never the rendered text or
    the adopter's name. Right before the send it checks the DM again and renders
