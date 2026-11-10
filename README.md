@@ -215,6 +215,10 @@ never reaches the model.
 4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
    `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
    this Agent and the adopter; otherwise nothing is sent (`send_failed`).
+   Each of these read-only calls is tried once more after a failure that is
+   not a refusal (unreadable output, timeout, server error). Trace lines the
+   openmax CLI prints to stdout (`[rpc] ...`, `[token] ...`, any `[name] `
+   prefix) are skipped and the trailing JSON answer is read.
 5. The send waits while a message into that DM would be taken as a run's
    reply: the client asks the openmax component's own activity store and run
    selection (`src/lib/activity/run-store.js`, `reply.js` `selectRun`, the code
@@ -228,11 +232,20 @@ never reaches the model.
    the adopter's name. Right before the send it checks the DM again and renders
    the message again through the whole pipeline (filter, size fit, credential
    check including the adopter's name, byte limit). A changed content hash, a
-   changed DM or any failing step means no send and `send_failed`.
+   changed DM or any failing step means no send and `send_failed`, and so does
+   a check that ends 9 minutes or more after the claim (`too_late`), so no send
+   can still run when the market's 10-minute grace ends.
 6. One `comm.send`, plain text, no mentions, never retried. A refused send is
    `send_failed`. A send whose outcome is unknown (timeout, server error) is
    not reported at all, so it is not counted as failed.
 7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
+   A `send_failed` or `rejected_content` result is logged with a short reason
+   code (`dm_check_<failure>` such as `dm_check_unreadable_output`,
+   `dm_check_timeout` or `dm_check_http_<status>`; `dm_not_one_to_one`,
+   `dm_changed`, `dm_busy`, `too_late`, `content_changed`,
+   `content_unavailable`, `no_content`, `too_large`, `asks_for_credential`,
+   `send_refused_http_<status>`, `interrupted`, `internal_error`). The market
+   takes only `result`, so the reason is not sent.
 
 The content is the `starter_content` the market puts on the write order
 (`{template_name, first_guide, starter_tasks}`). Without it, without the

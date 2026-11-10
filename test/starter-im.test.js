@@ -3,16 +3,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
-import { ImError, OPENMAX_NORUN_MIN_VERSION, createOpenmaxIm, openmaxCommCli, parseCliOutput, sendParams, versionAtLeast } from '../src/starter/im.js';
+import {
+  ImError, OPENMAX_NORUN_MIN_VERSION, createOpenmaxIm, openmaxCommCli, parseCliOutput, redact, sendParams, versionAtLeast,
+} from '../src/starter/im.js';
 
 const ORG = '0b6f4f3e-1111-4c2a-9d1e-cccccccccccc';
 
-// Fake execFile: answers per command with {stdout} or {err, stderr}; records argv.
+// Fake execFile: answers per command with {stdout} or {err, stderr}, or a list of them used in turn; records argv.
 function fakeRun(answers) {
   const calls = [];
+  const turns = {};
   const run = (file, args, opts, cb) => {
     calls.push({ file, args, opts });
-    const a = answers[args[1]];
+    const list = [answers[args[1]]].flat();
+    const n = turns[args[1]] = (turns[args[1]] ?? 0) + 1;
+    const a = list[Math.min(n, list.length) - 1];
     setImmediate(() => (a.err ? cb(a.err, '', a.stderr ?? '') : cb(null, a.stdout, '')));
   };
   return { calls, run };
@@ -165,4 +170,105 @@ test('reads the service answer shapes of create_dm, get_conversation and member_
   assert.deepEqual((await im.memberList({ orgId: ORG, conversationId: 'cv-9' })).map((m) => m.member_id), ['a', 'b']);
   const empty = createOpenmaxIm({ zylosDir: tmpHome(), run: fakeRun({ 'comm.create_dm': { stdout: '{"data":{"conversation":{},"created":true}}' } }).run });
   await assert.rejects(empty.createDm({ orgId: ORG, peerMemberId: 'b' }), ImError);
+});
+
+// The lines openmax 2.32.0 prints to stdout around a lazy token refresh (src/lib/token.js), before the answer.
+const TOKEN_LINES = '[token] auto-filled orgs.acme.self.member_id from JWT claims: 019f0000-0000-7000-8000-000000000001\n'
+  + `[token] refresh org=${ORG}\n[token] refresh ok org=${ORG} exp=2026-11-10T10:24:21.000Z\n`;
+
+test('reads the answer past [token] and [rpc] lines, pretty-printed or compact', () => {
+  const answer = { data: { conversation: { id: 'cv-1', type: 'DM', tags: ['a', 'b'] }, created: false } };
+  const rpc = '[rpc] \u2192 POST https://example.test/api/v1/conversations/dm  req: {"peer_member_id":"b"}\n';
+  for (const stdout of [
+    `${TOKEN_LINES}${JSON.stringify(answer, null, 2)}\n`,
+    `${TOKEN_LINES}${rpc}${JSON.stringify(answer, null, 2)}\n`,
+    `${rpc}${TOKEN_LINES}${JSON.stringify(answer)}`,
+    `[token] exchange org=${ORG}\n[ws.ticket-2] x\n${JSON.stringify(answer, null, 2)}`,
+    `some unprefixed note\n{ not json\n${JSON.stringify(answer, null, 2)}\n\n`,
+  ]) assert.deepEqual(parseCliOutput(stdout), answer, stdout);
+  assert.deepEqual(parseCliOutput(`${TOKEN_LINES}${JSON.stringify([1, [2]], null, 2)}`), [1, [2]]);
+  assert.throws(() => parseCliOutput(TOKEN_LINES), SyntaxError);
+  assert.throws(() => parseCliOutput(`${TOKEN_LINES}{"a":`), SyntaxError);
+  assert.throws(() => parseCliOutput(''), SyntaxError);
+});
+
+test('a DM-check call answered after [token] lines succeeds without a retry', async () => {
+  const conv = { id: 'cv-1', type: 'DM' };
+  const f = fakeRun({ 'comm.create_dm': { stdout: `${TOKEN_LINES}${JSON.stringify({ data: { conversation: conv, created: false } }, null, 2)}\n` } });
+  const im = createOpenmaxIm({ zylosDir: tmpHome(), run: f.run, retryDelayMs: 0 });
+  assert.equal(await im.createDm({ orgId: ORG, peerMemberId: 'b' }), 'cv-1');
+  assert.equal(f.calls.length, 1);
+});
+
+test('the read-only DM-check calls are tried once more after unreadable output or a timeout, not after a refusal', async () => {
+  const good = {
+    'comm.create_dm': { stdout: JSON.stringify({ id: 'cv-1' }) },
+    'comm.get_conversation': { stdout: JSON.stringify({ id: 'cv-1', type: 'DM' }) },
+    'comm.member_list': { stdout: JSON.stringify([{ member_id: 'a' }, { member_id: 'b' }]) },
+  };
+  const calls = {
+    'comm.create_dm': (im) => im.createDm({ orgId: ORG, peerMemberId: 'b' }),
+    'comm.get_conversation': (im) => im.getConversation({ orgId: ORG, conversationId: 'cv-1' }),
+    'comm.member_list': (im) => im.memberList({ orgId: ORG, conversationId: 'cv-1' }),
+  };
+  const exit = Object.assign(new Error('exit'), { code: 1 });
+  const transient = [
+    { stdout: 'garbage' },
+    { err: Object.assign(new Error('killed'), { killed: true }), stderr: '' },
+    { err: exit, stderr: JSON.stringify({ error: 'busy', status: 503 }) },
+  ];
+  for (const [command, invoke] of Object.entries(calls)) {
+    for (const first of transient) {
+      const f = fakeRun({ [command]: [first, good[command]] });
+      await invoke(createOpenmaxIm({ zylosDir: tmpHome(), run: f.run, retryDelayMs: 0 }));
+      assert.equal(f.calls.length, 2, `${command} ${JSON.stringify(first)}`);
+    }
+    const twice = fakeRun({ [command]: [{ stdout: 'garbage' }, { stdout: 'still garbage' }, good[command]] });
+    const err = await invoke(createOpenmaxIm({ zylosDir: tmpHome(), run: twice.run, retryDelayMs: 0 })).catch((e) => e);
+    assert.ok(err instanceof ImError);
+    assert.equal(err.kind, 'unreadable');
+    assert.equal(twice.calls.length, 2);
+    const refused = fakeRun({ [command]: [{ err: exit, stderr: JSON.stringify({ error: 'no', status: 403 }) }, good[command]] });
+    const no = await invoke(createOpenmaxIm({ zylosDir: tmpHome(), run: refused.run, retryDelayMs: 0 })).catch((e) => e);
+    assert.equal(no.status, 403);
+    assert.equal(no.definite, true);
+    assert.equal(refused.calls.length, 1);
+  }
+});
+
+test('comm.send is never tried again, whatever the failure', async () => {
+  const exit = Object.assign(new Error('exit'), { code: 1 });
+  for (const first of [
+    { stdout: 'garbage' },
+    { err: Object.assign(new Error('killed'), { killed: true }), stderr: '' },
+    { err: exit, stderr: JSON.stringify({ error: 'busy', status: 503 }) },
+    { err: exit, stderr: JSON.stringify({ error: 'bad', status: 400 }) },
+  ]) {
+    const f = fakeRun({ 'comm.send': [first, { stdout: '{"id":"m1"}' }] });
+    const im = createOpenmaxIm({ zylosDir: tmpHome(), run: f.run, retryDelayMs: 0 });
+    await assert.rejects(im.sendText({ orgId: ORG, conversationId: 'c', text: 't', clientMsgId: 'k' }), ImError);
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test('an ImError keeps what failed and the CLI error text, redacted', async () => {
+  const exit = Object.assign(new Error('exit'), { code: 1 });
+  const fail = async (answer) => {
+    const im = createOpenmaxIm({ zylosDir: tmpHome(), run: fakeRun({ 'comm.send': answer }).run });
+    return im.sendText({ orgId: ORG, conversationId: 'c', text: 't', clientMsgId: 'k' }).catch((e) => e);
+  };
+  let err = await fail({ err: exit, stderr: `warn line\n${JSON.stringify({ error: 'peer is not a member', status: 403 })}\n` });
+  assert.deepEqual([err.message, err.kind, err.status, err.definite], ['HTTP 403: peer is not a member', 'http', 403, true]);
+  err = await fail({ err: exit, stderr: JSON.stringify({ error: 'request failed: Authorization: Bearer abc123 token=xyz789' }) });
+  assert.equal(err.kind, 'exit');
+  assert.ok(err.message.startsWith('exit 1: request failed'), err.message);
+  assert.ok(!err.message.includes('abc123') && !err.message.includes('xyz789'), err.message);
+  err = await fail({ err: Object.assign(new Error('killed'), { killed: true }), stderr: '' });
+  assert.deepEqual([err.message, err.kind], ['timed out', 'timeout']);
+  err = await fail({ stdout: `${TOKEN_LINES}oops` });
+  assert.equal(err.kind, 'unreadable');
+  assert.ok(err.message.startsWith('unreadable output: [token] auto-filled'), err.message);
+  assert.ok(err.message.length < 260, err.message);
+  assert.ok(!redact('x '.repeat(500)).includes('\n'));
+  assert.equal(redact('password: hunter2, api_key=k1'), 'password: [redacted], api_key=[redacted]');
 });
