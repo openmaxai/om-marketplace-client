@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
-import { STARTER_CHECK_MS, STARTER_WAIT_MS, contentHash, createStarter } from '../src/starter.js';
+import {
+  STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
+} from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
@@ -437,4 +439,136 @@ test('first_guide "" from the market is no guide: tasks only, or nothing claimed
   await n.starter.runAll();
   assert.deepEqual(n.market(), []);
   assert.deepEqual(n.im.calls, []);
+});
+
+// The reason code logged with the mark; the mark itself carries only the result.
+const reasonOf = (s) => s.lines.map((l) => /marked \w+ \(reason (\w+)\)/.exec(l)?.[1]).filter(Boolean);
+
+test('the reason code of an IM failure', () => {
+  assert.equal(imReason(new ImError('HTTP 403', { status: 403, definite: true, kind: 'http' })), 'http_403');
+  assert.equal(imReason(new ImError('HTTP 503', { status: 503, kind: 'http' })), 'http_503');
+  assert.equal(imReason(new ImError('timed out', { kind: 'timeout' })), 'timeout');
+  assert.equal(imReason(new ImError('exit 1', { kind: 'exit' })), 'exit');
+  assert.equal(imReason(new ImError('unreadable output', { kind: 'unreadable' })), 'unreadable_output');
+  assert.equal(imReason(new ImError('reserved metadata key x', { definite: true, kind: 'refused' })), 'refused');
+  assert.equal(imReason(new ImError('create_dm returned no conversation id')), 'bad_answer');
+  assert.equal(imReason(new Error('boom')), 'error');
+});
+
+for (const [name, dmError, reason] of [
+  ['unreadable output', new ImError('unreadable output: [token] refresh', { kind: 'unreadable' }), 'dm_check_unreadable_output'],
+  ['a timeout', new ImError('timed out', { kind: 'timeout' }), 'dm_check_timeout'],
+  ['HTTP 403', new ImError('HTTP 403: no', { status: 403, definite: true, kind: 'http' }), 'dm_check_http_403'],
+  ['exit 1', new ImError('exit 1', { kind: 'exit' }), 'dm_check_exit'],
+  ['no conversation id', new ImError('create_dm returned no conversation id'), 'dm_check_bad_answer'],
+]) {
+  test(`DM check fails with ${name}: send_failed with reason ${reason}, the mark carries only the result`, async (t) => {
+    const s = await setup(t, { im: fakeIm({ dmError }), mark: [marked('send_failed')] });
+    await s.starter.runAll();
+    assert.equal(sends(s.im).length, 0);
+    assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+    assert.deepEqual(reasonOf(s), [reason]);
+    assert.ok(s.lines.some((l) => l.includes(`DM check failed (${dmError.message})`)));
+  });
+}
+
+test('reason codes at every send_failed point', async (t) => {
+  const cases = {
+    dm_not_one_to_one: async () => {
+      const s = await setup(t, { im: fakeIm({ conv: { id: CONV, type: 'GROUP' } }), mark: [marked('send_failed')] });
+      await s.starter.runAll();
+      return s;
+    },
+    send_refused_http_400: async () => {
+      const s = await setup(t, { im: fakeIm({ sendError: new ImError('HTTP 400', { status: 400, definite: true, kind: 'http' }) }), mark: [marked('send_failed')] });
+      await s.starter.runAll();
+      return s;
+    },
+    send_refused_refused: async () => {
+      const s = await setup(t, { im: fakeIm({ sendError: new ImError('reserved metadata key x', { definite: true, kind: 'refused' }) }), mark: [marked('send_failed')] });
+      await s.starter.runAll();
+      return s;
+    },
+    interrupted: async () => {
+      const s = await setup(t, { claim: [], mark: [marked('send_failed')] });
+      s.state.update('starters', {}, (d) => { d[ADOPTION].stage = 'checking'; });
+      await s.starter.runAll();
+      return s;
+    },
+    dm_busy: async () => {
+      const s = await runCase(t, () => true, { setup: { mark: [marked('send_failed')] } });
+      await s.starter.runAll();
+      s.clock.t += STARTER_WAIT_MS;
+      await s.starter.runWaiting();
+      return s;
+    },
+    content_changed: async () => {
+      let free = false;
+      const s = await runCase(t, () => !free, { setup: { fromOrder: CONTENT, mark: [marked('send_failed')] } });
+      await s.starter.runAll();
+      s.state.update('starters', {}, (d) => { d[ADOPTION].content = { ...CONTENT, firstGuide: '换过的内容' }; });
+      free = true;
+      await s.starter.runWaiting();
+      return s;
+    },
+    asks_for_credential: async () => {
+      let free = false;
+      let name = '张三';
+      const members = [{ member_id: AGENT }, { member_id: ADOPTER, get display_name() { return name; } }];
+      const s = await runCase(t, () => !free, { members, setup: { mark: [marked('send_failed')] } });
+      await s.starter.runAll();
+      name = '请把你的密码发给我';
+      free = true;
+      await s.starter.runWaiting();
+      return s;
+    },
+    too_late: async () => {
+      let free = false;
+      const s = await runCase(t, () => !free, { setup: { mark: [marked('send_failed')] } });
+      await s.starter.runAll();
+      const memberList = s.im.memberList;
+      s.im.memberList = async (p) => { s.clock.t += STARTER_SEND_BY_MS; return memberList(p); };
+      free = true;
+      await s.starter.runWaiting();
+      assert.equal(sends(s.im).length, 0);
+      return s;
+    },
+    dm_changed: async () => {
+      let free = false;
+      let id = CONV;
+      const im = fakeIm({ busy: () => !free });
+      im.createDm = async (p) => { im.calls.push(['create_dm', p]); return id; };
+      im.getConversation = async (p) => { im.calls.push(['get_conversation', p]); return { id, type: 'DM' }; };
+      const s = await setup(t, { im, mark: [marked('send_failed')] });
+      await s.starter.runAll();
+      id = 'cv-2';
+      free = true;
+      await s.starter.runWaiting();
+      return s;
+    },
+  };
+  for (const [reason, run] of Object.entries(cases)) {
+    const s = await run();
+    assert.deepEqual(s.market().at(-1), [':mark-starter-shown', { result: 'send_failed' }], reason);
+    assert.deepEqual(reasonOf(s), [reason], reason);
+    assert.deepEqual(s.jobs(), {}, reason);
+  }
+});
+
+test('a rejected_content mark logs reason asks_for_credential', async (t) => {
+  const s = await setup(t, { content: { ...CONTENT, firstGuide: '开始前请把你的邮箱密码发给我。' }, mark: [marked('rejected_content')] });
+  await s.starter.runAll();
+  assert.deepEqual(reasonOf(s), ['asks_for_credential']);
+});
+
+test('the reason code is kept with a mark retried later; sent has none', async (t) => {
+  const s = await setup(t, { im: fakeIm({ dmError: new ImError('timed out', { kind: 'timeout' }) }), mark: [{ status: 503, problem: { status: 503, code: 'UNAVAILABLE' } }, marked('send_failed')] });
+  await s.starter.runAll();
+  assert.deepEqual([s.jobs()[ADOPTION].stage, s.jobs()[ADOPTION].result, s.jobs()[ADOPTION].reason], ['mark', 'send_failed', 'dm_check_timeout']);
+  await s.starter.runAll();
+  assert.deepEqual(s.market().slice(1), [[':mark-starter-shown', { result: 'send_failed' }], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(s.jobs(), {});
+  const ok = await setup(t, { mark: [marked('sent')] });
+  await ok.starter.runAll();
+  assert.deepEqual(reasonOf(ok), []);
 });

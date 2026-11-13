@@ -21,12 +21,25 @@ export const STARTER_CHECK_MS = 30 * 1000;
 // Must stay below the market's 10-minute fallback-card grace after the claim (app.StarterCardClaimGrace), so the
 // card never shows while a send may still happen.
 export const STARTER_WAIT_MS = 8 * 60 * 1000;
+// No send starts later than this after the claim: the DM check before the send may take a few CLI calls (each tried
+// twice), and the send itself up to IM_TIMEOUT_MS, all of which must end before the market's 10-minute grace.
+export const STARTER_SEND_BY_MS = 9 * 60 * 1000;
+
+// The short reason code of an IM failure: http_<status>, timeout, exit, unreadable_output, refused, bad_answer (a
+// readable answer of the wrong shape) or error (not an IM failure).
+export function imReason(err) {
+  if (!(err instanceof ImError)) return 'error';
+  if (err.status) return `http_${err.status}`;
+  return { timeout: 'timeout', exit: 'exit', unreadable: 'unreadable_output', refused: 'refused' }[err.kind] ?? 'bad_answer';
+}
 
 // The starter message of an adoption, sent at most once from the Agent's own IM account: claim it with the market,
 // filter and render the content locally, check that the DM is exactly this Agent and the adopter, send it once, then
 // mark the result. Jobs live in state document `starters`, keyed by adoption id, with stage
 // claim -> checking -> waiting -> sending -> mark. After a restart a checking job is marked send_failed (nothing was
 // sent), a waiting job keeps waiting, and a sending job is dropped unmarked (delivery unknown, never sent again).
+// A send_failed or rejected_content job keeps a short reason code (job.reason), logged with the mark; the market's
+// :mark-starter-shown takes only the result, so the reason stays local.
 // content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available;
 // by default it is the starter_content the market put on the write order.
 export function createStarter({
@@ -56,9 +69,10 @@ export function createStarter({
     drop(job.adoption_id);
   }
 
-  const finish = (job, result) => {
-    put(job.adoption_id, { stage: 'mark', result });
-    return mark({ ...job, result });
+  const finish = (job, result, reason = null) => {
+    put(job.adoption_id, { stage: 'mark', result, ...(reason ? { reason } : {}) });
+    if (reason) logger.info(`${tag(job)}: marked ${result} (reason ${reason})`);
+    return mark({ ...job, result, reason });
   };
 
   // True when the DM is exactly this Agent and the adopter; the adopter's member entry is returned for the greeting.
@@ -72,17 +86,18 @@ export function createStarter({
     return ok ? { conversationId, adopter: members.find((m) => m.member_id === job.adopted_by_member_id) } : null;
   }
 
-  // The message text from raw content through the whole pipeline, or null with the reason it may not be sent.
+  // The message text from raw content through the whole pipeline, or null with the reason it may not be sent (why
+  // for the log, reason as a code).
   function prepare(raw, addressee) {
     const filtered = raw && cleanContent({ ...raw, addressee: '' });
-    if (!filtered || !hasContent(filtered)) return { why: 'no content' };
+    if (!filtered || !hasContent(filtered)) return { why: 'no content', reason: 'no_content' };
     const clean = fitContent(filtered, limits);
-    if (!clean) return { why: 'the message does not fit the IM size limit' };
+    if (!clean) return { why: 'the message does not fit the IM size limit', reason: 'too_large' };
     if (asksForCredential(raw, clean) || (addressee && asksForCredential({ templateName: addressee }, { templateName: addressee }))) {
-      return { why: 'it asks for a credential', credential: true };
+      return { why: 'it asks for a credential', reason: 'asks_for_credential', credential: true };
     }
     const text = renderStarter({ ...clean, addressee: addressee ?? '' });
-    if (!withinLimits({ text }, limits)) return { why: 'the message does not fit the IM size limit' };
+    if (!withinLimits({ text }, limits)) return { why: 'the message does not fit the IM size limit', reason: 'too_large' };
     return { text };
   }
 
@@ -123,7 +138,7 @@ export function createStarter({
     put(id, { stage: 'checking', claimed_at: claim.claimed_at, claimed_local_at: now(), content_sha256: contentHash(raw) });
     if (before.credential) {
       logger.warn(`${tag(job)} not sent: it asks for a credential`);
-      return finish(job, 'rejected_content');
+      return finish(job, 'rejected_content', before.reason);
     }
     let dm;
     try {
@@ -131,11 +146,11 @@ export function createStarter({
     } catch (err) {
       if (!(err instanceof ImError)) logger.error(`${tag(job)}: DM check failed: ${err.message}`);
       else logger.warn(`${tag(job)} not sent: DM check failed (${err.message})`);
-      return finish(job, 'send_failed');
+      return finish(job, 'send_failed', `dm_check_${imReason(err)}`);
     }
     if (!dm) {
       logger.warn(`${tag(job)} not sent: the DM is not exactly this Agent and the adopter`);
-      return finish(job, 'send_failed');
+      return finish(job, 'send_failed', 'dm_not_one_to_one');
     }
     put(id, { stage: 'waiting', conversation_id: dm.conversationId });
     return sendWhenFree(jobs()[id]);
@@ -148,16 +163,17 @@ export function createStarter({
     try {
       raw = await content(job);
     } catch (err) {
-      return { why: `content unavailable (${err.message})` };
+      return { why: `content unavailable (${err.message})`, reason: 'content_unavailable' };
     }
-    if (!raw || contentHash(raw) !== job.content_sha256) return { why: 'the content changed after the claim' };
+    if (!raw || contentHash(raw) !== job.content_sha256) return { why: 'the content changed after the claim', reason: 'content_changed' };
     let dm;
     try {
       dm = await verifiedDm(job, await orgs.agentId(job.org_id));
     } catch (err) {
-      return { why: `DM check failed (${err.message})` };
+      return { why: `DM check failed (${err.message})`, reason: `dm_check_${imReason(err)}` };
     }
-    if (!dm || dm.conversationId !== job.conversation_id) return { why: 'the DM is not exactly this Agent and the adopter' };
+    if (!dm) return { why: 'the DM is not exactly this Agent and the adopter', reason: 'dm_not_one_to_one' };
+    if (dm.conversationId !== job.conversation_id) return { why: 'the DM changed after the claim', reason: 'dm_changed' };
     return prepare(raw, cleanText(cleanDisplayName(dm.adopter?.display_name), { max: LIMITS.addressee, multiline: false }));
   }
 
@@ -175,13 +191,17 @@ export function createStarter({
       if (busy) {
         if (now() - job.claimed_local_at < STARTER_WAIT_MS) return undefined;
         logger.warn(`${tag(job)} not sent: the DM still had an active run ${STARTER_WAIT_MS / 60000} minutes after the claim`);
-        return finish(job, 'send_failed');
+        return finish(job, 'send_failed', 'dm_busy');
       }
     }
-    const { text, why } = await renderAgain(job);
+    const { text, why, reason } = await renderAgain(job);
     if (!text) {
       logger.warn(`${tag(job)} not sent: ${why}`);
-      return finish(job, 'send_failed');
+      return finish(job, 'send_failed', reason);
+    }
+    if (now() - job.claimed_local_at >= STARTER_SEND_BY_MS) {
+      logger.warn(`${tag(job)} not sent: the DM check ended ${STARTER_SEND_BY_MS / 60000} minutes or more after the claim`);
+      return finish(job, 'send_failed', 'too_late');
     }
     put(job.adoption_id, { stage: 'sending' });
     try {
@@ -189,7 +209,7 @@ export function createStarter({
     } catch (err) {
       if (err instanceof ImError && err.definite) {
         logger.warn(`${tag(job)}: send refused (${err.message}); not retried`);
-        return finish(job, 'send_failed');
+        return finish(job, 'send_failed', `send_refused_${imReason(err)}`);
       }
       logger.warn(`${tag(job)}: send outcome unknown (${err.message}); not retried and not reported`);
       return drop(job.adoption_id);
@@ -222,7 +242,7 @@ export function createStarter({
       }
       if (job.stage === 'checking') {
         logger.warn(`${tag(job)} was interrupted before sending; reported as send_failed`);
-        await finish(job, 'send_failed');
+        await finish(job, 'send_failed', 'interrupted');
         continue;
       }
       if (!orgs.mayContact(job.org_id)) continue;
@@ -232,7 +252,7 @@ export function createStarter({
         logger.error(`${tag(job)}: ${err.message}`);
         const cur = jobs()[job.adoption_id];
         if (cur?.stage === 'sending') drop(job.adoption_id);
-        else if (cur?.stage === 'checking') await finish(cur, 'send_failed');
+        else if (cur?.stage === 'checking') await finish(cur, 'send_failed', 'internal_error');
       }
     }
   }

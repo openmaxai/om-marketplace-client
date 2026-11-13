@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-10
+
+### Fixed
+- Starter message: the openmax CLI prints `[token] ...` lines to stdout when it
+  refreshes its token, so the DM check could fail as unreadable output and the
+  message was reported as send_failed. The client now skips every `[name] `
+  trace line and reads the trailing JSON answer.
+
+### Changed
+- Starter message: the read-only DM-check calls (`create_dm`,
+  `get_conversation`, `member_list`) are tried once more after a failure that
+  is not a refusal (unreadable output, timeout, server error). `comm.send` is
+  still never retried. A send is no longer started 9 minutes or more after the
+  claim, so a slow DM check cannot run past the market's 10-minute grace.
+- Starter message: a send_failed or rejected_content result is logged with a
+  short reason code (for example `dm_check_unreadable_output`,
+  `dm_not_one_to_one`, `send_refused_http_400`, `interrupted`), and IM errors
+  keep the CLI's error text, redacted. The reason stays local: the market's
+  `:mark-starter-shown` accepts only `result`.
+
 ## [0.5.3] - 2026-11-07
 
 ### Changed
