@@ -21,6 +21,8 @@ import { openState } from '../src/state.js';
 import { createOrgs } from '../src/orgs.js';
 import { createSkills } from '../src/skills.js';
 import { createTemplates } from '../src/templates.js';
+import { createReconciler } from '../src/reconcile.js';
+import { createActivation } from '../src/activation.js';
 import { FAKE_KEY, VALID_ENV } from '../test/helpers.js';
 const a = JSON.parse(process.argv[2]);
 const ORG = VALID_ENV.COCO_ORG_ID, AGENT = VALID_ENV.COCO_MEMBER_ID;
@@ -36,6 +38,16 @@ const templates = () => createTemplates({ api, state, orgs, logger, dataDir: a.d
 await auth.getAccessToken(ORG);
 process.stdout.write('GO\n'); armed = true;
 // The template runner is built after GO, so its startup cleanup of an earlier crash can be killed too.
-const out = a.action === 'rollback' ? s.rollback(a.skillId) : a.action === 'template' ? await templates().runNext() : await s.runRound();
+// Activation: two idle checks (they agree at the fixed clock), then the urgent reconcile queue, as the 30-s task and
+// the next poll round would.
+async function activation() {
+  const reconcile = createReconciler({ api, state, orgs, skills: s, logger, now });
+  const act = createActivation({ state, dataDir: a.dataDir, zylosDir: a.zylosDir, logger, flush: () => reconcile.flushUrgent(), now, statusFile: a.statusFile });
+  const r = [await act.tick(), await act.tick()];
+  await reconcile.flushUrgent();
+  return r;
+}
+const out = a.action === 'rollback' ? s.rollback(a.skillId) : a.action === 'template' ? await templates().runNext()
+  : a.action === 'activation' ? await activation() : await s.runRound();
 armed=false; process.stdout.write(`DONE ${calls} ${JSON.stringify(out)}\n`);
 state.close();
