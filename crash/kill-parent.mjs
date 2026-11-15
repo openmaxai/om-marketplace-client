@@ -19,7 +19,8 @@ import { templateBundle } from '../test/fake/bundle.js';
 import { fakeZylos } from '../test/fake/zylos.js';
 import { createIntentPuller } from '../src/intents.js';
 import { createTemplates } from '../src/templates.js';
-import { controlScript, createActivation } from '../src/activation.js';
+import { createActivation } from '../src/activation.js';
+import { fakeControl } from '../test/fake/control.js';
 import { emitSlot } from '../src/shard-emitter.js';
 import { ensureDeclarations, readSlots } from '../src/shards.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
@@ -142,15 +143,17 @@ function activationSetup(h) {
   fs.writeFileSync(h.statusFile, JSON.stringify({ state: 'idle', active_tools: 0, idle_seconds: 900 }));
   fs.utimesSync(h.statusFile, h.now() / 1000, h.now() / 1000);
   h.controlLog = path.join(h.dataDir, '..', 'controls.log');
-  const script = controlScript(h.zylosDir);
-  fs.mkdirSync(path.dirname(script), { recursive: true });
-  fs.writeFileSync(script, `import fs from 'node:fs';\nfs.appendFileSync(${JSON.stringify(h.controlLog)}, 'x\\n');\nconsole.log('OK: enqueued control 1');\n`);
+  // Requests stay queued (never delivered), so a restarted child must see one and not stack another.
+  h.control = fakeControl(h.zylosDir, h.controlLog);
   const c10 = (req) => {
     h.fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`, c10);
     return { status: 200, json: { results: req.json.items.map((_, index) => ({ index, outcome: 'recorded' })) } };
   };
   h.fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`, c10);
-  return createActivation({ state: h.state, dataDir: h.dataDir, zylosDir: h.zylosDir, logger: h.logger, now: h.now, statusFile: h.statusFile, enqueue: async () => {} });
+  return createActivation({
+    state: h.state, dataDir: h.dataDir, zylosDir: h.zylosDir, logger: h.logger, now: h.now, statusFile: h.statusFile,
+    control: { enqueue: async () => ({ id: null }), get: async () => 'not_found', ack: async () => {} },
+  });
 }
 
 // 'ok' when dir holds exactly the files of bundle tag (t1 / t2).
@@ -301,9 +304,9 @@ function activationIssues(h, st) {
     const want = JSON.stringify({ items: [{ kind: 'template_activated', adoption_id: ADOPTION, rendered_sha256: T1.sha }] });
     if (!sent.length) issues.push('template_activated not reported');
     if (!sent.every((r) => JSON.stringify(r.json) === want)) issues.push(`reports differ: ${sent.map((r) => r.body).join(' | ')}`);
-    if (fs.existsSync(h.controlLog)) issues.push('a new session was requested');
+    if (h.control.enqueued().length) issues.push('a new session was requested');
   } else {
-    const controls = fs.existsSync(h.controlLog) ? fs.readFileSync(h.controlLog, 'utf8').trim().split('\n').length : 0;
+    const controls = h.control.enqueued().length;
     const p = doc?.pending;
     if (!p) issues.push('activation record lost');
     // One request; a kill after it was counted but before the enqueue loses it (made again after the wait), never twice.

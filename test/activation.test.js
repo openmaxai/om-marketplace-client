@@ -8,7 +8,7 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, IDLE_MIN_SECONDS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
-  STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, controlEnqueue, createActivation, readRuntimeStatus,
+  PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { MARKER_FILE, readMarker } from '../src/shard-emitter.js';
@@ -26,18 +26,28 @@ const problem = (status, code) => ({ status, problem: { status, code } });
 
 // The activation with a fake runtime status file, a fake control queue, a fake openmax turn check and the real urgent
 // reconcile path against the fake market.
-async function harness(t, { turn = () => false, imAvailable = true, enqueueError = null, state: wrap = (s) => s } = {}) {
+// The fake control queue delivers a request at once unless `deliver` is false; `statuses` maps control id to state.
+async function harness(t, { turn = () => false, imAvailable = true, enqueueError = null, deliver = true, state: wrap = (s) => s } = {}) {
   const h = await pullHarness(t, { orgs: {} });
   const statusFile = path.join(tmpHome(), 'agent-status.json');
   const controls = [];
   const im = { available: () => imAvailable, openTurn: async () => { const r = turn(); if (r instanceof Error) throw r; return r; } };
   const reconcile = createReconciler({ api: h.api, state: h.state, orgs: h.orgs, skills: null, logger: h.logger, now: h.now });
-  const enqueue = async () => {
-    if (enqueueError) throw enqueueError;
-    controls.push(h.clock.t);
+  const statuses = new Map();
+  const acks = [];
+  const control = {
+    async enqueue() {
+      if (enqueueError) throw enqueueError;
+      controls.push(h.clock.t);
+      statuses.set(controls.length, deliver ? 'done' : 'pending');
+      return { id: controls.length };
+    },
+    async get(id) { return statuses.get(id) ?? 'not_found'; },
+    async ack(id) { acks.push(id); if (statuses.get(id) === 'pending') statuses.set(id, 'done'); },
   };
+  const withEnqueue = (enqueue) => ({ ...control, enqueue });
   const make = (state = wrap(h.state), extra = {}) => createActivation({
-    state, dataDir: h.dataDir, zylosDir: tmpHome(), logger: h.logger, im, flush: () => reconcile.flushUrgent(), now: h.now, statusFile, enqueue, ...extra,
+    state, dataDir: h.dataDir, zylosDir: tmpHome(), logger: h.logger, im, flush: () => reconcile.flushUrgent(), now: h.now, statusFile, control, ...extra,
   });
   // Writes the status file, modified ageMs before the fake now.
   const status = (over = {}, ageMs = 1000) => {
@@ -59,7 +69,7 @@ async function harness(t, { turn = () => false, imAvailable = true, enqueueError
     status(over);
     return [first, await a.tick()];
   };
-  return { ...h, statusFile, controls, reconcile, make, status, adopt, marker, advance, reports, pending, alert, twoTicks };
+  return { ...h, statusFile, controls, statuses, acks, control, withEnqueue, reconcile, make, status, adopt, marker, advance, reports, pending, alert, twoTicks };
 }
 
 const written = (f, a, id = A1, s = S1) => {
@@ -90,6 +100,7 @@ for (const [name, over, opts] of [
   ['active_tools missing', { active_tools: undefined }],
   ['idle less than 5 minutes', { idle_seconds: IDLE_MIN_SECONDS - 1 }],
   ['idle_seconds missing', { idle_seconds: undefined }],
+  ['runtime health not ok', { health: 'rate_limited' }],
   ['an open OpenMax turn', {}, { turn: () => true }],
   ['the OpenMax turn state unreadable', {}, { turn: () => new Error('no activity store') }],
 ]) {
@@ -470,18 +481,30 @@ test('welcome: an adoption without a pending write is not held', async (t) => {
   assert.equal(await f.make().welcome(A1), null);
 });
 
-test('the control queue request: new-session text, held until idle, no ack suffix, no deadline, state honoured', async () => {
+test('the control queue: enqueue (new-session text, held until idle, no ack suffix, no deadline, state honoured), get, ack', async () => {
   const calls = [];
-  const run = (file, args, opts, cb) => { calls.push({ file, args, opts }); cb(null, 'OK: enqueued control 7\n', ''); };
-  await controlEnqueue('/z', { run })();
+  const answer = { enqueue: [null, 'OK: enqueued control 7\n', ''], get: [null, 'status=pending\n', ''], ack: [null, 'OK: control 7 marked as done\n', ''] };
+  const run = (file, args, opts, cb) => { calls.push({ file, args, opts }); cb(...answer[args[1]]); };
+  const c = createControl('/z', { run });
+  assert.deepEqual(await c.enqueue(), { id: 7 });
   assert.equal(calls[0].file, process.execPath);
   assert.deepEqual(calls[0].args, [
     '/z/.claude/skills/comm-bridge/scripts/c4-control.js', 'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix',
   ]);
+  assert.equal(calls[0].opts.timeout, CONTROL_TIMEOUT_MS);
   assert.equal(NEW_SESSION_TEXT, 'Agent Market templates were updated; please use the new-session skill to start a new session.');
   assert.ok(!calls[0].args.includes('--bypass-state') && !calls[0].args.includes('--ack-deadline'));
-  await assert.rejects(controlEnqueue('/z', { run: (f, a, o, cb) => cb(Object.assign(new Error('x'), { code: 1 }), '', 'err') })(), /exit 1/);
-  await assert.rejects(controlEnqueue('/z', { run: (f, a, o, cb) => cb(null, 'nothing', '') })(), /no confirmation/);
+  assert.equal(await c.get(7), 'pending');
+  assert.deepEqual(calls[1].args.slice(1), ['get', '--id', '7']);
+  await c.ack(7);
+  assert.deepEqual(calls[2].args.slice(1), ['ack', '--id', '7']);
+  const fail = (err, stdout = '', stderr = '') => createControl('/z', { run: (f, a, o, cb) => cb(err, stdout, stderr) });
+  const exit1 = Object.assign(new Error('x'), { code: 1 });
+  await assert.rejects(fail(exit1, '', 'Error: boom').enqueue(), (e) => e instanceof ControlError && !e.unknown && /exit 1/.test(e.message));
+  await assert.rejects(fail(Object.assign(new Error('t'), { killed: true, signal: 'SIGTERM' })).enqueue(), (e) => e.unknown && /timed out/.test(e.message));
+  await assert.rejects(fail(null, 'nothing').enqueue(), (e) => e.unknown && /no readable confirmation/.test(e.message));
+  assert.equal(await fail(exit1, '', 'Error: not found\n').get(9), 'not_found');
+  await assert.rejects(fail(exit1, '', 'Error: db locked').get(9), ControlError);
 });
 
 // Crash safety: a crash at any state write around the confirmation or the report neither loses nor duplicates the
@@ -508,7 +531,7 @@ for (const [name, point, sentBeforeCrash] of [
     const r2 = createReconciler({ api: f.api, state: f.state, orgs: f.orgs, skills: null, logger: f.logger, now: f.now });
     const b = createActivation({
       state: f.state, dataDir: f.dataDir, zylosDir: tmpHome(), logger: f.logger, flush: () => r2.flushUrgent(), now: f.now, statusFile: f.statusFile,
-      enqueue: async () => { throw new Error('not expected'); },
+      control: { enqueue: async () => { throw new Error('not expected'); }, get: async () => 'not_found', ack: async () => {} },
     });
     await b.tick();
     await r2.flushUrgent();
@@ -531,7 +554,7 @@ test('crash after the market took the report, before it was settled: resent once
   const r1 = createReconciler({ api: f.api, state: crashing, orgs: f.orgs, skills: null, logger: f.logger, now: f.now });
   const a = createActivation({
     state: crashing, dataDir: f.dataDir, zylosDir: tmpHome(), logger: f.logger, flush: () => r1.flushUrgent(), now: f.now, statusFile: f.statusFile,
-    enqueue: async () => {},
+    control: f.control,
   });
   await a.tick();
   assert.equal(f.reports().length, 1);
@@ -554,11 +577,11 @@ for (const [name, when, controlsAfterCrash] of [
     let killed = false;
     const crashing = crashingState(f.state, (k, n) => (killed ? 'before' : when === 'before' && k === 'update' && n === 'activation' ? 'after' : false));
     const a = f.make(crashing, {
-      enqueue: async () => {
+      control: f.withEnqueue(async () => {
         f.controls.push(f.clock.t);
         killed = true;
         throw new Crash('killed');
-      },
+      }),
     });
     f.status();
     await a.tick();
@@ -607,4 +630,199 @@ test('an inject_missing reported for an adoption drops its waiting activation', 
   f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
   assert.equal(await a.tick(), 'none');
   assert.deepEqual(f.reports(), []);
+});
+
+test('a request still queued is never stacked: no new request until it left the queue, then the wait counts from delivery', async (t) => {
+  const f = await harness(t, { deliver: false });
+  const a = f.make();
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  assert.equal(f.pending().control_id, 1);
+  // Hours later, still pending in the control queue (e.g. the runtime held it): waiting, nothing new.
+  for (let i = 0; i < 10; i++) {
+    f.advance(REQUEST_COOLDOWN_MS);
+    f.status();
+    assert.equal(await a.tick(), 'waiting');
+  }
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.controls.length, 1);
+  // Delivered: given CONFIRM_WAIT_MS from then.
+  f.statuses.set(1, 'done');
+  f.status();
+  assert.equal(await a.tick(), 'waiting');
+  assert.equal(f.pending().control_id, null);
+  f.advance(CONFIRM_WAIT_MS - ACTIVATION_CHECK_MS);
+  f.status();
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(2 * ACTIVATION_CHECK_MS);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  assert.equal(f.controls.length, 2);
+});
+
+test('a control state that cannot be read counts as still queued', async (t) => {
+  const f = await harness(t, { deliver: false });
+  const a = f.make();
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  const b = f.make(f.state, { control: { ...f.control, get: async () => { throw new ControlError('control status unavailable (exit 1)'); } } });
+  f.advance(REQUEST_COOLDOWN_MS + CONFIRM_WAIT_MS);
+  assert.deepEqual(await f.twoTicks(b), ['waiting', 'waiting']);
+  assert.equal(f.controls.length, 1);
+});
+
+test('a session confirming the record withdraws its request still queued', async (t) => {
+  const f = await harness(t, { deliver: false });
+  const a = f.make();
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  f.advance(1000);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.fake.script('POST', C10, recordAll());
+  assert.equal(await a.tick(), 'confirmed');
+  assert.deepEqual(f.acks, [1]);
+  assert.equal(f.statuses.get(1), 'done');
+});
+
+test('a timed-out enqueue stays counted and is not repeated before the confirm wait', async (t) => {
+  let attempts = 0;
+  const f = await harness(t);
+  const timedOut = f.withEnqueue(async () => { attempts += 1; throw new ControlError('control enqueue timed out', { unknown: true }); });
+  const a = f.make(f.state, { control: timedOut });
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  const p = f.pending();
+  assert.equal(p.request_count, 1);
+  assert.equal(p.control_id, null);
+  assert.equal(f.state.read('activation', null).requests.length, 1);
+  for (let i = 0; i < 25; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status();
+    assert.notEqual(await a.tick(), 'requested');
+  }
+  assert.equal(attempts, 1);
+});
+
+test('welcome and tick at the same time give exactly one control', async (t) => {
+  const f = await harness(t);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const slow = f.withEnqueue(async () => {
+    await gate;
+    f.controls.push(f.clock.t);
+    return { id: f.controls.length };
+  });
+  const a = f.make(f.state, { control: slow });
+  written(f, a);
+  f.status();
+  assert.equal(await a.tick(), 'sampled');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status();
+  const both = Promise.all([a.tick(), a.welcome(A1)]);
+  await new Promise((r) => { setImmediate(r); });
+  release();
+  const [r, hold] = await both;
+  assert.equal(f.controls.length, 1);
+  // Whichever came first made the request; the other one saw it.
+  assert.ok(['requested', 'waiting', 'sampled'].includes(r), r);
+  assert.equal(hold, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.pending().request_count, 1);
+  assert.equal(f.state.read('activation', null).requests.length, 1);
+});
+
+test('a refused enqueue does not restore an old request count over the reset of a write merged meanwhile', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a);
+  // Two requests made and delivered, no session.
+  for (let n = 0; n < 2; n++) {
+    assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+    f.status();
+    await a.tick();
+    f.advance(REQUEST_COOLDOWN_MS + CONFIRM_WAIT_MS);
+  }
+  assert.equal(f.pending().request_count, 2);
+  const b = f.make(f.state, {
+    control: f.withEnqueue(async () => {
+      written(f, b, A2, S2);
+      throw new ControlError('control enqueue failed (exit 1)');
+    }),
+  });
+  assert.deepEqual(await f.twoTicks(b), ['sampled', 'enqueue_failed']);
+  const p = f.pending();
+  assert.equal(p.request_count, 0);
+  assert.deepEqual(p.targets.map((x) => x.adoption_id), [A1, A2]);
+});
+
+test('a record pending for 24 hours raises its own alert, cleared when it is confirmed', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a);
+  const alerts = () => f.state.read('status', { alerts: {} }).alerts;
+  f.status({ state: 'busy' });
+  assert.equal(await a.tick(), 'busy');
+  assert.equal(alerts()[PENDING_ALERT], undefined);
+  f.advance(PENDING_ALERT_MS);
+  f.status({ state: 'busy' });
+  assert.equal(await a.tick(), 'busy');
+  assert.ok(alerts()[PENDING_ALERT]);
+  assert.equal(alerts()[STUCK_ALERT], undefined);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.fake.script('POST', C10, recordAll());
+  f.advance(1000);
+  assert.equal(await a.tick(), 'confirmed');
+  assert.equal(alerts()[PENDING_ALERT], undefined);
+});
+
+test('an unreadable OpenMax turn state is warned about once and counts as busy', async (t) => {
+  const f = await harness(t, { turn: () => new Error('Cannot find module run-store.js') });
+  const a = f.make();
+  written(f, a);
+  for (let i = 0; i < 3; i++) {
+    f.status();
+    assert.equal(await a.tick(), 'busy');
+  }
+  assert.equal(f.lines.filter((l) => /OpenMax turn state unreadable/.test(l) && /WARN/i.test(l)).length, 1);
+});
+
+test('a rewrite of the bundle the current session already shows needs no session and is reported at once', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  f.adopt(A1, S1);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.advance(1000);
+  f.fake.script('POST', C10, recordAll());
+  assert.equal(a.recordWrite({ adoptionId: A1, renderedSha: S1, at: new Date(f.clock.t).toISOString() }), 'active');
+  assert.equal(f.pending(), null);
+  await f.reconcile.flushUrgent();
+  assert.deepEqual(f.reports(), [[{ kind: 'template_activated', adoption_id: A1, rendered_sha256: S1 }]]);
+  assert.deepEqual(await f.twoTicks(a), ['none', 'none']);
+  assert.deepEqual(f.controls, []);
+  // Another bundle is a change.
+  f.adopt(A1, S2);
+  assert.equal(a.recordWrite({ adoptionId: A1, renderedSha: S2, at: new Date(f.clock.t).toISOString() }), 'pending');
+  assert.deepEqual(f.pending().targets, [{ adoption_id: A1, rendered_sha256: S2 }]);
+});
+
+test('requests are one at a time: two starter messages and an idle check at once give one control', async (t) => {
+  const f = await harness(t);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const a = f.make(f.state, {
+    control: f.withEnqueue(async () => {
+      await gate;
+      f.controls.push(f.clock.t);
+      return { id: f.controls.length };
+    }),
+  });
+  written(f, a, A1, S1);
+  written(f, a, A2, S2);
+  f.status();
+  const all = Promise.all([a.welcome(A1), a.welcome(A2), a.tick(), a.tick()]);
+  await new Promise((r) => { setImmediate(r); });
+  release();
+  const [h1, h2] = await all;
+  assert.equal(f.controls.length, 1);
+  assert.equal(h1, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(h2, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.pending().request_count, 1);
 });

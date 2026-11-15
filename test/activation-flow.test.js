@@ -7,10 +7,11 @@ import { startFakeStorage } from './fake/storage.js';
 import { templateBundle } from './fake/bundle.js';
 import { fakeZylos } from './fake/zylos.js';
 import { tmpHome } from './helpers.js';
+import { fakeControl } from './fake/control.js';
 import { createIntentPuller } from '../src/intents.js';
 import { createTemplates } from '../src/templates.js';
 import { createReconciler } from '../src/reconcile.js';
-import { ACTIVATION_CHECK_MS, NEW_SESSION_TEXT, WELCOME_HOLD_MS, controlScript, createActivation } from '../src/activation.js';
+import { ACTIVATION_CHECK_MS, NEW_SESSION_TEXT, WELCOME_HOLD_MS, createActivation } from '../src/activation.js';
 import { ensureDeclarations, readSlots } from '../src/shards.js';
 import { MARKER_FILE, emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
@@ -25,16 +26,6 @@ const C10 = `${B}/reconcile`;
 const applied = { status: 200, json: { adoption_id: ADOPTION, status: 'active', outcome: 'applied' } };
 const recordAll = (req) => ({ status: 200, json: { results: req.json.items.map((_, index) => ({ index, outcome: 'recorded' })) } });
 
-// A fake control queue: the comm-bridge c4-control.js of the zylos dir, recording its arguments.
-function fakeControl(zylosDir) {
-  const script = controlScript(zylosDir);
-  const log = path.join(tmpHome(), 'controls.jsonl');
-  fs.mkdirSync(path.dirname(script), { recursive: true });
-  fs.writeFileSync(script, `import fs from 'node:fs';\nfs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`
-    + 'const n = fs.readFileSync(' + JSON.stringify(log) + ", 'utf8').trim().split('\\n').length;\nconsole.log('OK: enqueued control ' + n);\n");
-  return () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
-}
-
 // Template write, uninstall and activation end to end: fake market and storage, a zylos dir with the slot hooks, a
 // fake control queue, a fake runtime status file and the real shard emitter writing the marker.
 async function flow(t, { starterMessage = false } = {}) {
@@ -43,7 +34,8 @@ async function flow(t, { starterMessage = false } = {}) {
   t.after(storage.close);
   const zylosDir = fakeZylos({ hooks: true });
   ensureDeclarations(zylosDir);
-  const controls = fakeControl(zylosDir);
+  const queue = fakeControl(zylosDir, path.join(tmpHome(), 'controls.jsonl'));
+  const controls = queue.enqueued;
   const statusFile = path.join(zylosDir, 'activity-monitor', 'agent-status.json');
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   const status = (over = {}) => {
@@ -84,7 +76,7 @@ async function flow(t, { starterMessage = false } = {}) {
   const reports = () => h.fake.requests.filter((r) => r.path === C10).map((r) => r.json.items);
   const writeResults = () => h.fake.requests.filter((r) => r.path === C15).map((r) => r.json);
   const intents = [];
-  return { ...h, intents, writeResults, bundle, zylosDir, controls, status, order, templates, activation, reconcile, starts, session, reports };
+  return { ...h, queue, intents, writeResults, bundle, zylosDir, controls, status, order, templates, activation, reconcile, starts, session, reports };
 }
 
 test('a template write is activated: idle Agent asked through the control queue, marker written, template_activated reported', async (t) => {
@@ -121,6 +113,8 @@ test('a template write is activated: idle Agent asked through the control queue,
   assert.ok(![rec.inject_sha256, rec.role_sha256, rec.manifest_sha256].includes(intentSha));
   assert.equal(f.state.read('activation', null).pending, null);
   assert.equal(f.controls().length, 1);
+  // The request was still queued (the fake never delivers it): confirmed by the session, it is withdrawn.
+  assert.deepEqual(f.queue.statuses(), ['done']);
 
   // Uninstall: the slot is freed; the next session must not show it; nothing is reported for a removal.
   await f.order('uninstall');
@@ -167,4 +161,47 @@ test('the marker is written by the first shard only, also when nothing is printe
   fs.writeFileSync(path.join(f.dataDir, 'slots.json'), '{');
   assert.equal(emitSlot(1, { dataDir: f.dataDir, now: f.now }), '');
   assert.equal(emitSlot(1, { dataDir: path.join(f.dataDir, 'missing', 'dir') }), '');
+});
+
+// An Agent upgraded from 0.5.4: its adoption was written without an activation record and its slot has no bundle
+// sha256. 0.6.0 seeds it once, fills the slot, never asks for a session for it, and reports it when a session shows it.
+test('upgrade from 0.5.4: an earlier adoption is confirmed by the next natural session, without a request', async (t) => {
+  const f = await flow(t);
+  await f.order('write_template');
+  f.status({ state: 'busy' });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  // The state 0.5.4 left: no activation document, no bundle_sha256 in the slot, no marker.
+  const slotsFile = path.join(f.dataDir, 'slots.json');
+  const slots = JSON.parse(fs.readFileSync(slotsFile, 'utf8'));
+  delete slots['1'].bundle_sha256;
+  fs.writeFileSync(slotsFile, JSON.stringify(slots));
+  f.state.write('activation', {});
+  const start = () => createActivation({
+    state: f.state, dataDir: f.dataDir, zylosDir: f.zylosDir, logger: f.logger, im: { available: () => false }, flush: () => f.reconcile.flushUrgent(), now: f.now,
+  });
+  const a = start();
+  assert.equal(readSlots(f.dataDir)['1'].bundle_sha256, f.bundle.sha);
+  const doc = f.state.read('activation', null);
+  assert.equal(doc.backfilled, true);
+  assert.equal(doc.pending, null);
+  assert.deepEqual(doc.passive.targets, [{ adoption_id: ADOPTION, rendered_sha256: f.bundle.sha }]);
+  // An idle Agent is not asked for a session for it.
+  for (let i = 0; i < 4; i++) {
+    f.status();
+    assert.equal(await a.tick(), 'none');
+    f.clock.t += ACTIVATION_CHECK_MS;
+  }
+  assert.deepEqual(f.controls(), []);
+  // Seeded once only.
+  start();
+  assert.deepEqual(f.state.read('activation', null).passive.targets.length, 1);
+  f.fake.script('POST', C10, recordAll);
+  f.session();
+  f.clock.t += 1000;
+  assert.equal(await a.tick(), 'none');
+  assert.deepEqual(f.reports(), [[{ kind: 'template_activated', adoption_id: ADOPTION, rendered_sha256: f.bundle.sha }]]);
+  assert.equal(f.state.read('activation', null).passive, null);
+  assert.deepEqual(f.controls(), []);
+  start();
+  assert.equal(f.state.read('activation', null).passive, null);
 });
