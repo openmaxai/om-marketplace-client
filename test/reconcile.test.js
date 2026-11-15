@@ -8,7 +8,7 @@ import { createSkills } from '../src/skills.js';
 import { createTemplates } from '../src/templates.js';
 import { emptySlots, writeSlots } from '../src/shards.js';
 import {
-  MAX_ITEMS, MAX_URGENT_DONE, MAX_URGENT_ITEMS, RATE_BUDGET, URGENT_MAX_AGE_MS, RECONCILE_EVERY_MS, batches, createReconciler, enqueueUrgent, revokedEntry, validItem,
+  MAX_ITEMS, MAX_SINGLE_RESENDS, MAX_URGENT_DONE, MAX_URGENT_ITEMS, RATE_BUDGET, URGENT_MAX_AGE_MS, RECONCILE_EVERY_MS, batches, createReconciler, enqueueUrgent, revokedEntry, validItem,
 } from '../src/reconcile.js';
 import { EMPTY_REVOKED } from '../src/revocations.js';
 import { revocationEnforcer } from '../src/app.js';
@@ -637,3 +637,48 @@ for (const [name, refuse] of [
     assert.equal(f.reports(ORG).length, 2 * first, 'each run sends the same number of requests');
   });
 }
+
+test('urgent path, an indexed 400: the named item is dropped and the rest resent once, never item by item', async (t) => {
+  const f = await harness(t);
+  const items = [1, 2, 3].map((n) => ({ kind: 'revoked_disabled', skill_id: SK(n), skill_version_id: VER(n, 1) }));
+  enqueueUrgent(f.state, items.map((item, i) => ({ key: `k${i}`, org_id: ORG, item })));
+  let first = true;
+  f.answer.c10 = (req) => {
+    if (first) {
+      first = false;
+      return problem(400, 'VALIDATION_FAILED', { errors: [{ field: 'items[0].kind' }] });
+    }
+    return problem(400, 'VALIDATION_FAILED', { errors: [{ field: 'items[0].skill_id' }] });
+  };
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.reports(ORG).map((b) => b.length), [3, 2]);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+});
+
+test(`urgent path, a 400 naming no item: at most ${MAX_SINGLE_RESENDS} single resends per flush, the rest kept for the next`, async (t) => {
+  const f = await harness(t);
+  const items = Array.from({ length: 8 }, (_, n) => ({ kind: 'revoked_disabled', skill_id: SK(n), skill_version_id: VER(n, 1) }));
+  enqueueUrgent(f.state, items.map((item, i) => ({ key: `k${i}`, org_id: ORG, item })));
+  f.answer.c10 = (req) => (req.json.items.length > 1 ? problem(400, 'VALIDATION_FAILED') : recordAll(req));
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.reports(ORG).map((b) => b.length), [8, 1, 1, 1, 1, 1]);
+  assert.equal(f.state.read('reconcile_urgent', null).items.length, 8 - MAX_SINGLE_RESENDS);
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.reports(ORG).map((b) => b.length), [8, 1, 1, 1, 1, 1, 3, 1, 1, 1]);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+});
+
+test('urgent items queued without queued_at are stamped at the next flush and age out 7 days later', async (t) => {
+  const f = await harness(t);
+  f.state.write('reconcile_urgent', { items: [{ key: 'old', org_id: ORG2, item: { kind: 'revoked_disabled', skill_id: SK(1), skill_version_id: VER(1, 1) } }], done: [] });
+  f.orgs.markLeft(ORG2, 'member_removed');
+  await f.reconciler.flushUrgent();
+  const [it] = f.state.read('reconcile_urgent', null).items;
+  assert.equal(it.queued_at, new Date(f.clock.t).toISOString());
+  f.clock.t += URGENT_MAX_AGE_MS - 1000;
+  await f.reconciler.flushUrgent();
+  assert.equal(f.state.read('reconcile_urgent', null).items.length, 1);
+  f.clock.t += 2000;
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+});

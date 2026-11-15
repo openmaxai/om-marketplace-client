@@ -19,6 +19,8 @@ export const EMPTY_URGENT = Object.freeze({ items: [], done: [] });
 // org unreachable all that time) is dropped.
 export const MAX_URGENT_ITEMS = 200;
 export const URGENT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// Items sent one by one after a 400 that named none of them, per flush.
+export const MAX_SINGLE_RESENDS = 5;
 const TEMPLATE_STATUS = new Set(['template_activated', 'template_inject_missing']);
 
 const SKILL = { required: ['skill_id'], optional: ['skill_version_id', 'installed_sha256'] };
@@ -238,8 +240,8 @@ export function createReconciler({
     }
   }
 
-  // The status of the last refused report (for the urgent queue).
-  let lastRefused = null;
+  // Set when a report was refused with a 400 that named no item (for the urgent queue).
+  let unnamed400 = false;
 
   // Sends entries in batches; returns 'ok', 'dropped' (sent without items or batches the market refused), 'deferred',
   // 'rate_limited', 'budget_unsaved' or 'rejected'. A batch refused with 400 is resent once without the items it names, or skipped.
@@ -271,9 +273,10 @@ export function createReconciler({
         const what = `reconcile report to org ${orgId} rejected (${code})`;
         state.setAlert(`reconcile:${orgId}`, what);
         logger.error(what);
-        lastRefused = err.status;
         const bad = new Set((err.errors ?? []).map((e) => ITEM_INDEX_RE.exec(e?.field ?? '')?.[1]).filter(Boolean).map(Number));
         if (err.status !== 400) return 'rejected';
+        if (!bad.size) unnamed400 = true;
+        for (const i of bad) if (batch[i]) batch[i].refused = true;
         dropped = true;
         const rest = batch.filter((_, i) => !bad.has(i));
         if (!retried && bad.size && rest.length) queue.unshift({ batch: rest, retried: true });
@@ -404,6 +407,13 @@ export function createReconciler({
   // once the market answered it (recorded or skipped alike) or refused it; it stays queued when the report was not
   // delivered (transient error, rate limit, unsaved budget, org not reachable) and is sent again by the next flush.
   async function flushUrgent() {
+    // Items queued before queued_at was recorded are stamped now, so they age out like the others.
+    if (urgentDoc(state).items.some((x) => !Number.isFinite(Date.parse(x.queued_at)))) {
+      state.update('reconcile_urgent', EMPTY_URGENT, (raw) => {
+        for (const x of Array.isArray(raw?.items) ? raw.items : []) if (!Number.isFinite(Date.parse(x.queued_at))) x.queued_at = new Date(now()).toISOString();
+        return raw;
+      });
+    }
     const queued = urgentDoc(state).items;
     if (!queued.length) return { sent: 0, left: 0 };
     const tally = { recorded: 0, skipped: 0 };
@@ -446,24 +456,33 @@ export function createReconciler({
           }
         },
       }));
-      lastRefused = null;
+      unnamed400 = false;
       let r = await send(orgId, agentId, entries, tally);
-      // A 400 for a batch (for example an older market that does not know an item kind) may not name the item: the
-      // items left are sent one by one, so only the refused ones are lost.
-      let rest = entries.filter((_, i) => !done.includes(list[i].key));
-      if ((r === 'dropped' || r === 'rejected') && lastRefused === 400 && rest.length > 1) {
-        for (const e of rest) {
-          const one = await send(orgId, agentId, [e], tally);
-          if (one === 'rate_limited' || one === 'deferred' || one === 'budget_unsaved') {
-            r = one;
-            break;
+      const keyOf = (e) => list[entries.indexOf(e)].key;
+      const open = () => entries.filter((e) => !done.includes(keyOf(e)));
+      // A 400 that named no item (for example from a market that does not know an item kind): the items it may have
+      // refused are sent one by one, at most MAX_SINGLE_RESENDS per flush (they share the hourly budget); the ones not
+      // tried yet stay queued for the next flush. Items a 400 named are dropped as before.
+      let kept = [];
+      if ((r === 'dropped' || r === 'rejected') && unnamed400) {
+        const singles = open().filter((e) => !e.refused);
+        if (singles.length > 1) {
+          kept = singles.slice(MAX_SINGLE_RESENDS);
+          for (const e of singles.slice(0, MAX_SINGLE_RESENDS)) {
+            const one = await send(orgId, agentId, [e], tally);
+            if (one === 'rate_limited' || one === 'deferred' || one === 'budget_unsaved') {
+              r = one;
+              break;
+            }
+            if (!done.includes(keyOf(e))) settle([keyOf(e)]);
           }
-          if (!done.includes(list[entries.indexOf(e)].key)) settle([list[entries.indexOf(e)].key]);
         }
-        rest = entries.filter((_, i) => !done.includes(list[i].key) && urgentDoc(state).items.some((x) => x.key === list[i].key));
       }
       sent += done.length;
-      if (r === 'ok' || r === 'dropped' || r === 'rejected') settle(rest.map((e) => list[entries.indexOf(e)].key));
+      if (r === 'ok' || r === 'dropped' || r === 'rejected') {
+        const queuedNow = new Set(urgentDoc(state).items.map((x) => x.key));
+        settle(open().filter((e) => !kept.includes(e) && queuedNow.has(keyOf(e))).map(keyOf));
+      }
       if (r === 'ok') state.clearAlert(`reconcile:${orgId}`);
       else logger.warn(`reconcile: urgent report to org ${orgId}: ${r}`);
     }
