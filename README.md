@@ -187,12 +187,66 @@ file hashes are never sent.
 - The market shows the list only; it is never used to decide visibility,
   installs or reconcile.
 
-## Starter message
+## Template activation
+
+Template content reaches the Agent only through the `market-template-*`
+session-start shards, so a template write, upgrade or uninstall takes effect
+when a session next starts. The client does not wait for that to happen by
+chance. It is always on; there is no setting to turn it off.
+
+1. After the market accepted the write (or the uninstall that took a template
+   out of its slot), the change is recorded as pending activation:
+   `{pending_since, targets: [{adoption_id, rendered_sha256}], removed:
+   [adoption_id]}`. There is one record per Agent; later changes merge into it,
+   so changes close together share one session. The record survives restarts.
+2. Every 30 seconds, apart from the 5-minute poll round, the client checks
+   whether it may ask for a new session. All of these must hold: the runtime
+   status file (`~/zylos/activity-monitor/agent-status.json`) was written less
+   than 60 seconds ago and shows `state` idle, `active_tools` 0 and
+   `idle_seconds` at least 300, in two consecutive checks; no OpenMax
+   conversation has an open turn, nor one closed by a reply within the last 10
+   minutes (openmax's own activity store); the last automatic request was 30
+   minutes ago or more; fewer than 4 were made this UTC day. A missing or stale
+   status file means no request.
+3. The request goes to the zylos control queue: "Agent Market templates were
+   updated; please use the new-session skill to start a new session.", held
+   until the Agent is idle, without an ack suffix or deadline. The Agent starts
+   the session through its new-session skill.
+4. At every session start the first shard writes `injected.json` in the data
+   directory: `{at, items: [{adoption_id, rendered_sha256}]}`, the templates
+   that session was given (`rendered_sha256` is the bundle sha256, the same
+   value the client reports on the write result). Writing it never fails the
+   shard. A session that started after the last change, requested or not
+   (a restart, a context rollover), confirms the record when it lists every
+   target with its sha256 and none of the removed adoptions. The client then
+   reports `template_activated` for each target through the reconcile report,
+   at once. A target missing from the session or listed with another sha256 is
+   reported as `template_inject_missing` instead and not retried.
+5. A request not followed by a session within 15 minutes is made again, at most
+   3 times per change. Then the alert `template_activation_stuck` is raised;
+   the record stays pending and a later session still confirms it.
+
+Reports that must not wait for the periodic reconcile run (`template_activated`,
+`template_inject_missing` from a session check, and `revoked_disabled` when a
+revocation is applied) are queued in the client state and sent at once in a
+reconcile request of their own. One that is not delivered is sent again first
+by the next poll round, also after a restart; one the market answered
+(`recorded` or `skipped`) or refused is dropped. A report never carries both
+`template_activated` and `template_inject_missing` for one adoption, and once
+`template_inject_missing` was reported for an adoption, an activation of it
+still waiting is dropped.
+
 
 After the market accepted the first write of an adopted expert template whose
 order carries `starter_message`, the client sends the adopter one plain-text
 welcome message from this Agent's own OpenMax IM account. The template text
 never reaches the model.
+
+When the Agent has been idle for 30 seconds with no open OpenMax turn at that
+moment, the client asks for a new session at once (see
+[Template activation](#template-activation)) and holds the message until the
+session has the template, or for at most 3 minutes. Otherwise the message is
+handled at once, as below. The claim always comes right before the send.
 
 1. The client claims the message with the market (`:claim-starter`). Anything
    but `claimed` (`already_claimed`, `already_shown`, `disabled`,
@@ -292,8 +346,10 @@ Release checklist:
   process per data directory, but processes in different PID namespaces cannot
   see each other, so two containers that both run the client as PID 1 would
   each treat the other's lock as their own stale lock.
-- Installing or upgrading a skill or template may cause the Agent to restart
-  or to pick up the change only in its next session.
+- Installing or upgrading a skill may cause the Agent to restart or to pick up
+  the change only in its next session. A template write, upgrade or uninstall
+  also takes effect at the next session start, but the client asks an idle
+  Agent for that session itself; see [Template activation](#template-activation).
 - Revoked versions are moved to `quarantine/` and never deleted; the revoked
   set is never cleared.
 
