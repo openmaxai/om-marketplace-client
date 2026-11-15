@@ -211,11 +211,14 @@ chance. It is always on; there is no setting to turn it off.
    status file means no request.
 3. The request goes to the zylos control queue: "Agent Market templates were
    updated; please use the new-session skill to start a new session.", held
-   until the Agent is idle, without an ack suffix or deadline. The Agent starts
-   the session through its new-session skill. The client keeps the control id
-   and follows it with `c4-control.js get`; while it is pending no other
-   request is made, and one still pending when the change is confirmed is
-   withdrawn (`ack`). An enqueue that timed out counts as made. Requests are
+   until the Agent is idle, without an ack suffix, with a 6-hour ack deadline
+   (the control queue gives up a request not delivered by then; a delivered
+   one is marked done at once). The Agent starts the session through its
+   new-session skill. The client keeps the control id and follows it with
+   `c4-control.js get`; while it is pending or running no other request is
+   made, and one still pending when the change is confirmed is withdrawn
+   (`ack`). A control id older than 24 hours is given up (acked, best effort)
+   whatever its state. An enqueue that timed out counts as made. Requests are
    made one at a time.
 4. At every session start the first shard writes `injected.json` in the data
    directory: `{at, items: [{adoption_id, rendered_sha256}]}`, the templates
@@ -245,8 +248,9 @@ reconcile request of their own. One that is not delivered is sent again first
 by the next poll round, also after a restart; one the market answered
 (`recorded` or `skipped`) or refused is dropped. When a market refuses a batch
 with 400 without naming the item (for example a market that does not know an
-item kind), the items are sent again one by one, so only the refused one is
-lost. At most 200 items are queued (the oldest are dropped first), and an
+item kind), the items are sent again one by one (at most 5 per flush; the
+rest wait for the next), so only the refused one is lost. Items a 400 named
+are dropped and the rest resent once. At most 200 items are queued (the oldest are dropped first), and an
 item not delivered for 7 days is dropped. A report never carries both
 `template_activated` and `template_inject_missing` for one adoption, and once
 `template_inject_missing` was reported for an adoption, an activation of it
