@@ -30,6 +30,11 @@ export const STUCK_ALERT = 'template_activation_stuck';
 export const PENDING_ALERT = 'template_activation_pending_24h';
 export const NEW_SESSION_TEXT = 'Agent Market templates were updated; please use the new-session skill to start a new session.';
 export const CONTROL_TIMEOUT_MS = 15_000;
+// The control queue gives up a request not delivered (or left running) after this; passed as its ack deadline. With
+// --no-ack-suffix the runtime marks a submitted request done itself, so the deadline only ends one that is stuck.
+export const CONTROL_ACK_DEADLINE_S = 6 * 60 * 60;
+// A control id older than this (from the request) is taken as gone, whatever the queue still says.
+export const CONTROL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_SAMPLE_GAP_MS = 2.5 * ACTIVATION_CHECK_MS;
 const HISTORY_KEEP_MS = 2 * 24 * 60 * 60 * 1000;
 // Control queue states in which the request may still be delivered.
@@ -66,7 +71,9 @@ export function createControl(zylosDir, { run = execFile, timeoutMs = CONTROL_TI
     async enqueue() {
       let out;
       try {
-        out = await call(['enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix']);
+        out = await call([
+          'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix', '--ack-deadline', String(CONTROL_ACK_DEADLINE_S),
+        ]);
       } catch (err) {
         if (err.killed || err.signal) throw new ControlError('control enqueue timed out', { unknown: true });
         throw new ControlError(`control enqueue failed (exit ${err.code ?? 'unknown'})`);
@@ -149,11 +156,12 @@ export function createActivation({
   }
 
   // A control queue request no longer needed (its record was confirmed or dropped) is acked while it is still pending,
-  // so it is never delivered. Best effort.
-  async function cancel(id) {
+  // so it is never delivered; with force it is acked whatever its state (one given up after CONTROL_MAX_AGE_MS).
+  // Best effort.
+  async function cancel(id, force = false) {
     if (!Number.isSafeInteger(id)) return;
     try {
-      if ((await control.get(id)) === 'pending') {
+      if (force || (await control.get(id)) === 'pending') {
         await control.ack(id);
         logger.info(`activation: new-session request ${id} is no longer needed; withdrawn`);
       }
@@ -243,6 +251,12 @@ export function createActivation({
   // cannot be read), otherwise its id is dropped (the first time it is seen delivered is kept as delivered_at).
   async function followControl(p) {
     if (!Number.isSafeInteger(p?.control_id)) return 'none';
+    if (now() - Date.parse(p.requested_at) >= CONTROL_MAX_AGE_MS || !Number.isFinite(Date.parse(p.requested_at))) {
+      logger.warn(`activation: new-session request ${p.control_id} still not settled after a day; no longer waited for`);
+      await cancel(p.control_id, true);
+      save((d) => { if (d.pending?.control_id === p.control_id) d.pending.control_id = null; });
+      return 'gone';
+    }
     let st;
     try {
       st = await control.get(p.control_id);
@@ -335,9 +349,12 @@ export function createActivation({
     for (const t of missing) logger.warn(`activation: the session did not get template adoption ${t.adoption_id}; reported as inject missing`);
     // The reports are queued before the record changes; the same keys are ignored when a crash repeats this.
     queue(entries);
+    // The control id is read inside the update, so a request made meanwhile (a starter message) is withdrawn too.
+    let controlId = null;
     save((d) => {
       if (!d.pending || d.pending.written_at !== p.written_at) return;
       if (removedGone) {
+        controlId = d.pending.control_id ?? null;
         d.pending = null;
         return;
       }
@@ -348,7 +365,7 @@ export function createActivation({
     if (removedGone) {
       clearAlerts();
       logger.info(`activation: confirmed by the session started at ${new Date(marker.at).toISOString()}`);
-      await cancel(p.control_id);
+      await cancel(controlId);
     }
     if (entries.length) await flush();
     return removedGone ? 'confirmed' : 'unconfirmed';

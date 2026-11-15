@@ -8,7 +8,7 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, IDLE_MIN_SECONDS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
-  PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
+  CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { MARKER_FILE, readMarker } from '../src/shard-emitter.js';
@@ -481,7 +481,7 @@ test('welcome: an adoption without a pending write is not held', async (t) => {
   assert.equal(await f.make().welcome(A1), null);
 });
 
-test('the control queue: enqueue (new-session text, held until idle, no ack suffix, no deadline, state honoured), get, ack', async () => {
+test('the control queue: enqueue (new-session text, held until idle, no ack suffix, 6 h ack deadline, state honoured), get, ack', async () => {
   const calls = [];
   const answer = { enqueue: [null, 'OK: enqueued control 7\n', ''], get: [null, 'status=pending\n', ''], ack: [null, 'OK: control 7 marked as done\n', ''] };
   const run = (file, args, opts, cb) => { calls.push({ file, args, opts }); cb(...answer[args[1]]); };
@@ -490,10 +490,12 @@ test('the control queue: enqueue (new-session text, held until idle, no ack suff
   assert.equal(calls[0].file, process.execPath);
   assert.deepEqual(calls[0].args, [
     '/z/.claude/skills/comm-bridge/scripts/c4-control.js', 'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix',
+    '--ack-deadline', String(CONTROL_ACK_DEADLINE_S),
   ]);
+  assert.equal(CONTROL_ACK_DEADLINE_S, 6 * 60 * 60);
   assert.equal(calls[0].opts.timeout, CONTROL_TIMEOUT_MS);
   assert.equal(NEW_SESSION_TEXT, 'Agent Market templates were updated; please use the new-session skill to start a new session.');
-  assert.ok(!calls[0].args.includes('--bypass-state') && !calls[0].args.includes('--ack-deadline'));
+  assert.ok(!calls[0].args.includes('--bypass-state'));
   assert.equal(await c.get(7), 'pending');
   assert.deepEqual(calls[1].args.slice(1), ['get', '--id', '7']);
   await c.ack(7);
@@ -825,4 +827,79 @@ test('requests are one at a time: two starter messages and an idle check at once
   assert.equal(h1, f.clock.t + WELCOME_HOLD_MS);
   assert.equal(h2, f.clock.t + WELCOME_HOLD_MS);
   assert.equal(f.pending().request_count, 1);
+});
+
+for (const [name, stuckState] of [
+  ['left running', (f) => { f.statuses.set(1, 'running'); return f.control; }],
+  ['unreadable', (f) => ({ ...f.control, get: async () => { throw new ControlError('control status unavailable (exit 1)'); } })],
+]) {
+  test(`a request ${name} for good is given up after a day and the next request follows`, async (t) => {
+    const f = await harness(t, { deliver: false });
+    written(f, f.make());
+    assert.deepEqual(await f.twoTicks(f.make()), ['sampled', 'requested']);
+    const a = f.make(f.state, { control: stuckState(f) });
+    for (let i = 0; i < 47; i++) {
+      f.advance(REQUEST_COOLDOWN_MS);
+      f.status();
+      assert.equal(await a.tick(), 'waiting');
+    }
+    assert.equal(f.controls.length, 1);
+    f.advance(REQUEST_COOLDOWN_MS);
+    const r = await f.twoTicks(a);
+    assert.ok(r.includes('requested'), JSON.stringify(r));
+    assert.ok(f.acks.includes(1), 'the stale request is acked');
+    assert.equal(f.controls.length, 2);
+    assert.equal(f.pending().request_count, 2);
+    assert.ok(CONTROL_MAX_AGE_MS <= 24 * 60 * 60 * 1000);
+  });
+}
+
+test('a request left running at the last allowed request ends in the stuck alert, not in waiting for ever', async (t) => {
+  const f = await harness(t, { deliver: false });
+  const a = f.make();
+  written(f, a);
+  for (let n = 1; n <= MAX_REQUESTS; n++) {
+    let r;
+    for (let i = 0; i < 400 && r !== 'requested'; i++) {
+      f.status();
+      r = await a.tick();
+      f.advance(ACTIVATION_CHECK_MS);
+    }
+    assert.equal(r, 'requested');
+    f.statuses.set(n, n < MAX_REQUESTS ? 'done' : 'running');
+    f.status();
+    await a.tick();
+    f.advance(CONFIRM_WAIT_MS + REQUEST_COOLDOWN_MS);
+  }
+  f.status();
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONTROL_MAX_AGE_MS);
+  f.status();
+  assert.equal(await a.tick(), 'stuck');
+  assert.equal(f.alert(), true);
+  assert.equal(f.controls.length, MAX_REQUESTS);
+});
+
+test('confirm withdraws the request recorded at the time of its update, also one made after the record was read', async (t) => {
+  const f = await harness(t, { deliver: false });
+  written(f, f.make());
+  f.advance(1000);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.fake.script('POST', C10, recordAll());
+  f.statuses.set(5, 'pending');
+  // A starter message's request lands right after the check read the record (reads: start-up, passive targets, record).
+  let reads = 0;
+  const racing = {
+    ...f.state,
+    read: (name, fb) => {
+      const r = f.state.read(name, fb);
+      if (name === 'activation' && ++reads === 3) {
+        f.state.update('activation', {}, (d) => { Object.assign(d.pending, { control_id: 5, requested_at: new Date(f.clock.t).toISOString() }); return d; });
+      }
+      return r;
+    },
+  };
+  assert.equal(await f.make(racing).tick(), 'confirmed');
+  assert.deepEqual(f.acks, [5]);
+  assert.equal(f.statuses.get(5), 'done');
 });

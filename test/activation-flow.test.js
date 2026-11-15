@@ -93,7 +93,9 @@ test('a template write is activated: idle Agent asked through the control queue,
   f.clock.t += ACTIVATION_CHECK_MS;
   f.status();
   assert.equal(await f.activation.tick(), 'requested');
-  assert.deepEqual(f.controls(), [['enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix']]);
+  assert.deepEqual(f.controls(), [[
+    'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix', '--ack-deadline', '21600',
+  ]]);
   f.clock.t += 20_000;
   const out = f.session();
   assert.match(out[0], /# Demo/);
