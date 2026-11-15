@@ -16,6 +16,7 @@ import { createTemplates } from './templates.js';
 import { STARTER_CHECK_MS, createStarter } from './starter.js';
 import { createOpenmaxIm } from './starter/im.js';
 import { createReconciler, enqueueUrgent, revokedEntry } from './reconcile.js';
+import { ACTIVATION_CHECK_MS, createActivation } from './activation.js';
 import { createLocalSkillReporter } from './localscan.js';
 import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
@@ -59,7 +60,10 @@ export function pollRound(logger, { revocations, intents, skills, templates, sta
 export function buildTasks(logger, runtime = {}, commands = null) {
   const round = pollRound(logger, runtime);
   const starterTask = runtime.starter ? [{ name: 'starter', baseMs: STARTER_CHECK_MS, run: () => runtime.starter.runWaiting() }] : [];
+  // Independent of the poll round: confirms template activation, or asks the idle Agent for a new session.
+  const activationTask = runtime.activation ? [{ name: 'activation', baseMs: ACTIVATION_CHECK_MS, run: () => runtime.activation.tick() }] : [];
   return [
+    ...activationTask,
     ...starterTask,
     {
       name: 'poll',
@@ -162,13 +166,16 @@ export function createRuntime({
     const revocations = createRevocationPuller({
       api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates, reconcile: () => reconcile }),
     });
+    const im = createOpenmaxIm({ zylosDir });
+    const activation = createActivation({ state, dataDir, zylosDir, logger, im, flush: () => reconcile?.flushUrgent() });
     const starter = createStarter({
-      api, state, orgs, logger, im: createOpenmaxIm({ zylosDir }), enabled: config.starter_message?.enabled !== false,
+      api, state, orgs, logger, im, enabled: config.starter_message?.enabled !== false, activation,
     });
     templates = createTemplates({
       api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal, starter,
+      activation,
     });
-    reconcile = createReconciler({ api, state, orgs, skills, templates, logger });
+    reconcile = createReconciler({ api, state, orgs, skills, templates, logger, onInjectMissing: (id) => activation.dropTarget(id) });
     return {
       state,
       api,
@@ -179,6 +186,7 @@ export function createRuntime({
       revocations,
       templates,
       starter,
+      activation,
       reconcile,
       localSkills: createLocalSkillReporter({ api, state, orgs, logger, skillsDir, zylosDir }),
     };

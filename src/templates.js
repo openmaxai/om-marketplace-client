@@ -111,7 +111,7 @@ export function cleanLeftovers(dataDir) {
 // template_reports and resent unchanged first.
 export function createTemplates({
   api, state, orgs, logger, dataDir, zylosDir, revocations = null, emulatorOrigin = null, fetchImpl, now = Date.now, sleep, signal = null,
-  starter = null,
+  starter = null, activation = null,
 }) {
   const iso = () => new Date(now()).toISOString();
   const adoptions = () => state.read('adoptions', {});
@@ -133,12 +133,17 @@ export function createTemplates({
     return slots;
   }
   const slotOf = (slots, id) => Object.keys(slots).find((n) => slots[n]?.adoption_id === id);
-  const clearSlot = (id) => setSlots((s) => { const n = slotOf(s, id); if (n) s[n] = null; return Boolean(n); });
-  function assignSlot(id, injectSha, roleSha) {
+  // True when the adoption held a slot.
+  function clearSlot(id) {
+    let held = false;
+    setSlots((s) => { const n = slotOf(s, id); if (n) s[n] = null; held = Boolean(n); return held; });
+    return held;
+  }
+  function assignSlot(id, injectSha, roleSha, bundleSha) {
     setSlots((s) => {
       const n = slotOf(s, id) ?? Object.keys(s).find((k) => s[k] === null);
       if (!n) throw internal('slots_full');
-      s[n] = { adoption_id: id, inject_sha256: injectSha, ...(roleSha ? { role_sha256: roleSha } : {}) };
+      s[n] = { adoption_id: id, inject_sha256: injectSha, ...(roleSha ? { role_sha256: roleSha } : {}), ...(isSha256Hex(bundleSha) ? { bundle_sha256: bundleSha } : {}) };
       return true;
     });
   }
@@ -202,7 +207,7 @@ export function createTemplates({
     const rec = adoptions()[id];
     const st = lstatOrNull(dir(id));
     if (rec?.state === 'active' && rec.bundle_sha256 === it.bundle_sha256 && st?.isDirectory() && unchanged(rec)) {
-      return assignSlot(id, rec.inject_sha256, rec.role_sha256);
+      return assignSlot(id, rec.inject_sha256, rec.role_sha256, rec.bundle_sha256);
     }
     if (st && (!st.isDirectory() || !['active', 'writing', 'failed'].includes(rec?.state))) throw conflict('target_exists');
     if (st && rec.state === 'active' && !it.discard_local_changes && !unchanged(rec)) throw conflict('locally_modified');
@@ -244,7 +249,7 @@ export function createTemplates({
       throw err;
     }
     putAdoption(id, { state: 'active' });
-    assignSlot(id, injectSha, roleSha);
+    assignSlot(id, injectSha, roleSha, it.bundle_sha256);
   }
 
   // C-04 answers one 404 for every reason: pull C-11 first, then ask C-01 whether the intent is still pending.
@@ -334,9 +339,11 @@ export function createTemplates({
   }
 
   // Remove: clear the slot, then delete templates/<id>. An adoption with no local record is not touched on disk; it is
-  // recorded as a tombstone of this epoch instead.
+  // recorded as a tombstone of this epoch instead. unslotted tells whether the removal took a template out of a slot.
+  let unslotted = false;
   function remove(it, body) {
     const id = it.adoption_id;
+    unslotted = false;
     try {
       if (!adoptions()[id]) {
         const epoch = state.read('epoch', { tombstones: [] });
@@ -346,7 +353,7 @@ export function createTemplates({
         logger.warn(`uninstall of unknown template adoption ${id}: nothing removed`);
         return { ...body, status: 'succeeded' };
       }
-      clearSlot(id);
+      unslotted = clearSlot(id);
       const left = leftInTrash(state, logger);
       discard(dir(id), trashOf(dataDir), left);
       for (const [name] of leftovers(dataDir, id)) discard(path.join(dataDir, 'templates', name), trashOf(dataDir), left);
@@ -381,9 +388,10 @@ export function createTemplates({
     const closedFailed = wrote && res.status === 'failed';
     if (stale) revoke(r.adoption_id, 'market did not accept the write (stale)');
     else if (closedFailed && res.error_code !== 'INSTALL_TIMEOUT') revoke(r.adoption_id, 'market closed the write as failed');
-    else if (wrote && !closedFailed && r.starter_adopted_by) starter?.enqueue({
-      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, content: r.starter_content ?? null,
-    });
+    else if (wrote && !closedFailed) await activate(r);
+    else if (res && r.body.kind === 'uninstall' && r.body.status === 'succeeded' && r.activation?.removed) {
+      activation?.recordRemove({ adoptionId: r.adoption_id, at: r.activation.slot_at });
+    }
     state.update('template_reports', {}, (d) => { delete d[requestId]; });
     setIntent(r.intent_id, null);
     // The report is already settled; a failed pull only delays the sweep to the next round.
@@ -391,6 +399,25 @@ export function createTemplates({
       try { await revocations?.pull(); } catch (err) { logger.warn(`revocations pull after stale ${requestId} failed: ${err.message}`); }
     }
     return r.body.status;
+  }
+
+  // A write the market accepted waits for a session to pick it up (activation); its starter message waits for that too
+  // when a new session is requested at once. Recorded before the report is settled locally, so a crash in between
+  // records it again, unchanged.
+  async function activate(r) {
+    if (activation && r.activation?.rendered_sha256) {
+      activation.recordWrite({ adoptionId: r.adoption_id, renderedSha: r.activation.rendered_sha256, at: r.activation.slot_at });
+    }
+    if (!r.starter_adopted_by || !starter) return;
+    let holdUntil = null;
+    try {
+      holdUntil = (await activation?.welcome(r.adoption_id)) ?? null;
+    } catch (err) {
+      logger.warn(`new session for the starter message of adoption ${r.adoption_id} not requested: ${err.message}`);
+    }
+    starter.enqueue({
+      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, content: r.starter_content ?? null, holdUntil,
+    });
   }
 
   function sweepRevoked() {
@@ -438,8 +465,12 @@ export function createTemplates({
         if (typeof body === 'string') return body;
         const starterOf = it.op === 'write_template' && it.starter_message === true && it.adopted_by_member_id && body.status === 'succeeded'
           ? { starter_adopted_by: it.adopted_by_member_id, starter_content: it.starter_content ?? null } : {};
+        // What a session must show once the market took the result; slot_at is when the slots were changed.
+        const activationOf = body.status !== 'succeeded' ? {}
+          : it.op === 'write_template' ? { activation: { rendered_sha256: it.bundle_sha256, slot_at: iso() } }
+            : unslotted ? { activation: { removed: true, slot_at: iso() } } : {};
         state.update('template_reports', {}, (d) => {
-          d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body, ...starterOf };
+          d[requestId] = { org_id: it.org_id, adoption_id: it.adoption_id, intent_id: it.id, body, ...starterOf, ...activationOf };
         });
         return send(requestId);
       }

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveDataDir } from './config.js';
 import { INJECT_MAX_TOKENS, SHARD_BUDGET, SHARD_HEADER_RESERVE, SLOT_COUNT, estimateTokens, parseRole, readSlots, roleLines } from './shards.js';
+import { readJson, writeJsonAtomic } from './state.js';
 
 const MAX_FILE_BYTES = 64 << 10;
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -148,24 +149,52 @@ export function slotParts(dataDir, slot) {
 }
 
 // What the SLOT_COUNT shards print: the parts of each mapped adoption in slot order, a template only as a whole
-// (one that no longer fits after the earlier ones is left out).
-export function shardPlan(dataDir) {
-  const plan = [];
+// (one that no longer fits after the earlier ones is left out); items names the adoptions printed.
+export function shardLayout(dataDir) {
+  const parts = [];
+  const items = [];
   const slots = readSlots(dataDir);
-  if (!slots) return plan;
+  if (!slots) return { parts, items };
   for (let n = 1; n <= SLOT_COUNT; n++) {
     const slot = slots[String(n)];
-    const parts = slot && slotParts(dataDir, slot);
-    if (parts && plan.length + parts.length <= SLOT_COUNT) plan.push(...parts);
+    const p = slot && slotParts(dataDir, slot);
+    if (p && parts.length + p.length <= SLOT_COUNT) {
+      parts.push(...p);
+      items.push({ adoption_id: slot.adoption_id, ...(slot.bundle_sha256 ? { rendered_sha256: slot.bundle_sha256 } : {}) });
+    }
   }
-  return plan;
+  return { parts, items };
 }
 
-// Session-start output of shard n (1-based). Never throws; anything unexpected prints nothing.
-export function emitSlot(n, { dataDir = resolveDataDir(process.env) } = {}) {
+export const shardPlan = (dataDir) => shardLayout(dataDir).parts;
+
+// D/injected.json, written by the first shard at every session start: {at, items: [{adoption_id, rendered_sha256}]},
+// the templates that session was given. The client reads it to confirm that a template write reached a session.
+export const MARKER_FILE = 'injected.json';
+
+// The marker, or null when it is missing or unusable.
+export function readMarker(dataDir) {
   try {
-    return shardPlan(dataDir)[n - 1] ?? '';
+    const m = readJson(path.join(dataDir, MARKER_FILE), null);
+    const at = Date.parse(m?.at);
+    if (!Number.isFinite(at) || !Array.isArray(m.items)) return null;
+    return { at, items: m.items.filter((i) => i && typeof i === 'object' && typeof i.adoption_id === 'string') };
   } catch {
-    return '';
+    return null;
   }
+}
+
+// Session-start output of shard n (1-based); shard 1 also writes the marker, its time taken before slots.json is read.
+// Never throws; anything unexpected prints nothing.
+export function emitSlot(n, { dataDir = resolveDataDir(process.env), now = Date.now } = {}) {
+  let at = null;
+  let layout = { parts: [], items: [] };
+  try {
+    if (n === 1) at = new Date(now()).toISOString();
+    layout = shardLayout(dataDir);
+  } catch { /* nothing printed */ }
+  if (at) {
+    try { writeJsonAtomic(path.join(dataDir, MARKER_FILE), { at, items: layout.items }); } catch { /* the session still starts */ }
+  }
+  return layout.parts[n - 1] ?? '';
 }

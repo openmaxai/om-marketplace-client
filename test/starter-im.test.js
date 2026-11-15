@@ -108,6 +108,20 @@ test('the run check asks openmax\'s own activity store and run selection', async
   await assert.rejects(createOpenmaxIm({ zylosDir: tmpHome() }).runInProgress({ conversationId: 'cv-1' }));
 });
 
+test('the open-turn check asks openmax\'s run selection for every conversation, a skipped candidate counting as open', async () => {
+  const active = { by_conversation: { 'cv-1': ['r_00000001'], 'cv-2': ['r_00000002'] } };
+  globalThis.selectRunCalls = [];
+  const busy = createOpenmaxIm({ zylosDir: fakeOpenmax({ active, selected: { run_id: 'r_00000002' } }), now: () => 7 });
+  assert.equal(await busy.openTurn(), true);
+  assert.deepEqual(globalThis.selectRunCalls.at(0), { active, convId: 'cv-1', now: 7 });
+  const free = createOpenmaxIm({ zylosDir: fakeOpenmax({ active, selected: null }) });
+  globalThis.selectRunCalls = [];
+  assert.equal(await free.openTurn(), false);
+  assert.deepEqual(globalThis.selectRunCalls.map((c) => c.convId), ['cv-1', 'cv-2']);
+  assert.equal(await createOpenmaxIm({ zylosDir: fakeOpenmax({ active: null }) }).openTurn(), false);
+  await assert.rejects(createOpenmaxIm({ zylosDir: tmpHome() }).openTurn());
+});
+
 test('noRun is used only from the configured openmax version on', () => {
   assert.equal(versionAtLeast('2.31.0', '2.31.0'), true);
   assert.equal(versionAtLeast('2.31.1', '2.31.0'), true);
@@ -144,6 +158,11 @@ test('real openmax run selection: open run, reply-closed run within and after 10
   assert.equal(await im.runInProgress({ conversationId: 'recent' }), true);
   assert.equal(await im.runInProgress({ conversationId: 'old' }), false);
   assert.equal(await im.runInProgress({ conversationId: 'other' }), false);
+  assert.equal(await im.openTurn(), true);
+  fs.writeFileSync(path.join(runs, 'active.json'), JSON.stringify({ by_conversation: { old: ['r_0000000c'] }, gate: { [ORG]: 'open' } }));
+  assert.equal(await im.openTurn(), false);
+  fs.writeFileSync(path.join(runs, 'active.json'), JSON.stringify({ by_conversation: { old: ['r_0000000c'], recent: ['r_0000000b'] }, gate: { [ORG]: 'open' } }));
+  assert.equal(await im.openTurn(), true);
 });
 
 test('turns off the CLI request trace and reads the answer past any trace lines on stdout', async () => {
