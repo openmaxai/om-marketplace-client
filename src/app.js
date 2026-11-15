@@ -158,7 +158,7 @@ export function createRuntime({
       installsAllowed: pinned,
       onRevoked: (skillId, rec) => {
         const e = revokedEntry(skillId, rec);
-        if (e) enqueueUrgent(state, [e]);
+        if (e) enqueueUrgent(state, [e], { logger });
       },
     });
     let templates = null;

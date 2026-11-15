@@ -15,6 +15,10 @@ export const EMPTY_RECONCILE = Object.freeze({ last_run_at: null, sent: [], bloc
 // settled are kept (the newest MAX_URGENT_DONE), so an item queued again after a restart is not sent twice.
 export const MAX_URGENT_DONE = 500;
 export const EMPTY_URGENT = Object.freeze({ items: [], done: [] });
+// At most this many urgent items are queued (the oldest go first); an item not delivered for URGENT_MAX_AGE_MS (its
+// org unreachable all that time) is dropped.
+export const MAX_URGENT_ITEMS = 200;
+export const URGENT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const TEMPLATE_STATUS = new Set(['template_activated', 'template_inject_missing']);
 
 const SKILL = { required: ['skill_id'], optional: ['skill_version_id', 'installed_sha256'] };
@@ -75,7 +79,7 @@ const urgentDoc = (state) => {
 // Queues urgent items, entries [{ key, org_id, item }], persisted before they are sent. A key that is queued or already
 // settled is ignored. A template_activated or template_inject_missing item replaces a queued one of the same adoption,
 // so one report never carries both for an adoption. Returns the number of entries added.
-export function enqueueUrgent(state, entries) {
+export function enqueueUrgent(state, entries, { now = Date.now, logger = null } = {}) {
   let added = 0;
   const fresh = (d) => entries.filter((e) => !d.items.some((x) => x.key === e.key) && !d.done.includes(e.key));
   if (!fresh(urgentDoc(state)).length) return 0;
@@ -85,8 +89,12 @@ export function enqueueUrgent(state, entries) {
       if (TEMPLATE_STATUS.has(e.item.kind)) {
         d.items = d.items.filter((x) => !(TEMPLATE_STATUS.has(x.item?.kind) && x.item.adoption_id === e.item.adoption_id));
       }
-      d.items.push({ key: e.key, org_id: e.org_id, item: e.item });
+      d.items.push({ key: e.key, org_id: e.org_id, item: e.item, queued_at: new Date(now()).toISOString() });
       added += 1;
+    }
+    if (d.items.length > MAX_URGENT_ITEMS) {
+      const over = d.items.splice(0, d.items.length - MAX_URGENT_ITEMS);
+      logger?.warn(`reconcile: urgent queue full; dropped the ${over.length} oldest item(s) (${over.map((x) => x.item?.kind).join(', ')})`);
     }
     return d;
   });
@@ -230,6 +238,9 @@ export function createReconciler({
     }
   }
 
+  // The status of the last refused report (for the urgent queue).
+  let lastRefused = null;
+
   // Sends entries in batches; returns 'ok', 'dropped' (sent without items or batches the market refused), 'deferred',
   // 'rate_limited', 'budget_unsaved' or 'rejected'. A batch refused with 400 is resent once without the items it names, or skipped.
   async function send(orgId, agentId, entries, tally) {
@@ -260,6 +271,7 @@ export function createReconciler({
         const what = `reconcile report to org ${orgId} rejected (${code})`;
         state.setAlert(`reconcile:${orgId}`, what);
         logger.error(what);
+        lastRefused = err.status;
         const bad = new Set((err.errors ?? []).map((e) => ITEM_INDEX_RE.exec(e?.field ?? '')?.[1]).filter(Boolean).map(Number));
         if (err.status !== 400) return 'rejected';
         dropped = true;
@@ -434,11 +446,32 @@ export function createReconciler({
           }
         },
       }));
-      const r = await send(orgId, agentId, entries, tally);
+      lastRefused = null;
+      let r = await send(orgId, agentId, entries, tally);
+      // A 400 for a batch (for example an older market that does not know an item kind) may not name the item: the
+      // items left are sent one by one, so only the refused ones are lost.
+      let rest = entries.filter((_, i) => !done.includes(list[i].key));
+      if ((r === 'dropped' || r === 'rejected') && lastRefused === 400 && rest.length > 1) {
+        for (const e of rest) {
+          const one = await send(orgId, agentId, [e], tally);
+          if (one === 'rate_limited' || one === 'deferred' || one === 'budget_unsaved') {
+            r = one;
+            break;
+          }
+          if (!done.includes(list[entries.indexOf(e)].key)) settle([list[entries.indexOf(e)].key]);
+        }
+        rest = entries.filter((_, i) => !done.includes(list[i].key) && urgentDoc(state).items.some((x) => x.key === list[i].key));
+      }
       sent += done.length;
-      if (r === 'ok' || r === 'dropped' || r === 'rejected') settle(list.map((e) => e.key).filter((k) => !done.includes(k)));
+      if (r === 'ok' || r === 'dropped' || r === 'rejected') settle(rest.map((e) => list[entries.indexOf(e)].key));
       if (r === 'ok') state.clearAlert(`reconcile:${orgId}`);
       else logger.warn(`reconcile: urgent report to org ${orgId}: ${r}`);
+    }
+    // Items an unreachable org has not taken for URGENT_MAX_AGE_MS are given up.
+    const old = urgentDoc(state).items.filter((x) => now() - Date.parse(x.queued_at ?? '') > URGENT_MAX_AGE_MS);
+    if (old.length) {
+      logger.warn(`reconcile: ${old.length} urgent item(s) not delivered for 7 days; dropped`);
+      settle(old.map((x) => x.key));
     }
     const left = urgentDoc(state).items.length;
     if (sent) logger.info(`reconcile: urgent report sent (${tally.recorded} recorded, ${tally.skipped} skipped, ${left} left)`);
@@ -464,7 +497,7 @@ export function createReconciler({
     flushUrgent: flushNow,
     // Queues urgent entries ({ key, org_id, item }) and sends them at once.
     urgent(entries) {
-      enqueueUrgent(state, entries);
+      enqueueUrgent(state, entries, { now, logger });
       return flushNow();
     },
     // Sends what is left in the urgent queue, then runs at the first call of the process, and once every `every`.

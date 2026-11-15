@@ -8,7 +8,7 @@ import { createSkills } from '../src/skills.js';
 import { createTemplates } from '../src/templates.js';
 import { emptySlots, writeSlots } from '../src/shards.js';
 import {
-  MAX_ITEMS, MAX_URGENT_DONE, RATE_BUDGET, RECONCILE_EVERY_MS, batches, createReconciler, enqueueUrgent, revokedEntry, validItem,
+  MAX_ITEMS, MAX_URGENT_DONE, MAX_URGENT_ITEMS, RATE_BUDGET, URGENT_MAX_AGE_MS, RECONCILE_EVERY_MS, batches, createReconciler, enqueueUrgent, revokedEntry, validItem,
 } from '../src/reconcile.js';
 import { EMPTY_REVOKED } from '../src/revocations.js';
 import { revocationEnforcer } from '../src/app.js';
@@ -546,10 +546,10 @@ test('urgent queue: one template status per adoption, a settled key is never que
   await f.reconciler.flushUrgent();
   assert.deepEqual(f.reports(ORG), [[e('template_activated', 2).item]]);
   assert.equal(enqueueUrgent(f.state, [e('template_activated', 2)]), 0);
-  for (let i = 0; i < MAX_URGENT_DONE + 5; i++) {
-    enqueueUrgent(f.state, [{ key: `k${i}`, org_id: ORG, item: { kind: 'bogus' } }]);
+  for (let n = 0; n < 3; n++) {
+    for (let i = 0; i < MAX_URGENT_DONE / 2; i++) enqueueUrgent(f.state, [{ key: `k${n}-${i}`, org_id: ORG, item: { kind: 'bogus' } }]);
+    await f.reconciler.flushUrgent();
   }
-  await f.reconciler.flushUrgent();
   assert.equal(f.state.read('reconcile_urgent', null).done.length, MAX_URGENT_DONE);
   assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
 });
@@ -578,3 +578,62 @@ test('once template_inject_missing is reported for an adoption, its queued templ
   // No report ever carried both kinds for the adoption.
   for (const items of h.reports(ORG)) assert.ok(new Set(items.filter((i) => i.adoption_id === U(22)).map((i) => i.kind)).size <= 1);
 });
+
+test('the urgent queue is bounded: the oldest items go first, and items an unreachable org has not taken for 7 days', async (t) => {
+  const f = await harness(t);
+  const item = (n) => ({ kind: 'revoked_disabled', skill_id: SK(n), skill_version_id: VER(n, 1) });
+  for (let i = 0; i < MAX_URGENT_ITEMS + 5; i++) enqueueUrgent(f.state, [{ key: `k${i}`, org_id: ORG2, item: item(i % 50) }], { now: f.now, logger: f.logger });
+  const items = f.state.read('reconcile_urgent', null).items;
+  assert.equal(items.length, MAX_URGENT_ITEMS);
+  assert.equal(items[0].key, 'k5');
+  assert.ok(f.lines.some((l) => /urgent queue full; dropped the 1 oldest/.test(l)));
+  f.orgs.markLeft(ORG2, 'member_removed');
+  await f.reconciler.flushUrgent();
+  assert.equal(f.state.read('reconcile_urgent', null).items.length, MAX_URGENT_ITEMS);
+  f.clock.t += URGENT_MAX_AGE_MS + 1;
+  enqueueUrgent(f.state, [{ key: 'new', org_id: ORG2, item: item(2) }], { now: f.now });
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items.map((x) => x.key), ['new']);
+  assert.equal(f.reports(ORG2).length, 0);
+});
+
+// An older market that does not know the template_activated kind answers 400 for the batch.
+const activatedItem = { kind: 'template_activated', adoption_id: U(21), rendered_sha256: sha(21) };
+const revokedItem = { kind: 'revoked_disabled', skill_id: SK(1), skill_version_id: VER(1, 1) };
+for (const [name, refuse] of [
+  ['naming the item', () => problem(400, 'VALIDATION_FAILED', { errors: [{ field: 'items[0].kind' }] })],
+  ['naming no item', () => problem(400, 'VALIDATION_FAILED')],
+]) {
+  test(`urgent path, a 400 for an unknown kind ${name}: that item is dropped, the others are delivered, no loop`, async (t) => {
+    const f = await harness(t);
+    enqueueUrgent(f.state, [
+      { key: 'a', org_id: ORG, item: activatedItem },
+      { key: 'r', org_id: ORG, item: revokedItem },
+    ]);
+    f.answer.c10 = (req) => (req.json.items.some((i) => i.kind === 'template_activated') ? refuse() : recordAll(req));
+    await f.reconciler.flushUrgent();
+    const sent = f.reports(ORG);
+    assert.deepEqual(sent.at(-1), [revokedItem]);
+    assert.ok(sent.length <= 3, JSON.stringify(sent));
+    assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+    await f.reconciler.flushUrgent();
+    await f.reconciler.flushUrgent();
+    assert.equal(f.reports(ORG).length, sent.length);
+  });
+
+  test(`periodic path, a 400 ${name}: the run ends, the rest is delivered or reported next run, never in a loop`, async (t) => {
+    const f = await harness(t);
+    f.adoption(U(22));
+    f.skill(5);
+    f.answer.c10 = (req) => (req.json.items.some((i) => i.kind === 'template_inject_missing') ? refuse() : recordAll(req));
+    const out = await f.reconciler.run();
+    assert.notEqual(out.outcome, 'ok');
+    const first = f.reports(ORG).length;
+    assert.ok(first <= 2);
+    if (name === 'naming the item') {
+      assert.deepEqual(f.reports(ORG).at(-1).map((i) => i.kind), ['local_extra']);
+    }
+    await f.reconciler.run();
+    assert.equal(f.reports(ORG).length, 2 * first, 'each run sends the same number of requests');
+  });
+}
