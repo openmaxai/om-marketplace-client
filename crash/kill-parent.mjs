@@ -5,7 +5,9 @@
 // SCEN: install, upgrade, disabled-upgrade, disable, enable, uninstall, refused (rollback after the market refuses),
 // rollback (local rollback to the kept version; the killed child runs it instead of a round), template (a template
 // adoption written at v1 is rewritten at v2; the killed child runs one template intent), template-uninstall (that
-// adoption written at v1 is uninstalled).
+// adoption written at v1 is uninstalled), activation-report (that adoption written at v1 waits for activation and a
+// session marker shows it; the killed child confirms and reports template_activated), activation-request (no marker,
+// the Agent is idle; the killed child asks for a new session through a fake control queue).
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -17,6 +19,9 @@ import { templateBundle } from '../test/fake/bundle.js';
 import { fakeZylos } from '../test/fake/zylos.js';
 import { createIntentPuller } from '../src/intents.js';
 import { createTemplates } from '../src/templates.js';
+import { createActivation } from '../src/activation.js';
+import { fakeControl } from '../test/fake/control.js';
+import { emitSlot } from '../src/shard-emitter.js';
 import { ensureDeclarations, readSlots } from '../src/shards.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
 import { openState } from '../src/state.js';
@@ -26,8 +31,12 @@ const MODE = process.env.MODE ?? 'timer';
 const ROUNDS = Number(process.env.ROUNDS ?? 20);
 const SCEN = process.env.SCEN ?? 'upgrade';
 const MAXD = Number(process.env.MAXD ?? 400);
-const SCENARIOS = ['install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused', 'rollback', 'template', 'template-uninstall'];
-const TEMPLATE = SCEN.startsWith('template');
+const SCENARIOS = [
+  'install', 'upgrade', 'disabled-upgrade', 'disable', 'enable', 'uninstall', 'refused', 'rollback', 'template', 'template-uninstall',
+  'activation-report', 'activation-request',
+];
+const ACTIVATION = SCEN.startsWith('activation');
+const TEMPLATE = SCEN.startsWith('template') || ACTIVATION;
 if (!SCENARIOS.includes(SCEN)) throw new Error(`unknown SCEN ${SCEN}`);
 
 const many = (tag) => Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`docs/f${i}.md`, `${tag} ${i}\n`.repeat(50)]));
@@ -42,7 +51,9 @@ const TFILES = (tag) => ({ 'inject.md': tag === 't1' ? '# Demo\n\nHelp with demo
 
 function runChild(h, killAfter, killAt = 0, action = 'round') {
   return new Promise((resolve) => {
-    const arg = JSON.stringify({ url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, zylosDir: h.zylosDir, origin: h.storage.origin, action, skillId: SKILL });
+    const arg = JSON.stringify({
+      url: h.fake.url, dataDir: h.dataDir, skillsDir: h.skillsDir, zylosDir: h.zylosDir, origin: h.storage.origin, action, skillId: SKILL, statusFile: h.statusFile,
+    });
     const c = spawn(process.execPath, [CHILD, arg], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, KILL_AT: String(killAt) } });
     let out = '';
     let err = '';
@@ -111,9 +122,38 @@ async function templateSetup(h) {
     await createIntentPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now }).pull();
   };
   await write(1, T1);
-  const t = createTemplates({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir: h.zylosDir, emulatorOrigin: h.storage.origin, now: h.now, sleep: async () => {} });
+  const activation = ACTIVATION ? activationSetup(h) : null;
+  const t = createTemplates({
+    api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir: h.zylosDir, emulatorOrigin: h.storage.origin, now: h.now,
+    sleep: async () => {}, activation,
+  });
   if (await t.runNext() !== 'succeeded') throw new Error('template setup failed');
+  if (ACTIVATION) {
+    if (SCEN === 'activation-report') emitSlot(1, { dataDir: h.dataDir, now: () => h.now() + 1000 });
+    return;
+  }
   await write(2, SCEN === 'template' ? T2 : null);
+}
+
+// The children run at the fixed time h.now(); the runtime status file says idle at that time, the control queue is a
+// script appending one line per request, and C-10 records every item.
+function activationSetup(h) {
+  h.statusFile = path.join(h.zylosDir, 'activity-monitor', 'agent-status.json');
+  fs.mkdirSync(path.dirname(h.statusFile), { recursive: true });
+  fs.writeFileSync(h.statusFile, JSON.stringify({ state: 'idle', active_tools: 0, idle_seconds: 900 }));
+  fs.utimesSync(h.statusFile, h.now() / 1000, h.now() / 1000);
+  h.controlLog = path.join(h.dataDir, '..', 'controls.log');
+  // Requests stay queued (never delivered), so a restarted child must see one and not stack another.
+  h.control = fakeControl(h.zylosDir, h.controlLog);
+  const c10 = (req) => {
+    h.fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`, c10);
+    return { status: 200, json: { results: req.json.items.map((_, index) => ({ index, outcome: 'recorded' })) } };
+  };
+  h.fake.script('POST', `/api/v1/orgs/${ORG}/agents/${AGENT}/reconcile`, c10);
+  return createActivation({
+    state: h.state, dataDir: h.dataDir, zylosDir: h.zylosDir, logger: h.logger, now: h.now, statusFile: h.statusFile,
+    control: { enqueue: async () => ({ id: null }), get: async () => 'not_found', ack: async () => {} },
+  });
 }
 
 // 'ok' when dir holds exactly the files of bundle tag (t1 / t2).
@@ -176,6 +216,7 @@ function finalIssues(h, st) {
   const dis = path.join(h.dataDir, 'disabled', 'market--demo-skill');
   const rb = path.join(h.dataDir, 'rollback', 'demo-skill');
   const issues = [];
+  if (ACTIVATION) return activationIssues(h, st);
   if (st.outbox.list().length) issues.push('outbox not empty');
   if (st.read('intents', { queue: [] }).queue.length) issues.push('queue not empty');
   if (ls(path.join(h.dataDir, 'staging')).length) issues.push('staging not empty');
@@ -252,6 +293,30 @@ function finalIssues(h, st) {
   return issues;
 }
 
+function activationIssues(h, st) {
+  const issues = [];
+  const doc = st.read('activation', null);
+  const urgent = st.read('reconcile_urgent', { items: [] });
+  if (urgent.items.length) issues.push('urgent queue not empty');
+  if (SCEN === 'activation-report') {
+    if (doc?.pending) issues.push('activation still pending');
+    const sent = h.fake.requests.filter((r) => r.path.endsWith('/reconcile'));
+    const want = JSON.stringify({ items: [{ kind: 'template_activated', adoption_id: ADOPTION, rendered_sha256: T1.sha }] });
+    if (!sent.length) issues.push('template_activated not reported');
+    if (!sent.every((r) => JSON.stringify(r.json) === want)) issues.push(`reports differ: ${sent.map((r) => r.body).join(' | ')}`);
+    if (h.control.enqueued().length) issues.push('a new session was requested');
+  } else {
+    const controls = h.control.enqueued().length;
+    const p = doc?.pending;
+    if (!p) issues.push('activation record lost');
+    // One request; a kill after it was counted but before the enqueue loses it (made again after the wait), never twice.
+    if (controls > 1) issues.push(`${controls} new-session requests`);
+    if (p && p.request_count !== 1) issues.push(`request_count ${p.request_count} with ${controls} requests`);
+    if (h.fake.requests.some((r) => r.path.endsWith('/reconcile'))) issues.push('reported without a session');
+  }
+  return issues;
+}
+
 const results = { ok: 0, bad: [], killed: 0, notKilled: 0 };
 for (let r = 0; r < ROUNDS; r++) {
   const afters = [];
@@ -259,7 +324,7 @@ for (let r = 0; r < ROUNDS; r++) {
   await setup(h);
   h.state.close();
   const at = MODE === 'count' ? r + 1 : Math.floor(Math.random() * MAXD);
-  const action = SCEN === 'rollback' ? 'rollback' : TEMPLATE ? 'template' : 'round';
+  const action = SCEN === 'rollback' ? 'rollback' : ACTIVATION ? 'activation' : TEMPLATE ? 'template' : 'round';
   const k = MODE === 'count' ? await runChild(h, null, at, action) : await runChild(h, at, 0, action);
   const cleanup = async () => { for (const f of afters.reverse()) { try { await f(); } catch { /* best effort */ } } };
   if (MODE === 'count' && !k.sig) {
@@ -271,7 +336,7 @@ for (let r = 0; r < ROUNDS; r++) {
   if (k.sig === 'SIGKILL') results.killed++;
   else results.notKilled++;
   const issues = atKill(h);
-  const restart = TEMPLATE ? 'template' : 'round';
+  const restart = ACTIVATION ? 'activation' : TEMPLATE ? 'template' : 'round';
   const r2 = await runChild(h, null, 0, restart);
   const r3 = await runChild(h, null, 0, restart);
   if (r2.code !== 0 || r3.code !== 0) {

@@ -143,10 +143,11 @@ export function syncHooks(zylosDir, { env = process.env, spawn = spawnSync } = {
 
 const EMPTY_SLOTS = Object.freeze(Object.fromEntries(SLOTS.map((n) => [String(n), null])));
 const validSlot = (v) => v === null || (v && typeof v === 'object' && isCanonicalUuid(v.adoption_id) && isSha256Hex(v.inject_sha256)
-  && (v.role_sha256 === undefined || isSha256Hex(v.role_sha256)));
+  && (v.role_sha256 === undefined || isSha256Hex(v.role_sha256)) && (v.bundle_sha256 === undefined || isSha256Hex(v.bundle_sha256)));
 
-// D/slots.json: slot n -> {adoption_id, inject_sha256, role_sha256?} or null; role_sha256 only for bundles with
-// role.json. Returns null when missing; throws when unusable.
+// D/slots.json: slot n -> {adoption_id, inject_sha256, role_sha256?, bundle_sha256?} or null; role_sha256 only for
+// bundles with role.json; bundle_sha256 (the rendered bundle, named in the injection marker) on slots written since
+// 0.6.0. Returns null when missing; throws when unusable.
 export function readSlots(dataDir) {
   const raw = readJson(path.join(dataDir, SLOTS_FILE), null);
   if (raw === null) return null;

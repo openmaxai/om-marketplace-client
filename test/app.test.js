@@ -1,4 +1,5 @@
 import { STARTER_CHECK_MS } from '../src/starter.js';
+import { ACTIVATION_CHECK_MS } from '../src/activation.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -169,4 +170,15 @@ test('starter messages waiting for a free DM are checked by their own task', asy
   await task.run();
   assert.equal(waited, 1);
   assert.equal(buildTasks(logger, {}).some((x) => x.name === 'starter'), false);
+});
+
+test('template activation is checked by its own task, every 30 s, apart from the poll round', async () => {
+  const logger = { debug() {}, info() {}, warn() {}, error() {} };
+  const ticks = [];
+  const withActivation = buildTasks(logger, { activation: { tick: async () => ticks.push(1) } });
+  const task = withActivation.find((x) => x.name === 'activation');
+  assert.equal(task.baseMs, ACTIVATION_CHECK_MS);
+  await task.run();
+  assert.deepEqual(ticks, [1]);
+  assert.equal(buildTasks(logger, {}).some((x) => x.name === 'activation'), false);
 });

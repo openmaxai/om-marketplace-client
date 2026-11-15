@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-15
+
+### Added
+- Template activation: a template write, upgrade or uninstall takes effect at
+  the next session start; the client now asks for that session itself. Once
+  the Agent has been idle for 5 minutes (two checks 30 seconds apart, fresh
+  runtime status file, no open OpenMax turn), it enqueues a new-session request
+  on the zylos control queue, at most every 30 minutes and 4 times a day.
+  Changes close together share one request. Always on; there is no setting.
+- The first template shard writes `injected.json` at every session start,
+  naming the templates and bundle sha256s that session was given. A session
+  that shows every change, requested or natural, is reported as
+  `template_activated` through the reconcile report; one that does not show a
+  template is reported as `template_inject_missing`. A request without a
+  session within 15 minutes is made again, at most 3 times, then the alert
+  `template_activation_stuck` is raised and the client keeps watching.
+- Urgent reconcile items are sent at once in their own request, kept in the
+  client state until the market answered them, and resent first by the next
+  poll round. The queue holds at most 200 items and drops items not delivered
+  for 7 days; a batch refused with 400 without an item index is resent item by
+  item, at most 5 per flush.
+- New-session requests are followed in the control queue by their id: none is
+  made while the runtime health is not ok or an earlier request is still
+  queued, a request no longer needed is withdrawn, a timed-out enqueue counts
+  as made, and requests are made one at a time. Requests carry a 6-hour ack
+  deadline, and a control id older than 24 hours is given up.
+- Templates adopted before 0.6.0 are seeded once and confirmed by the next
+  session that shows them, without a request.
+- The alert `template_activation_pending_24h` is raised for a change pending
+  24 hours. A rewrite of a bundle the current session already shows is
+  reported as activated at once.
+
+### Changed
+- Starter message: when the Agent has been idle for 30 seconds with no open
+  turn at write time, the new session is requested at once and the message
+  waits until the session has the template, at most 3 minutes.
+- A revoke applied to an installed skill is reported as `revoked_disabled` at
+  once instead of with the next periodic reconcile run.
+- Template slots record the bundle sha256 of the adoption.
+
 ## [0.5.4] - 2026-11-10
 
 ### Fixed

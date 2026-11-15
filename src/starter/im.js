@@ -165,6 +165,19 @@ export function createOpenmaxIm({
       if (!active) return false;
       return Boolean(selectRun({ store, active, convId: conversationId, now: now() }).run);
     },
+    // True when any OpenMax conversation has a turn open: a run not yet closed, or one closed by its reply within the
+    // window in which openmax still ties replies to it (10 minutes), read with the same activity modules as above.
+    async openTurn() {
+      const { createRunStore } = await import(pathToFileURL(path.join(activity, 'run-store.js')).href);
+      const { selectRun } = await import(pathToFileURL(path.join(activity, 'reply.js')).href);
+      const store = createRunStore();
+      const active = store.readActive();
+      if (!active) return false;
+      return Object.keys(active.by_conversation ?? {}).some((convId) => {
+        const r = selectRun({ store, active, convId, now: now() });
+        return Boolean(r.run || r.candidate);
+      });
+    },
     // Plain text, no mentions: the message body is passed whole so the CLI resolves no @name.
     async sendText({ orgId, conversationId, text, clientMsgId, noRun = false }) {
       return call('comm.send', sendParams({ orgId, conversationId, text, clientMsgId, noRun }));

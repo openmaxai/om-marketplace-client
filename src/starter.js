@@ -40,10 +40,14 @@ export function imReason(err) {
 // sent), a waiting job keeps waiting, and a sending job is dropped unmarked (delivery unknown, never sent again).
 // A send_failed or rejected_content job keeps a short reason code (job.reason), logged with the mark; the market's
 // :mark-starter-shown takes only the result, so the reason stays local.
+// A job queued with hold_until (a new session was requested for its template) is not claimed before that time while
+// activation.isPending(adoption) holds, so the message follows the session that has the template; the claim still
+// happens right before the send.
 // content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available;
 // by default it is the starter_content the market put on the write order.
 export function createStarter({
   api, state, orgs, logger, im, content = async (job) => job.content ?? null, enabled = true, now = Date.now, limits = {},
+  activation = null,
 }) {
   const iso = () => new Date(now()).toISOString();
   const jobs = () => state.read('starters', {});
@@ -232,9 +236,21 @@ export function createStarter({
     return p;
   };
 
+  // True while the job waits for its template to reach a session; a released hold is cleared, so the job is claimed
+  // like any other.
+  function held(job) {
+    if (job.stage !== 'claim' || !job.hold_until) return false;
+    let pending = false;
+    try { pending = Boolean(activation?.isPending(job.adoption_id)); } catch { /* unreadable: released */ }
+    if (pending && now() < job.hold_until) return true;
+    put(job.adoption_id, { hold_until: null });
+    return false;
+  }
+
   async function runJobs(onlyWaiting) {
     for (const job of Object.values(jobs())) {
-      if (onlyWaiting && job.stage !== 'waiting') continue;
+      if (onlyWaiting && job.stage !== 'waiting' && !(job.stage === 'claim' && job.hold_until)) continue;
+      if (held(job)) continue;
       if (job.stage === 'sending') {
         logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
         drop(job.adoption_id);
@@ -259,13 +275,15 @@ export function createStarter({
 
   return {
     // Queues the starter message of an adoption whose first write the market accepted; a known adoption is not queued again.
-    enqueue({ orgId, adoptionId, adoptedBy, content = null }) {
+    // holdUntil (ms): the message waits for its template's session until then.
+    enqueue({ orgId, adoptionId, adoptedBy, content = null, holdUntil = null }) {
       if (!isOrgOrMemberId(orgId) || !isCanonicalUuid(adoptionId) || !isOrgOrMemberId(adoptedBy)) return false;
       let added = false;
       state.update('starters', {}, (d) => {
         if (d[adoptionId] || Object.keys(d).length >= MAX_STARTER_JOBS) return;
         d[adoptionId] = {
           org_id: orgId, adoption_id: adoptionId, adopted_by_member_id: adoptedBy, content, stage: 'claim', created_at: iso(), updated_at: iso(),
+          ...(Number.isFinite(holdUntil) ? { hold_until: holdUntil } : {}),
         };
         added = true;
       });
@@ -276,7 +294,7 @@ export function createStarter({
     // Runs every queued job once.
     runAll: () => serial(() => runJobs(false)),
 
-    // Checks the jobs waiting for the DM to be free.
+    // Checks the jobs waiting for the DM to be free, and those waiting for their template's session.
     runWaiting: () => serial(() => runJobs(true)),
   };
 }
