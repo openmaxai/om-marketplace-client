@@ -7,7 +7,11 @@ import { AGENT, ORG, ORG2, U, pullHarness } from './fake/pull.js';
 import { createSkills } from '../src/skills.js';
 import { createTemplates } from '../src/templates.js';
 import { emptySlots, writeSlots } from '../src/shards.js';
-import { MAX_ITEMS, RATE_BUDGET, RECONCILE_EVERY_MS, batches, createReconciler, validItem } from '../src/reconcile.js';
+import {
+  MAX_ITEMS, MAX_URGENT_DONE, RATE_BUDGET, RECONCILE_EVERY_MS, batches, createReconciler, enqueueUrgent, revokedEntry, validItem,
+} from '../src/reconcile.js';
+import { EMPTY_REVOKED } from '../src/revocations.js';
+import { revocationEnforcer } from '../src/app.js';
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const SK = (n) => U(500 + n);
@@ -487,4 +491,90 @@ test('the budget alert is cleared only after the run was stored', async (t) => {
   assert.ok(f.state.read('status', null).alerts['reconcile:budget'], 'run not stored: alert kept');
   await r.run();
   assert.equal(f.state.read('status', null).alerts['reconcile:budget'], undefined);
+});
+
+test('template_activated needs adoption_id and rendered_sha256 and nothing else', () => {
+  assert.equal(validItem({ kind: 'template_activated', adoption_id: U(1), rendered_sha256: sha(1) }), true);
+  assert.equal(validItem({ kind: 'template_activated', adoption_id: U(1) }), false);
+  assert.equal(validItem({ kind: 'template_activated', rendered_sha256: sha(1) }), false);
+  assert.equal(validItem({ kind: 'template_activated', adoption_id: U(1), rendered_sha256: 'x' }), false);
+  assert.equal(validItem({ kind: 'template_activated', adoption_id: U(1), rendered_sha256: sha(1), at: '2026-10-16T00:00:00Z' }), false);
+});
+
+test('a revoke applied by the revocation pull is reported as revoked_disabled at once, and only once', async (t) => {
+  const f = await harness(t);
+  f.skill(1);
+  const skills = createSkills({
+    api: f.api, state: f.state, orgs: f.orgs, logger: f.logger, bffUrl: f.fake.url, skillsDir: f.skillsDir, dataDir: f.dataDir, now: f.now,
+    onRevoked: (skillId, rec) => enqueueUrgent(f.state, [revokedEntry(skillId, rec)]),
+  });
+  f.state.write('revoked', { ...EMPTY_REVOKED, skill_version_id: [VER(1, 1)] });
+  const enforce = revocationEnforcer({ skills, templates: () => null, reconcile: () => f.reconciler });
+  await enforce();
+  assert.equal(f.state.read('installs', {})[SK(1)].state, 'revoked_disabled');
+  assert.deepEqual(f.reports(ORG), [[{ kind: 'revoked_disabled', skill_id: SK(1), skill_version_id: VER(1, 1), installed_sha256: sha(1) }]]);
+  // Applied again (a re-delivered page, the next round): not reported again.
+  await enforce();
+  await skills.runRound();
+  await f.reconciler.flushUrgent();
+  assert.equal(f.reports(ORG).length, 1);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).done, [`revoked_disabled:${SK(1)}:${VER(1, 1)}`]);
+});
+
+test('an urgent revoked_disabled the market could not take is kept and sent first by the next round', async (t) => {
+  const f = await harness(t);
+  f.skill(1);
+  enqueueUrgent(f.state, [revokedEntry(SK(1), f.state.read('installs', {})[SK(1)])]);
+  f.answer.c10 = () => ({ status: 503, problem: { status: 503, code: 'UNAVAILABLE' } });
+  await f.reconciler.flushUrgent();
+  assert.equal(f.state.read('reconcile_urgent', null).items.length, 1);
+  f.answer.c10 = recordAll;
+  await f.reconciler.maybeRun();
+  const all = f.reports(ORG);
+  assert.deepEqual(all[1], [{ kind: 'revoked_disabled', skill_id: SK(1), skill_version_id: VER(1, 1), installed_sha256: sha(1) }]);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+  // The periodic report is a separate request.
+  assert.ok(all.length >= 2);
+});
+
+test('urgent queue: one template status per adoption, a settled key is never queued again', async (t) => {
+  const f = await harness(t);
+  const e = (kind, n) => ({ key: `${kind}:${U(21)}:${n}`, org_id: ORG, item: { kind, adoption_id: U(21), rendered_sha256: sha(n) } });
+  assert.equal(enqueueUrgent(f.state, [e('template_inject_missing', 1)]), 1);
+  assert.equal(enqueueUrgent(f.state, [e('template_activated', 2)]), 1);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items.map((x) => x.item.kind), ['template_activated']);
+  await f.reconciler.flushUrgent();
+  assert.deepEqual(f.reports(ORG), [[e('template_activated', 2).item]]);
+  assert.equal(enqueueUrgent(f.state, [e('template_activated', 2)]), 0);
+  for (let i = 0; i < MAX_URGENT_DONE + 5; i++) {
+    enqueueUrgent(f.state, [{ key: `k${i}`, org_id: ORG, item: { kind: 'bogus' } }]);
+  }
+  await f.reconciler.flushUrgent();
+  assert.equal(f.state.read('reconcile_urgent', null).done.length, MAX_URGENT_DONE);
+  assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
+});
+
+test('once template_inject_missing is reported for an adoption, its queued template_activated is dropped unsent', async (t) => {
+  const h = await harness(t);
+  const dropped = [];
+  const reconciler = createReconciler({
+    api: h.api, state: h.state, orgs: h.orgs, skills: h.skills, templates: h.templates, logger: h.logger, now: h.now, onInjectMissing: (id) => dropped.push(id),
+  });
+  h.adoption(U(22));
+  const activated = { kind: 'template_activated', adoption_id: U(22), rendered_sha256: sha(`bundle-${U(22)}`) };
+  enqueueUrgent(h.state, [{ key: 'a', org_id: ORG, item: activated }]);
+  h.answer.c10 = () => ({ status: 503, problem: { status: 503, code: 'UNAVAILABLE' } });
+  await reconciler.flushUrgent();
+  assert.equal(h.state.read('reconcile_urgent', null).items.length, 1);
+  h.answer.c10 = recordAll;
+  await reconciler.run();
+  const last = h.reports(ORG).at(-1);
+  assert.deepEqual(last, [{ kind: 'template_inject_missing', adoption_id: U(22) }]);
+  assert.deepEqual(h.state.read('reconcile_urgent', null).items, []);
+  assert.deepEqual(dropped, [U(22)]);
+  const n = h.reports(ORG).length;
+  await reconciler.flushUrgent();
+  assert.equal(h.reports(ORG).length, n);
+  // No report ever carried both kinds for the adoption.
+  for (const items of h.reports(ORG)) assert.ok(new Set(items.filter((i) => i.adoption_id === U(22)).map((i) => i.kind)).size <= 1);
 });

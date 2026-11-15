@@ -55,7 +55,7 @@ const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return fal
 // outbox until the market answers and are resent unchanged.
 export function createSkills({
   api, state, orgs, logger, bffUrl, skillsDir, dataDir, emulatorOrigin = null, fetchImpl, inspect = inspectInWorker,
-  installsAllowed = true, now = Date.now, sleep, signal = null,
+  installsAllowed = true, now = Date.now, sleep, signal = null, onRevoked = null,
 }) {
   const iso = () => new Date(now()).toISOString();
   // Quarantine keeps one subdirectory per quarantined copy: quarantine/market--<slug>/<version_no>-<skill_version_id>[.n]/.
@@ -552,7 +552,8 @@ export function createSkills({
   };
 
   // Revoked installed versions move to quarantine as revoked_disabled; never deleted. Both areas are checked, also for a
-  // record already quarantined, so a move lost in a crash is completed. Idempotent.
+  // record already quarantined, so a move lost in a crash is completed. Idempotent. onRevoked(skillId, rec) is called
+  // for each record newly revoked, so it can be reported at once.
   function enforceRevocations() {
     const revoked = revokedSet(state);
     let n = 0;
@@ -564,6 +565,8 @@ export function createSkills({
         if (m?.skill_id === skillId && m.package_sha256 === rec.package_sha256) quarantine(d, rec, skillId);
       }
       if (rec.state === 'revoked_disabled') continue;
+      // Queued before the record changes, so a crash in between queues it again (the same key) on the next sweep.
+      onRevoked?.(skillId, rec);
       putRec(skillId, revokedRec(rec));
       revokedAlert(skillId, rec);
       n += 1;

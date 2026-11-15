@@ -15,7 +15,7 @@ import { createSkills } from './skills.js';
 import { createTemplates } from './templates.js';
 import { STARTER_CHECK_MS, createStarter } from './starter.js';
 import { createOpenmaxIm } from './starter/im.js';
-import { createReconciler } from './reconcile.js';
+import { createReconciler, enqueueUrgent, revokedEntry } from './reconcile.js';
 import { createLocalSkillReporter } from './localscan.js';
 import { defaultZylosDir } from './shards.js';
 import { vendoredPolicyMatchesPin } from './policy/pin.js';
@@ -86,13 +86,15 @@ export function buildTasks(logger, runtime = {}, commands = null) {
 }
 
 // New revocations quarantine installed skills first, then template adoptions. Both always run; a failure is rethrown
-// afterwards so the revocation cursor stays put and the page is enforced again.
-export function revocationEnforcer({ skills, templates }) {
+// afterwards so the revocation cursor stays put and the page is enforced again. The revoked_disabled items queued by
+// the skills step are reported at once.
+export function revocationEnforcer({ skills, templates, reconcile = () => null }) {
   return async () => {
     let failure = null;
     for (const step of [() => skills?.enforceRevocations(), () => templates()?.sweepRevoked()]) {
       try { step(); } catch (err) { failure ??= err; }
     }
+    await reconcile()?.flushUrgent();
     if (failure) throw failure;
   };
 }
@@ -150,15 +152,23 @@ export function createRuntime({
     const skills = createSkills({
       api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
       installsAllowed: pinned,
+      onRevoked: (skillId, rec) => {
+        const e = revokedEntry(skillId, rec);
+        if (e) enqueueUrgent(state, [e]);
+      },
     });
     let templates = null;
-    const revocations = createRevocationPuller({ api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates }) });
+    let reconcile = null;
+    const revocations = createRevocationPuller({
+      api, state, orgs, logger, enforce: revocationEnforcer({ skills, templates: () => templates, reconcile: () => reconcile }),
+    });
     const starter = createStarter({
       api, state, orgs, logger, im: createOpenmaxIm({ zylosDir }), enabled: config.starter_message?.enabled !== false,
     });
     templates = createTemplates({
       api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal, starter,
     });
+    reconcile = createReconciler({ api, state, orgs, skills, templates, logger });
     return {
       state,
       api,
@@ -169,7 +179,7 @@ export function createRuntime({
       revocations,
       templates,
       starter,
-      reconcile: createReconciler({ api, state, orgs, skills, templates, logger }),
+      reconcile,
       localSkills: createLocalSkillReporter({ api, state, orgs, logger, skillsDir, zylosDir }),
     };
   } catch (err) {
