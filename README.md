@@ -202,8 +202,9 @@ chance. It is always on; there is no setting to turn it off.
 2. Every 30 seconds, apart from the 5-minute poll round, the client checks
    whether it may ask for a new session. All of these must hold: the runtime
    status file (`~/zylos/activity-monitor/agent-status.json`) was written less
-   than 60 seconds ago and shows `state` idle, `active_tools` 0 and
-   `idle_seconds` at least 300, in two consecutive checks; no OpenMax
+   than 60 seconds ago and shows `state` idle, `health` ok (or no health
+   field), `active_tools` 0 and `idle_seconds` at least 300, in two
+   consecutive checks; no earlier request is still in the control queue; no OpenMax
    conversation has an open turn, nor one closed by a reply within the last 10
    minutes (openmax's own activity store); the last automatic request was 30
    minutes ago or more; fewer than 4 were made this UTC day. A missing or stale
@@ -211,7 +212,11 @@ chance. It is always on; there is no setting to turn it off.
 3. The request goes to the zylos control queue: "Agent Market templates were
    updated; please use the new-session skill to start a new session.", held
    until the Agent is idle, without an ack suffix or deadline. The Agent starts
-   the session through its new-session skill.
+   the session through its new-session skill. The client keeps the control id
+   and follows it with `c4-control.js get`; while it is pending no other
+   request is made, and one still pending when the change is confirmed is
+   withdrawn (`ack`). An enqueue that timed out counts as made. Requests are
+   made one at a time.
 4. At every session start the first shard writes `injected.json` in the data
    directory: `{at, items: [{adoption_id, rendered_sha256}]}`, the templates
    that session was given (`rendered_sha256` is the bundle sha256, the same
@@ -222,16 +227,27 @@ chance. It is always on; there is no setting to turn it off.
    reports `template_activated` for each target through the reconcile report,
    at once. A target missing from the session or listed with another sha256 is
    reported as `template_inject_missing` instead and not retried.
-5. A request not followed by a session within 15 minutes is made again, at most
-   3 times per change. Then the alert `template_activation_stuck` is raised;
-   the record stays pending and a later session still confirms it.
+5. A request not followed by a session within 15 minutes of its delivery is
+   made again, at most 3 times per change. Then the alert
+   `template_activation_stuck` is raised; the record stays pending and a later
+   session still confirms it. A record pending for 24 hours raises
+   `template_activation_pending_24h`.
+6. A rewrite of the bundle the current session already shows needs no session;
+   it is reported as activated at once.
+7. Templates adopted before 0.6.0 are seeded once at the first start of 0.6.0
+   (their slots get the bundle sha256). They never cause a request; the next
+   session that shows them confirms them.
 
 Reports that must not wait for the periodic reconcile run (`template_activated`,
 `template_inject_missing` from a session check, and `revoked_disabled` when a
 revocation is applied) are queued in the client state and sent at once in a
 reconcile request of their own. One that is not delivered is sent again first
 by the next poll round, also after a restart; one the market answered
-(`recorded` or `skipped`) or refused is dropped. A report never carries both
+(`recorded` or `skipped`) or refused is dropped. When a market refuses a batch
+with 400 without naming the item (for example a market that does not know an
+item kind), the items are sent again one by one, so only the refused one is
+lost. At most 200 items are queued (the oldest are dropped first), and an
+item not delivered for 7 days is dropped. A report never carries both
 `template_activated` and `template_inject_missing` for one adoption, and once
 `template_inject_missing` was reported for an adoption, an activation of it
 still waiting is dropped.

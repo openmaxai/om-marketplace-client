@@ -25,7 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `template_activation_stuck` is raised and the client keeps watching.
 - Urgent reconcile items are sent at once in their own request, kept in the
   client state until the market answered them, and resent first by the next
-  poll round.
+  poll round. The queue holds at most 200 items and drops items not delivered
+  for 7 days; a batch refused with 400 without an item index is resent item by
+  item.
+- New-session requests are followed in the control queue by their id: none is
+  made while the runtime health is not ok or an earlier request is still
+  queued, a request no longer needed is withdrawn, a timed-out enqueue counts
+  as made, and requests are made one at a time.
+- Templates adopted before 0.6.0 are seeded once and confirmed by the next
+  session that shows them, without a request.
+- The alert `template_activation_pending_24h` is raised for a change pending
+  24 hours. A rewrite of a bundle the current session already shows is
+  reported as activated at once.
 
 ### Changed
 - Starter message: when the Agent has been idle for 30 seconds with no open

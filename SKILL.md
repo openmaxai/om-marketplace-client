@@ -105,9 +105,11 @@ placed this way is refused at install. Templates over 2000 tokens need client
 0.4.0 or later; the market refuses older clients with `CLIENT_VERSION_TOO_OLD`.
 Template activation (0.6.0, always on): a template write, upgrade or uninstall
 reaches the Agent at its next session start. Once the Agent has been idle for 5
-minutes with no open OpenMax turn, the client asks it, through the control
-queue, to start a new session with the new-session skill (at most every 30
-minutes, 4 times a day, 3 times per change). The first shard records what the
+minutes with no open OpenMax turn and runtime health ok, the client asks it,
+through the control queue, to start a new session with the new-session skill
+(one queued request at a time, at most every 30 minutes, 4 times a day, 3 times
+per change). Templates adopted before 0.6.0 are confirmed by the next natural
+session. The first shard records what the
 session was given in `injected.json`; from that the client reports
 `template_activated` (or `template_inject_missing`) to the market at once.
 
