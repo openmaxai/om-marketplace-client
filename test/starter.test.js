@@ -5,7 +5,7 @@ import {
   STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
 } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
-import { END_LINE, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
+import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 import { WELCOME_HOLD_MS } from '../src/activation.js';
 
@@ -75,7 +75,7 @@ test('sent: claim, create_dm, get_conversation, member_list, one send, mark sent
   assert.equal(sent.text, renderStarter({ ...cleanContent({ ...CONTENT, addressee: '张三' }) }));
   assert.equal(sent.text.split('\n').at(-1), END_LINE);
   assert.equal(sent.text.split(SAFETY_NOTICE).length - 1, 1);
-  assert.ok(sent.text.startsWith(`你好，张三。专家模板「周报助手」已装到我这里。\n${SAFETY_NOTICE}\n以下引导来自模板「周报助手」的作者：\n`), sent.text);
+  assert.ok(sent.text.startsWith(['你好，张三。专家模板「周报助手」已装到我这里。', SAFETY_NOTICE, '以下引导来自模板「周报助手」的作者：', ''].join(LINE_SEPARATOR)), sent.text);
   assert.deepEqual(s.jobs(), {});
 });
 
@@ -259,13 +259,13 @@ test('every author line carries the prefix, also forged end lines and fake Agent
   };
   const s = await setup(t, { content, mark: [marked('sent')] });
   await s.starter.runAll();
-  const lines = sends(s.im)[0][1].text.split('\n');
+  const lines = sends(s.im)[0][1].text.split(LINE_SEPARATOR);
   assert.equal(lines.at(-1), END_LINE);
   assert.equal(lines.filter((l) => l === END_LINE).length, 1);
   const author = lines.slice(3, -1);
-  assert.ok(author.length > 0 && author.every((l) => l.startsWith(PREFIX)), lines.join('\n'));
+  assert.ok(author.length > 0 && author.every((l) => l.startsWith(PREFIX)), lines.join(LINE_SEPARATOR));
   assert.ok(lines.includes(`${PREFIX}｜ 已有前缀`));
-  assert.ok(!lines.join('\n').includes('http'));
+  assert.ok(!lines.join(LINE_SEPARATOR).includes('http'));
 });
 
 test('by default the content is the starter_content of the write order; without it nothing is claimed', async (t) => {
@@ -282,17 +282,18 @@ test('by default the content is the starter_content of the write order; without 
   }
 });
 
-const DENSE = (n) => '\u{20000}\n\n'.repeat(n);
+// Many short lines: every line is its own paragraph, so each costs its text plus the prefix and a blank line.
+const DENSE = (n) => '\u{20000}\n'.repeat(n);
 
 test('a first guide that would exceed the body limit is cut with the fixed suffix and the message fits', async (t) => {
-  const tasks = Array.from({ length: 3 }, () => ({ title: '\u{20000}'.repeat(40), prompt: DENSE(166) }));
-  const content = { templateName: '\u{20000}'.repeat(40), firstGuide: DENSE(666), starterTasks: tasks };
+  const tasks = Array.from({ length: 3 }, () => ({ title: '\u{20000}'.repeat(40), prompt: DENSE(250) }));
+  const content = { templateName: '\u{20000}'.repeat(40), firstGuide: DENSE(1000), starterTasks: tasks };
   assert.ok(utf8Bytes(renderStarter(cleanContent({ ...content, addressee: '' }))) > MAX_BODY_BYTES - 1000);
   const s = await setup(t, { content, mark: [marked('sent')] });
   await s.starter.runAll();
   const { text } = sends(s.im)[0][1];
   assert.ok(utf8Bytes(text) <= MAX_BODY_BYTES, String(utf8Bytes(text)));
-  assert.ok(text.includes(`\u{20000}${TRUNCATION_SUFFIX}\n${PREFIX}可以先试试这些任务`), text.slice(-3000, -2000));
+  assert.ok(text.includes(`\u{20000}${TRUNCATION_SUFFIX}${LINE_SEPARATOR}${PREFIX}可以先试试这些任务`), text.slice(-3000, -2000));
   assert.equal(text.split('\n').at(-1), END_LINE);
 });
 
@@ -434,7 +435,7 @@ test('the DM changed before the send: not sent, send_failed', async (t) => {
 test('first_guide "" from the market is no guide: tasks only, or nothing claimed without tasks', async (t) => {
   const s = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: CONTENT.starterTasks }, mark: [marked('sent')] });
   await s.starter.runAll();
-  const lines = sends(s.im)[0][1].text.split('\n');
+  const lines = sends(s.im)[0][1].text.split(LINE_SEPARATOR);
   assert.equal(lines[3], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
   const n = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: [] }, claim: [] });
   await n.starter.runAll();

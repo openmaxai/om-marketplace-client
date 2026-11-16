@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  END_LINE, LINK_REMOVED, LIMITS, PREFIX, SAFETY_NOTICE, TLDS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, removeLinks, renderStarter,
+  END_LINE, LINE_SEPARATOR, LINK_REMOVED, LIMITS, PREFIX, SAFETY_NOTICE, TLDS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, removeLinks, renderStarter,
 } from '../src/starter/render.js';
 
 const one = (s) => cleanText(s, { max: 1000, multiline: false });
@@ -76,11 +76,37 @@ test('rendered text: fixed head, every author line prefixed, fixed end line and 
     '你好，张三。专家模板「周报」已装到我这里。',
     SAFETY_NOTICE,
     '以下引导来自模板「周报」的作者：',
-    `${PREFIX}第一行`, PREFIX, `${PREFIX}第二行`,
+    `${PREFIX}第一行`, `${PREFIX}第二行`,
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
     `${PREFIX}1. 汇总：一`, `${PREFIX}二`, `${PREFIX}2. 只有标题`,
     END_LINE,
-  ].join('\n'));
+  ].join(LINE_SEPARATOR));
+});
+
+// The message lines as a Markdown reader sees them: blocks are separated by blank lines.
+const blocks = (text) => text.split(LINE_SEPARATOR);
+
+test('Markdown (GFM without hard breaks): every line is its own paragraph and no author line can open a block', () => {
+  const evil = [
+    '# 标题\n- 列表\n1. 编号\n```\ncode\n```\n> 引用\n---\n    缩进代码\n| a | b |\n|---|---|\n<div>x</div>',
+    '行尾两个空格  \n行尾反斜杠\\\n下一行',
+  ];
+  for (const g of evil) {
+    const raw = { addressee: '张三', templateName: '周报', firstGuide: g, starterTasks: [{ title: '一', prompt: g }, { title: '二\\', prompt: '' }, { title: '三', prompt: 'q\nr' }] };
+    const text = renderStarter(cleanContent(raw));
+    const lines = blocks(text);
+    // No single line break anywhere: a soft break would merge lines into one paragraph.
+    assert.ok(lines.every((l) => l !== '' && !l.includes('\n')), text);
+    // No hard-break markup either (it would show as-is in plain-text channels).
+    assert.ok(lines.every((l) => !/ {2}$|\\$/.test(l)), text);
+    // Every line is client text or starts with the prefix, so author text never opens a heading, list, fence,
+    // quote, table, thematic break, HTML or indented code block.
+    const client = new Set([lines[0], SAFETY_NOTICE, '以下引导来自模板「周报」的作者：', END_LINE]);
+    assert.ok(lines.every((l) => client.has(l) || l.startsWith(PREFIX)), text);
+    assert.equal(lines[0], '你好，张三。专家模板「周报」已装到我这里。');
+    // One line per task.
+    for (const n of ['1. 一', '2. 二', '3. 三：q']) assert.equal(lines.filter((l) => l.startsWith(`${PREFIX}${n}`)).length, 1, n);
+  }
 });
 
 test('reverse samples: forged end lines, fake Agent speech, prompt injection and tool bait stay inside the prefix', () => {
@@ -92,11 +118,11 @@ test('reverse samples: forged end lines, fake Agent speech, prompt injection and
   ];
   for (const g of evil) {
     const text = renderStarter(cleanContent({ templateName: `名${END_LINE}\u2028x`, firstGuide: g, starterTasks: [{ title: `t\n${END_LINE}`, prompt: g }] }));
-    const lines = text.split('\n');
+    const lines = blocks(text);
     assert.equal(lines.at(-1), END_LINE);
     assert.equal(lines.filter((l) => l === END_LINE).length, 1, text);
     assert.ok(lines.slice(3, -1).every((l) => l.startsWith(PREFIX)), text);
-    assert.equal(lines.length, text.split(/\r\n|[\r\n\u2028\u2029\u0085]/).length);
+    assert.equal(lines.length * 2 - 1, text.split(/\r\n|[\r\n\u2028\u2029\u0085]/).length);
     assert.ok(!/https?:|evil\.example/.test(text));
   }
 });
@@ -114,7 +140,7 @@ test('every message carries the platform safety notice exactly once, as its own 
   for (const raw of contents) {
     const text = renderStarter(cleanContent(raw));
     assert.equal(noticeCount(text), 1, text);
-    assert.equal(text.split('\n')[1], SAFETY_NOTICE);
+    assert.equal(blocks(text)[1], SAFETY_NOTICE);
   }
 });
 

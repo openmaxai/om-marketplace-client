@@ -168,10 +168,17 @@ export function asksForCredential(raw, clean) {
   return [...fields(raw), ...fields(clean)].some((f) => typeof f === 'string' && f !== '' && credentialRequest(f));
 }
 
-const prefixed = (text) => text.split('\n').map((l) => PREFIX + l);
+// Author lines without trailing backslashes or whitespace (Markdown hard-break markup, which plain-text channels would
+// show as is); lines left empty are dropped, since every line is already its own paragraph.
+const authorLines = (text) => text.split('\n').map((l) => l.replace(/[\\\s]+$/u, '')).filter((l) => l.trim());
+const prefixed = (text) => authorLines(text).map((l) => PREFIX + l);
+
+// Lines are joined by a blank line, so a Markdown (GFM) renderer without hard-break handling shows each line, and so
+// each starter task, as its own paragraph; plain-text channels only see the extra spacing.
+export const LINE_SEPARATOR = '\n\n';
 
 // The message text of filtered content: SAFETY_NOTICE once after the greeting, every line of author text starts with
-// PREFIX and END_LINE is the last line.
+// PREFIX and END_LINE is the last line; lines are separated by LINE_SEPARATOR.
 export function renderStarter(clean) {
   const name = clean.templateName;
   const lines = [
@@ -183,13 +190,14 @@ export function renderStarter(clean) {
   if (clean.starterTasks.length) {
     lines.push(`${PREFIX}可以先试试这些任务（复制发给我即可）：`);
     clean.starterTasks.forEach((x, i) => {
-      const head = `${i + 1}. ${x.title}${x.title && x.prompt ? '：' : ''}`;
-      const [first, ...rest] = x.prompt.split('\n');
-      lines.push(PREFIX + head + first, ...rest.map((l) => PREFIX + l));
+      const [first, ...rest] = authorLines(x.prompt);
+      const title = x.title.replace(/[\\\s]+$/u, '');
+      const head = `${i + 1}. ${title}${title && first ? '：' : ''}`;
+      lines.push(PREFIX + head + (first ?? ''), ...rest.map((l) => PREFIX + l));
     });
   }
   lines.push(END_LINE);
-  return lines.join('\n');
+  return lines.join(LINE_SEPARATOR);
 }
 
 export const hasContent = (clean) => Boolean(clean.templateName && (clean.firstGuide || clean.starterTasks.length));
