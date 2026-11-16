@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Starter message: lines are now separated by a blank line, so a Markdown (GFM)
+  chat renderer shows the greeting, the notice, each guide line and each starter
+  task on its own line instead of one paragraph. Plain-text channels only see
+  extra spacing. Trailing backslashes and spaces are dropped from author lines,
+  and the author's own blank lines are dropped.
+
 ## [0.6.0] - 2026-11-15
 
 ### Added
