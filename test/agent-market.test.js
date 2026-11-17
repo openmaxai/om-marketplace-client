@@ -81,7 +81,7 @@ test('request-install proposes up to 3 candidates, resolving slugs, with one rea
   assert.deepEqual(req.json.candidates, [{ skill_id: U(1), reason: 'why 1' }, { skill_id: U(5), reason: 'why 5' }]);
   assert.match(s.text(), /pending_confirmation \(waiting for the owner's reply, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0 — d\n[\s\S]*\n {2}2\. Skill 5 1\.2\.0 — d\n/);
   assert.match(s.text(), /「组织市场里有 2 个技能能做：① Skill 1 — d ② Skill 5 — d 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」或「都不装」。安装要我的负责人确认。」/);
-  assert.match(s.text(), /If anyone else wants them installed, do not confirm; tell them: 「安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」安装」/);
+  assert.match(s.text(), /If anyone else wants them installed, do not confirm; tell them: 「安装需要我的负责人在对话里确认。管理员 \/ 所有者也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」安装」/);
   assert.doesNotMatch(s.text(), /confirm link|请点这个链接确认/);
 });
 
@@ -289,8 +289,8 @@ test('confirm-install refuses locally when the Agent has no owner', async (t) =>
   assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
   const j = JSON.parse(s.text());
   assert.equal(j.error, 'AGENT_OWNER_REQUIRED');
-  assert.match(j.message, /no active human owner.*only an org admin.*Workspace market.*「我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/);
-  assert.equal(j.say, '我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装');
+  assert.match(j.message, /no active human owner.*only an org admin.*Workspace market.*「我现在没有负责人，需要组织管理员 \/ 所有者在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/);
+  assert.equal(j.say, '我现在没有负责人，需要组织管理员 / 所有者在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装');
   assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
 });
 
@@ -336,7 +336,7 @@ test('decline-install sends no skills, drops the watch and tells the owner', asy
 test('confirm-install explains each market refusal', async (t) => {
   const s = await setupWatched(t);
   const cases = [
-    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*Tell them: 「安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/],
+    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*Tell them: 「安装需要我的负责人在对话里确认。管理员 \/ 所有者也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/],
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }), /made for a previous owner.*request-install/],
     [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*predates.*do not retry.*「对话里确认暂时没开放/],
     [problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }), /^confirm-install refused: chat confirmation is turned off in this market; nothing was changed\. Don't retry and don't decline \(the request expires by itself\); the owner installs manually in the Workspace market\. Tell them: 「对话里确认暂时没开放，请到市场里手动安装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」$/],

@@ -197,7 +197,7 @@ Rules:
   record and the audit.
 - When anyone else wants it installed, an org admin included, do not
   confirm; reply, for example:
-  「安装需要我的负责人 @<负责人> 在对话里确认。管理员也可以直接在 Workspace 市场里给我装。」
+  「安装需要我的负责人 @<负责人> 在对话里确认。管理员 / 所有者也可以直接在 Workspace 市场里给我装。」
   with the market pages `request-install` printed for this case. Never
   claim that an admin or anyone else confirmed.
 - After `confirm-install` succeeds, the client installs the selected skills

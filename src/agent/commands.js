@@ -254,14 +254,14 @@ async function ownerMemberId(ctx) {
 
 const ROUTE_MISSING = 'the workspace does not support confirming install requests in conversation yet (404 on the confirm route; '
   + 'the market or the workspace server is older than this client); nothing was changed. Don\'t retry; the owner installs manually in the Workspace market';
-const NOT_OWNER_SAY = '安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装';
+const NOT_OWNER_SAY = '安装需要我的负责人在对话里确认。管理员 / 所有者也可以直接在 Workspace 市场里给我装';
 // Refusals after which a person installs manually in the Workspace market; the value is what to tell the user.
 const MANUAL_INSTALL = (err) => {
   if (err?.routeMissing || err?.code === 'AGENT_CONFIRM_DISABLED') return (where) => `对话里确认暂时没开放，请到市场里手动安装：${where}`;
   if (err?.code === 'AGENT_ATTESTATION_REFUSED' && err.reason !== 'owner_changed') {
     return (where) => `${NOT_OWNER_SAY}：${where}`;
   }
-  if (err?.code === 'AGENT_OWNER_REQUIRED') return (where) => `我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：${where}`;
+  if (err?.code === 'AGENT_OWNER_REQUIRED') return (where) => `我现在没有负责人，需要组织管理员 / 所有者在 Workspace 市场里给我装：${where}`;
   return null;
 };
 const ORDER_ERRORS = new Set(['AGENT_NO_CLIENT', 'AGENT_QUEUE_FULL', 'VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED']);
