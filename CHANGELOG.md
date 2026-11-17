@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-17
+
 ### Added
 - `market-client start`: runs the post-install hook (an existing config is
   kept), starts the `zylos-om-marketplace-client` pm2 service when it is not
@@ -20,6 +22,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hires failed with `AGENT_NO_CLIENT`. SKILL.md `next-steps` now tells the
   Agent to run `market-client start` and to report the install as done only
   when it exits 0.
+- `market-client search`: search the skills listed for the organization.
+- `market-client install-permission`: who may confirm installs on this Agent
+  in the workspace (the owner, org admins), with display names when the
+  market gives them.
+- The service checks each pending install request every ~15 seconds (backing
+  off on errors, stopping when it is decided or expires) and pulls the
+  install orders as soon as it is confirmed in the workspace.
+- `market-client request-install`: propose 1 to 3 skills for this Agent;
+  nothing is installed until a person (owner or org admin) confirms on the
+  card in the workspace. A new request replaces the pending one, but is
+  refused while the previous one is being confirmed or installed; a skill
+  declined in the last 7 days is refused. The market's confirm link is shown
+  when given. `install-requests` refreshes the requests recorded locally.
+- `market-client submit-skill` and `submit-template`: submit a new skill (a
+  directory with `SKILL.md`, packed and checked locally; files that may hold
+  credentials, including service-account JSON keys found by content, refuse
+  the package) or a new expert
+  template manifest. Submissions land pending review. `--dry-run` runs the
+  local checks only. `submissions` lists what this Agent submitted.
+- Refusals from these commands are explained (name taken, no owner, client
+  too old, rate limits with the wait, validation and scan results).
+
+### Changed
+- SKILL.md tells the Agent about the Agent Market: search when a task needs a
+  capability it lacks, propose up to 3 skills, and send the user to the
+  workspace to confirm (the Agent never confirms); create skills and
+  templates only at the owner's request. User-facing phrasing is given in
+  Chinese.
+- Market problem responses keep the registered fields that explain a refusal
+  (`field`, `rule`, `rule_class`, `sentence`, `file`, `skill_md_rule`,
+  `expected_slug`, `queue_limit`, ...); they are shown to the Agent, not
+  logged. Text the market echoes back is quoted as market data.
 
 ### Fixed
 - Starter message: when the Agent is busy at adoption time (not idle for 30

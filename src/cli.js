@@ -10,6 +10,7 @@ import { createRuntime, pollRound } from './app.js';
 import { EXIT, execute, spool } from './commands.js';
 import { membershipMessage } from './orgs.js';
 import { STALE_AFTER_MS } from './revocations.js';
+import { AGENT_COMMANDS, SUBMIT_COMMANDS, runMarketCommand, runSubmitCommand } from './agent/commands.js';
 import { startService } from './service.js';
 
 const USAGE = `usage: market-client <command>
@@ -20,7 +21,17 @@ const USAGE = `usage: market-client <command>
   enable <slug>             move a disabled skill back into the skills directory
   disable <slug>            move a skill out of the skills directory
   uninstall <slug>          remove a skill and its kept versions
-commands other than status wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
+  submit-skill <dir>        package a directory with SKILL.md and submit it as a new skill (pending review)
+  submit-template <file>    submit an expert template manifest (JSON) as a new template (pending review)
+  submissions [--json]      submissions made from this Agent
+  search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
+  install-permission        who may confirm installs on this Agent (in the workspace)
+  request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
+  install-requests          install requests made from this Agent, refreshed from the market [--state <state>]
+submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
+  --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
+agent market commands take --json and --org <org_id> (default: the primary org)
+start, sync, rollback, enable, disable and uninstall wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
 const SKILL_COMMANDS = new Set(['rollback', 'enable', 'disable', 'uninstall']);
 const DEFAULT_WAIT_S = 900;
 const START_WAIT_S = 300;
@@ -191,15 +202,29 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
 
 export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`) } = {}) {
   const [cmd, ...rest] = argv;
-  const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S };
+  const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
+  const VALUE_OPTS = {
+    '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+  };
+  const submit = AGENT_COMMANDS.has(cmd);
   const pos = [];
+  let badOpt = false;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--json') opts.json = true;
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
-    else pos.push(rest[i]);
+    else if (SUBMIT_COMMANDS.has(cmd) && rest[i] === '--dry-run') opts.dryRun = true;
+    else if (submit && VALUE_OPTS[rest[i]]) {
+      if (i + 1 >= rest.length) badOpt = true;
+      const k = VALUE_OPTS[rest[i]];
+      const v = rest[++i];
+      opts[k] = k === 'reason' ? [...(opts.reason ?? []), v] : v;
+    } else pos.push(rest[i]);
   }
-  const arity = cmd === 'status' || cmd === 'sync' || cmd === 'start' ? 0 : SKILL_COMMANDS.has(cmd) ? 1 : -1;
-  if (arity !== pos.length || !(opts.wait >= 0)) {
+  const variadic = { search: [0, Infinity], 'request-install': [1, 3] }[cmd];
+  const arity = ['status', 'sync', 'start', 'submissions', 'install-requests', 'install-permission'].includes(cmd) ? 0
+    : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
+      : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
+  if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
   }
@@ -235,6 +260,16 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
     return EXIT.OK;
   }
   const logger = createLogger(env.MARKET_CLIENT_LOG_LEVEL || 'warn', { log: (l) => process.stderr.write(`${l}\n`), error: (l) => process.stderr.write(`${l}\n`) });
+  if (submit) {
+    try {
+      return SUBMIT_COMMANDS.has(cmd)
+        ? await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger })
+        : await runMarketCommand(cmd, cmd === 'search' ? (pos.length ? [pos.join(' ')] : []) : pos, opts, { config, dataDir, print, logger });
+    } catch (err) {
+      print(`${cmd} failed: ${err.message}`);
+      return EXIT.FAILED;
+    }
+  }
   try {
     const r = await runCommand({ cmd, arg, config, dataDir, logger, waitMs: opts.wait * 1000, print });
     print(r.message);
