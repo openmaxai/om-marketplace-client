@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
-import { SubmitError, buildZip, packSkill } from '../src/submit/pack.js';
+import { SubmitError, buildZip, packSkill } from '../src/agent/pack.js';
 import { inspectPackage } from '../src/pkg/hygiene.js';
-import { checkManifest, readManifest } from '../src/submit/template.js';
+import { checkManifest, readManifest } from '../src/agent/template.js';
 
 const SKILL_MD = '---\nname: weekday-helper\ndescription: Tells the weekday of a date.\nversion: 1.0.0\n---\n\n# Weekday helper\n';
 

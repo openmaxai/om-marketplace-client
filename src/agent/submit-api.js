@@ -93,24 +93,48 @@ export async function submitTemplate({ http, orgId, manifest, changelog = null, 
 
 const minutes = (ms) => Math.max(1, Math.ceil(ms / 60_000));
 
+const RATE_WHAT = {
+  agent_submissions: "the owner's Agents reached the hourly submission limit",
+  agent_search: 'this Agent reached the search limit',
+  agent_proposals: 'this Agent reached the hourly limit of install requests',
+};
+
+// Codes shared by every Agent market route; null when err is not one of them.
+export function explainCommonError(err) {
+  if (!(err instanceof MarketError)) return err?.message ?? String(err);
+  switch (err.code) {
+    case 'CLIENT_VERSION_TOO_OLD':
+      return `the market needs om-marketplace-client ${err.min_version ?? 'newer than this one'} or later for this; the owner can run \`zylos upgrade om-marketplace-client\``;
+    case 'AGENT_OWNER_REQUIRED':
+      return 'refused: this Agent has no active human owner in the organization';
+    case 'RATE_LIMITED': {
+      const wait = err.retryAfterMs != null ? `; try again in about ${minutes(err.retryAfterMs)} minute(s)` : '; try again later';
+      return `rate limited: ${RATE_WHAT[err.reason] ?? `by the market${err.reason ? ` (${err.reason})` : ''}`}${wait}`;
+    }
+    default:
+      return null;
+  }
+}
+
+export function explainOther(err) {
+  const x = err.extra ?? {};
+  const tail = x.detail ? `: ${x.detail}` : '';
+  if (err.transient) return `${err.message}${tail}; the market did not confirm it. Try again later`;
+  return `${err.message}${err.reason ? ` (${err.reason})` : ''}${tail}`;
+}
+
 // One message the Agent can relay to its owner for a refused or failed submission.
 export function explainSubmitError(err) {
-  if (!(err instanceof MarketError)) return err?.message ?? String(err);
+  const common = explainCommonError(err);
+  if (common !== null) return common;
   const x = err.extra ?? {};
   const at = x.field ? ` at ${x.field}` : '';
   switch (err.code) {
-    case 'CLIENT_VERSION_TOO_OLD':
-      return `the market needs om-marketplace-client ${err.min_version ?? 'newer than this one'} or later for Agent submissions; the owner can run \`zylos upgrade om-marketplace-client\``;
     case 'AGENT_UPLOAD_DISABLED':
-      if (err.reason === 'agent_owner_required') return 'refused: this Agent has no active human owner in the organization, so it cannot submit';
+      if (err.reason === 'agent_owner_required') return 'refused: this Agent has no active human owner in the organization';
       if (err.reason === 'existing_skill') return 'refused: a skill with this name already exists in the organization. An Agent can only create new skills: rename it (SKILL.md name) or ask a person to upload a new version in the workbench';
       if (err.reason === 'existing_template') return 'refused: an expert template with this id already exists. An Agent can only create new templates: change the manifest id or ask a person to publish a new version in the workbench';
       return 'refused: Agent submissions are turned off in this market';
-    case 'RATE_LIMITED': {
-      const wait = err.retryAfterMs != null ? `; try again in about ${minutes(err.retryAfterMs)} minute(s)` : '; try again later';
-      if (err.reason === 'agent_submissions') return `rate limited: the owner's Agents reached the hourly submission limit${wait}`;
-      return `rate limited by the market${err.reason ? ` (${err.reason})` : ''}${wait}`;
-    }
     case 'TEMPLATE_MANIFEST_INVALID':
       if (x.rule_class) return `manifest refused: unsafe instruction (${x.rule_class})${at}${x.sentence ? `: "${x.sentence}"` : ''}`;
       if (err.reason === 'version_not_greater') return `manifest refused: version must be greater than ${x.previous_version ?? 'the existing one'}`;
@@ -135,11 +159,10 @@ export function explainSubmitError(err) {
       return 'refused: this exact content was blocked by the market';
     case 'REVIEW_STATE_CONFLICT':
       return `refused: ${err.reason === 'personal_templates_disabled' ? 'expert templates cannot be submitted in this market now' : `review state conflict (${err.reason ?? 'unknown'})`}`;
-    default: {
-      const tail = x.detail ? `: ${x.detail}` : '';
-      if (err.transient) return `${err.message}${tail}; the market did not confirm the submission. Try again later; if a skill retry then answers that the skill already exists, the first attempt went through`;
-      return `${err.message}${err.reason ? ` (${err.reason})` : ''}${tail}`;
-    }
+    default:
+      return err.transient
+        ? `${explainOther(err)}; if a skill retry then answers that the skill already exists, the first attempt went through`
+        : explainOther(err);
   }
 }
 

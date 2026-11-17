@@ -59,7 +59,7 @@ const EXTRA_TEXT = { detail: 512, field: 256, rule: 64, rule_class: 64, sentence
 function problemExtra(data) {
   const out = {};
   for (const [k, max] of Object.entries(EXTRA_TEXT)) if (typeof data[k] === 'string' && data[k].length <= max) out[k] = data[k];
-  if (Number.isSafeInteger(data.index)) out.index = data.index;
+  for (const k of ['index', 'queue_limit']) if (Number.isSafeInteger(data[k])) out[k] = data[k];
   return Object.keys(out).length ? out : null;
 }
 
@@ -136,8 +136,8 @@ export function createMarketHttp({
   bffUrl, auth, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, logger = SILENT_LOGGER, now = Date.now, signal = null,
 }) {
   const base = new URL(normalizeBffUrl(bffUrl));
-  // An abort of `cancel` ends this one request.
-  async function request(method, orgId, subPath, body, { cancel = null } = {}) {
+  // An abort of `cancel` ends this one request. `query` is a flat object of string values.
+  async function request(method, orgId, subPath, body, { cancel = null, query = null } = {}) {
     if (!isOrgOrMemberId(orgId)) throw new TypeError('invalid orgId');
     // %2E and %2F are refused because URL parsing treats them as dot segments or separators.
     if (!/^\/(?:[A-Za-z0-9\-._~:/]|%[0-9A-F]{2})*$/.test(subPath) || /%2[EF]/.test(subPath)
@@ -145,6 +145,7 @@ export function createMarketHttp({
       throw new TypeError('invalid market path');
     }
     const url = new URL(`/api/v1/orgs/${encodeURIComponent(orgId)}${subPath}`, base);
+    if (query) for (const [k, v] of Object.entries(query)) url.searchParams.set(k, String(v));
     if (url.origin !== base.origin) throw new TypeError('market path left the configured origin');
     const label = `market ${method} ${url.pathname}`;
     const send = async () => {

@@ -10,7 +10,7 @@ import { createRuntime, pollRound } from './app.js';
 import { EXIT, execute, spool } from './commands.js';
 import { membershipMessage } from './orgs.js';
 import { STALE_AFTER_MS } from './revocations.js';
-import { SUBMIT_COMMANDS, runSubmitCommand } from './submit/commands.js';
+import { AGENT_COMMANDS, SUBMIT_COMMANDS, runMarketCommand, runSubmitCommand } from './agent/commands.js';
 
 const USAGE = `usage: market-client <command>
   status [--json]           orgs, client version gate, last pulls, installed content, queue, alerts
@@ -22,8 +22,13 @@ const USAGE = `usage: market-client <command>
   submit-skill <dir>        package a directory with SKILL.md and submit it as a new skill (pending review)
   submit-template <file>    submit an expert template manifest (JSON) as a new template (pending review)
   submissions [--json]      submissions made from this Agent
-submit options: --dry-run (local checks only), --json, --changelog <text>, --category-id <id>, --org <org_id>,
+  search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
+  request-install <skill>   ask a person to confirm installing a skill (id or slug) --reason <text>
+  install-requests          this Agent's install requests [--state pending_confirmation|confirmed|declined|expired]
+  confirm-install <id>      record that the owner confirmed in this chat, then pull the install order
+submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
+agent market commands take --json and --org <org_id> (default: the primary org)
 rollback, enable, disable, uninstall and sync wait up to --wait <seconds> (default 900) for a running service to answer`;
 const SKILL_COMMANDS = new Set(['rollback', 'enable', 'disable', 'uninstall']);
 const DEFAULT_WAIT_S = 900;
@@ -195,20 +200,23 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
 export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`) } = {}) {
   const [cmd, ...rest] = argv;
   const opts = { json: false, wait: DEFAULT_WAIT_S, dryRun: false };
-  const VALUE_OPTS = { '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org' };
-  const submit = SUBMIT_COMMANDS.has(cmd);
+  const VALUE_OPTS = {
+    '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+  };
+  const submit = AGENT_COMMANDS.has(cmd);
   const pos = [];
   let badOpt = false;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--json') opts.json = true;
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
-    else if (submit && rest[i] === '--dry-run') opts.dryRun = true;
+    else if (SUBMIT_COMMANDS.has(cmd) && rest[i] === '--dry-run') opts.dryRun = true;
     else if (submit && VALUE_OPTS[rest[i]]) {
       if (i + 1 >= rest.length) badOpt = true;
       opts[VALUE_OPTS[rest[i]]] = rest[++i];
     } else pos.push(rest[i]);
   }
-  const arity = cmd === 'status' || cmd === 'sync' || cmd === 'submissions' ? 0 : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
+  const arity = ['status', 'sync', 'submissions', 'install-requests'].includes(cmd) ? 0
+    : cmd === 'search' ? pos.length : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
   if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
@@ -230,8 +238,19 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   }
   const logger = createLogger(env.MARKET_CLIENT_LOG_LEVEL || 'warn', { log: (l) => process.stderr.write(`${l}\n`), error: (l) => process.stderr.write(`${l}\n`) });
   if (submit) {
+    // The order a confirmation creates is pulled at once rather than at the next poll.
+    const afterConfirm = async () => {
+      try {
+        const r = await runCommand({ cmd: 'sync', arg: undefined, config, dataDir, logger, waitMs: Math.min(opts.wait, 120) * 1000, print: () => {} });
+        return r.code === EXIT.OK ? `install order pulled: ${r.message}` : `the install order is pulled at the next poll (${r.message})`;
+      } catch (err) {
+        return `the install order is pulled at the next poll (${err.message})`;
+      }
+    };
     try {
-      return await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger });
+      return SUBMIT_COMMANDS.has(cmd)
+        ? await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger })
+        : await runMarketCommand(cmd, cmd === 'search' ? pos.join(' ') || undefined : pos[0], opts, { config, print, logger, afterConfirm });
     } catch (err) {
       print(`${cmd} failed: ${err.message}`);
       return EXIT.FAILED;

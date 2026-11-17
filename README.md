@@ -6,7 +6,9 @@ templates into this Agent after sha256 verification, and reports the result
 back to the market.
 
 Only a person decides what is installed or upgraded: install and upgrade run
-only from orders placed in the workbench. Enable, disable, uninstall and
+only from orders placed in the workbench or install requests a person
+confirmed. The Agent can search the market, request an install and, on its
+owner's request, submit a new skill or expert template for review. Enable, disable, uninstall and
 rollback can also be run locally with `market-client`; the change is made
 first and then reported to the market.
 
@@ -136,6 +138,28 @@ Only one process works on a data directory at a time. When the service is
 running, commands other than `status` are handed to it and run between poll
 rounds; otherwise the command takes the lock and runs itself. A service
 starting meanwhile waits for the lock.
+
+### Agent market commands
+
+These call the market directly (no state lock, not handed to the service) for
+the primary org, or `--org <org_id>`. All take `--json`. They need market
+support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
+
+| Command | Effect |
+|---|---|
+| `search [<words>] [--category-id <id>] [--limit 1-20]` | Skills listed for the org and visible to the Agent's owner, with description, examples, category, latest version and whether installed. |
+| `request-install <slug or skill_id> --reason <text>` | Creates an install request (`pending_confirmation`, expires after 24 hours). Nothing is installed. A pending request for the same skill is returned instead of a new one. |
+| `install-requests [--state <state>]` | This Agent's install requests, newest first. |
+| `confirm-install <proposal_id>` | Records that the owner confirmed in chat (`confirmed_via: chat`); the market checks the owner's install rights and creates the install order, which is then pulled at once (one poll round, handed to the service when it runs). In the workspace the owner confirms on the card instead. |
+| `submit-skill <dir> [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links refused), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin. |
+| `submit-template <manifest.json> [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review. |
+| `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |
+
+Refusals exit 3 with a message the Agent can relay: name already taken (the
+Agent creates only new skills and templates), no active owner, client too
+old, rate limits (with the wait from `Retry-After`), validation and scan
+results with the file, line or JSON pointer. Network and server errors are
+retried twice (all these calls are replay-safe) and then exit 1.
 
 ### Status messages
 

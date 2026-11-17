@@ -9,9 +9,9 @@ import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { writeJsonAtomic } from '../src/state.js';
 import { CLIENT_VERSION } from '../src/version.js';
-import { readSubmissions, runSubmitCommand } from '../src/submit/commands.js';
+import { readSubmissions, runSubmitCommand } from '../src/agent/commands.js';
 import { MarketError } from '../src/http.js';
-import { explainSubmitError } from '../src/submit/api.js';
+import { explainSubmitError } from '../src/agent/submit-api.js';
 
 const B = `/api/v1/orgs/${ORG}`;
 const SKILL_MD = '---\nname: weekday-helper\ndescription: Tells the weekday of a date.\nversion: 1.0.0\n---\n\n# Weekday helper\n';
@@ -96,9 +96,9 @@ test('submit-skill refusals: existing skill, too-old client, rate limit, policy'
   const problem = (status, body, headers) => ({ status, headers, problem: { status, ...body } });
   s.fake.script('POST', `${B}/skill-uploads`,
     problem(403, { code: 'AGENT_UPLOAD_DISABLED', reason: 'existing_skill' }),
-    problem(409, { code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_submit_required', min_version: '0.8.0' }),
+    problem(409, { code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.8.0' }),
     problem(429, { code: 'RATE_LIMITED', reason: 'agent_submissions' }, { 'retry-after': '1200' }),
-    problem(403, { code: 'AGENT_UPLOAD_DISABLED', reason: 'agent_owner_required' }),
+    problem(403, { code: 'AGENT_OWNER_REQUIRED' }),
     problem(403, { code: 'AGENT_UPLOAD_DISABLED' }));
   const expect = [/already exists[\s\S]*rename it/, /0\.8\.0 or later/, /hourly submission limit; try again in about 20 minute/, /no active human owner/, /turned off/];
   for (const re of expect) {
@@ -187,4 +187,10 @@ test('CLI: usage for submit commands and dry-run through the binary', async () =
   assert.equal(r.code, 0);
   assert.equal(JSON.parse(r.stdout).slug, 'weekday-helper');
   assert.match((await cli(['submissions'])).stdout, /no submissions/);
+  assert.equal((await cli(['request-install'])).code, 2);
+  assert.equal((await cli(['confirm-install'])).code, 2);
+  assert.equal((await cli(['install-requests', 'x'])).code, 2);
+  assert.equal((await cli(['search', '--limit'])).code, 2);
+  assert.equal((await cli(['status', '--dry-run'])).code, 2);
+  assert.match((await cli(['request-install', 'weekday-helper'])).stdout, /--reason is required/);
 });
