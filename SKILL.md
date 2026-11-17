@@ -145,8 +145,9 @@ How the permission is given:
   one per skill, in order) creates one request with up to 3 candidates.
   Nothing is installed by this.
 - OpenMax workspace: the person chooses which candidates to install on the
-  card in the workspace; the card is the confirmation. Do not run
-  `confirm-install` for a workspace conversation.
+  card in the workspace; the card is the confirmation, and the install starts
+  within seconds of it. Do not run `confirm-install` for a workspace
+  conversation.
 - Other channels (Lark, Telegram, ...): only your owner's explicit
   permission in this conversation counts ("install 1 and 3"). Then run
   `market-client confirm-install <request_id> <candidate numbers or skill_ids>`
@@ -171,6 +172,8 @@ the market, do it directly; no confirmation card is needed.
   (a new slug: lowercase letters, digits, hyphens), `description` and
   `version` (e.g. `1.0.0`). No credentials, no `.claude/` directory, no npm
   install hooks or dependencies, no inline commands (`` !` ``) in Markdown.
+  Installed files are not executable: have SKILL.md run scripts through
+  their interpreter (`bash scripts/run.sh`, `node scripts/run.js`).
   Run `market-client submit-skill <dir> --dry-run`, fix what it reports, then
   `market-client submit-skill <dir> [--changelog <text>] [--examples <file>]`.
 - Expert template: write a manifest JSON (`schema_version: 1`,

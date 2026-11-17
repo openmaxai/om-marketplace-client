@@ -157,6 +157,18 @@ support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
 | `submit-template <manifest.json> [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review. |
 | `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |
 
+While a request from `request-install` is pending, the service checks it every
+15 seconds (±20%; a failed check backs off from 30 seconds up to 5 minutes) and
+runs a poll round as soon as it is confirmed, so a card confirmation installs
+within seconds. It stops when the request is decided, gone, or expired. The
+pending requests are kept as files in `proposal-watch/` in the data dir.
+`who_can_install` is shown with display names when the market gives them,
+otherwise as member ids.
+
+`submit-skill` does not keep file modes: installs write every file 0600 and
+never execute package content, so a skill runs its scripts through an
+interpreter (`bash scripts/run.sh`).
+
 Refusals exit 3 with a message the Agent can relay: name already taken (the
 Agent creates only new skills and templates), no active owner, client too
 old, rate limits (with the wait from `Retry-After`), validation and scan

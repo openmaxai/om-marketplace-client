@@ -6,6 +6,9 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
+import { installers } from '../src/http.js';
+import { watchDir } from '../src/agent/proposal-watch.js';
+import fs from 'node:fs';
 
 const A = `/api/v1/orgs/${ORG}/agents/${AGENT}`;
 const OWNER = U(11);
@@ -34,7 +37,7 @@ async function setup(t) {
   const run = (cmd, args = [], opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, {
     config, print: (l) => out.push(l), afterConfirm: async (ids) => { pulled.push(...ids); return 'install orders pulled now'; },
   });
-  return { fake, out, run, pulled, text: () => out.join('\n'), reset: () => { out.length = 0; } };
+  return { fake, out, run, pulled, config, text: () => out.join('\n'), reset: () => { out.length = 0; } };
 }
 
 test('search sends the query, shows market text as data with controls removed', async (t) => {
@@ -64,12 +67,12 @@ test('install-permission reports who may confirm', async (t) => {
   const s = await setup(t);
   s.fake.script('GET', `${A}/install-permission`,
     { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [OWNER], owner_can_install: true, caller_can_install: false } },
-    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [U(20)], owner_can_install: false, caller_can_install: false } });
+    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [{ member_id: U(20), display_name: 'Ana Admin' }], owner_can_install: false, caller_can_install: false } });
   assert.equal(await s.run('install-permission'), 0);
   assert.match(s.text(), /the owner may install/);
   s.reset();
   assert.equal(await s.run('install-permission'), 0);
-  assert.match(s.text(), new RegExp(`may not install.*${U(20)}.*workspace card`));
+  assert.match(s.text(), new RegExp(`may not install.*Ana Admin \\(${U(20)}\\).*workspace card`));
 });
 
 test('request-install proposes up to 3 candidates, resolving slugs, with one reason each', async (t) => {
@@ -130,7 +133,7 @@ test('confirm-install: owner without the right gets who can install; not pending
   s.reset();
   assert.equal(await s.run('confirm-install', [U(10), U(1)], { json: true }), 3);
   const j = JSON.parse(s.text());
-  assert.deepEqual(j.who_can_install, [U(20)]);
+  assert.deepEqual(j.who_can_install, [{ member_id: U(20), display_name: null }]);
   assert.match(j.message, new RegExp(`may not install.*${U(20)}.*confirm the request in the workspace`));
   s.reset();
   assert.equal(await s.run('confirm-install', [U(10), U(1)]), 3);
@@ -149,4 +152,26 @@ test('decline-install and install-requests', async (t) => {
   assert.equal(await s.run('install-requests', [], { state: 'pending_confirmation' }), 0);
   assert.match(s.text(), /install request .*: pending_confirmation/);
   assert.equal(await s.run('install-requests', [], { state: 'bogus' }), 3);
+});
+
+test('installers takes ids or {member_id, display_name}, cleans names, falls back to ids', () => {
+  assert.deepEqual(installers([U(1), { member_id: U(2), display_name: ' Ana\u0007 ' }, { id: U(3), name: 'Bo' }, { member_id: 'not an id' }, 7]), [
+    { member_id: U(1), display_name: null }, { member_id: U(2), display_name: 'Ana' }, { member_id: U(3), display_name: 'Bo' },
+  ]);
+});
+
+test('request-install watches a pending request; confirm and decline stop watching it', async (t) => {
+  const s = await setup(t);
+  const dataDir = path.join(tmpHome(), 'w');
+  const run = (cmd, args, opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, {
+    config: s.config, dataDir, print: () => {}, afterConfirm: async () => 'pulled',
+  });
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() });
+  assert.equal(await run('request-install', [U(1)], { reason: ['r'] }), 0);
+  const file = path.join(watchDir(dataDir), `${U(10)}.json`);
+  const w = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual([w.org_id, w.agent_id, w.expires_at_ms], [ORG, AGENT, Date.parse('2026-11-18T10:00:00Z')]);
+  s.fake.script('POST', `${A}/install-proposals/${U(10)}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'chat' }) });
+  assert.equal(await run('decline-install', [U(10)]), 0);
+  assert.equal(fs.existsSync(file), false);
 });

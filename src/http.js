@@ -54,13 +54,31 @@ function problemFields(data) {
   };
 }
 
+// who_can_install entries as {member_id, display_name}: a bare member id, or an object with member_id (or id) and an
+// optional display_name (or name). Names are cut and stripped of control characters.
+export function installers(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const e of list.slice(0, 50)) {
+    const id = typeof e === 'string' ? e : e?.member_id ?? e?.id;
+    if (!isOrgOrMemberId(id)) continue;
+    const raw = typeof e === 'object' ? e?.display_name ?? e?.name : null;
+    const name = typeof raw === 'string' ? raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 100) : '';
+    out.push({ member_id: id, display_name: name || null });
+  }
+  return out;
+}
+
+// Names when the market gives them, else member ids.
+export const installerList = (list) => list.map((w) => (w.display_name ? `${w.display_name} (${w.member_id})` : w.member_id)).join(', ');
+
 // Registered problem extension fields that explain a refused submission to its author; never logged.
 const EXTRA_TEXT = { detail: 512, field: 256, rule: 64, rule_class: 64, sentence: 1000, skill_md_rule: 64, file: 512, expected_slug: 64, previous_version: 64 };
 function problemExtra(data) {
   const out = {};
   for (const [k, max] of Object.entries(EXTRA_TEXT)) if (typeof data[k] === 'string' && data[k].length <= max) out[k] = data[k];
   for (const k of ['index', 'queue_limit']) if (Number.isSafeInteger(data[k])) out[k] = data[k];
-  if (Array.isArray(data.who_can_install)) out.who_can_install = data.who_can_install.filter(isOrgOrMemberId).slice(0, 50);
+  if (Array.isArray(data.who_can_install)) out.who_can_install = installers(data.who_can_install);
   return Object.keys(out).length ? out : null;
 }
 

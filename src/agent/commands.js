@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createAuth } from '../auth.js';
-import { createMarketHttp } from '../http.js';
+import { createMarketHttp, installerList } from '../http.js';
 import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
@@ -14,6 +14,7 @@ import {
   getProposal, installPermission, listProposals, proposeInstall, searchSkills,
 } from './proposals-api.js';
 import { isCanonicalUuid } from '../ids.js';
+import { addWatch, dropWatch } from './proposal-watch.js';
 import { validSlug } from '../pkg/frontmatter.js';
 
 export const SUBMIT_COMMANDS = new Set(['submit-skill', 'submit-template', 'submissions']);
@@ -210,7 +211,7 @@ function checkArgs(cmd, args, opts) {
 
 // args: positional arguments; opts: {json, limit, categoryId, reason (string or list), state, org}.
 // deps.afterConfirm(intentIds) pulls the new orders at once.
-export async function runMarketCommand(cmd, args, opts, { config, print, fetchImpl = globalThis.fetch, logger, afterConfirm = null }) {
+export async function runMarketCommand(cmd, args, opts, { config, dataDir = null, print, fetchImpl = globalThis.fetch, logger, afterConfirm = null }) {
   const out = (obj, text) => print(opts.json ? JSON.stringify(obj, null, 2) : text);
   const refuse = (code, message, extra = {}) => {
     out({ ok: false, error: code, message, ...extra }, `${cmd} refused: ${message}`);
@@ -238,7 +239,7 @@ export async function runMarketCommand(cmd, args, opts, { config, print, fetchIm
       const r = await installPermission(ctx);
       out({ ok: true, ...r }, r.owner_can_install
         ? 'the owner may install skills on this Agent: the owner confirms (workspace card, or explicitly in chat)'
-        : `the owner may not install skills on this Agent; who can (member ids): ${r.who_can_install.join(', ') || 'nobody now'}. That person confirms in the workspace card`);
+        : `the owner may not install skills on this Agent; who can: ${installerList(r.who_can_install) || 'nobody now'}. That person confirms in the workspace card`);
       return EXIT.OK;
     }
     if (cmd === 'request-install') {
@@ -246,6 +247,13 @@ export async function runMarketCommand(cmd, args, opts, { config, print, fetchIm
       for (const a of args) ids.push(await resolveSkill(http, orgId, agentId, a));
       if (new Set(ids).size !== ids.length) throw new SubmitError('usage', 'the same skill is listed twice');
       const p = await proposeInstall({ ...ctx, candidates: ids.map((skill_id, i) => ({ skill_id, reason: reasons[i] })) });
+      if (dataDir && p.state === 'pending_confirmation') {
+        try {
+          addWatch(dataDir, { proposal_id: p.proposal_id, org_id: orgId, agent_id: agentId, expires_at: p.expires_at });
+        } catch (err) {
+          logger?.warn?.(`install request not watched (${err.code || 'error'}); a card confirmation is pulled at the next poll`);
+        }
+      }
       out({ ok: true, ...p }, renderProposal(p));
       return EXIT.OK;
     }
@@ -257,6 +265,7 @@ export async function runMarketCommand(cmd, args, opts, { config, print, fetchIm
     const proposalId = args[0];
     if (cmd === 'decline-install') {
       const p = await declineInChat({ ...ctx, proposalId });
+      if (dataDir) dropWatch(dataDir, proposalId);
       out({ ok: true, ...p }, renderProposal(p));
       return EXIT.OK;
     }
@@ -272,6 +281,7 @@ export async function runMarketCommand(cmd, args, opts, { config, print, fetchIm
     }
     skillIds = [...new Set(skillIds)];
     const p = await confirmInChat({ ...ctx, proposalId, skillIds });
+    if (dataDir) dropWatch(dataDir, proposalId);
     const intents = p.candidates.map((c) => c.intent_id).filter(Boolean);
     const pulled = intents.length && afterConfirm ? await afterConfirm(intents) : null;
     out({ ok: true, ...p, pulled }, `${renderProposal(p)}${pulled ? `\n${pulled}` : ''}`);

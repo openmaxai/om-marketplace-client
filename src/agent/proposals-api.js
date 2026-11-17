@@ -1,6 +1,6 @@
 // Market search and install proposals. The Agent only proposes; an install happens after a person confirms.
 import crypto from 'node:crypto';
-import { MarketError } from '../http.js';
+import { MarketError, installerList, installers } from '../http.js';
 import { isCanonicalUuid, isOrgOrMemberId } from '../ids.js';
 import { explainCommonError, explainOther } from './submit-api.js';
 
@@ -113,10 +113,9 @@ export async function declineInChat({ http, orgId, agentId, proposalId }) {
 export async function installPermission({ http, orgId, agentId }) {
   const d = (await http.request('GET', orgId, `${agentPath(agentId)}/install-permission`)).data;
   if (!isObject(d)) throw shape('market install permission', 'is not an object');
-  const ids = Array.isArray(d.who_can_install) ? d.who_can_install.filter(isOrgOrMemberId).slice(0, 50) : [];
   return {
     owner_member_id: isOrgOrMemberId(d.owner_member_id) ? d.owner_member_id : null,
-    who_can_install: ids,
+    who_can_install: installers(d.who_can_install),
     owner_can_install: d.owner_can_install === true,
   };
 }
@@ -143,7 +142,7 @@ export function explainProposalError(err) {
     case 'VERSION_REVOKED':
       return `the skill version was revoked and cannot be installed${at}`;
     case 'NOT_AGENT_OWNER': {
-      const who = x.who_can_install?.length ? ` Who can install (member ids): ${x.who_can_install.join(', ')}.` : '';
+      const who = x.who_can_install?.length ? ` Who can install: ${installerList(x.who_can_install)}.` : '';
       return `the owner may not install skills on this Agent.${who} That person has to confirm the request in the workspace (the install card)`;
     }
     default:

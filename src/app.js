@@ -4,6 +4,7 @@ import { EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
 import { createLogger } from './logger.js';
 import { createScheduler, POLL_INTERVAL_MS } from './scheduler.js';
+import { WATCH_INTERVAL_MS, createProposalWatch } from './agent/proposal-watch.js';
 import { createAuth } from './auth.js';
 import { createMarketHttp } from './http.js';
 import { createMarketApi } from './market-api.js';
@@ -57,14 +58,17 @@ export function pollRound(logger, { revocations, intents, skills, templates, sta
 }
 
 // CLI requests waiting in `commands` run first, one at a time; a sync request is answered when the round ends.
-export function buildTasks(logger, runtime = {}, commands = null) {
+// pollNow runs the poll round at once (an install request was confirmed).
+export function buildTasks(logger, runtime = {}, commands = null, { pollNow = () => {} } = {}) {
   const round = pollRound(logger, runtime);
   const starterTask = runtime.starter ? [{ name: 'starter', baseMs: STARTER_CHECK_MS, run: () => runtime.starter.runWaiting() }] : [];
   // Independent of the poll round: confirms template activation, or asks the idle Agent for a new session.
   const activationTask = runtime.activation ? [{ name: 'activation', baseMs: ACTIVATION_CHECK_MS, run: () => runtime.activation.tick() }] : [];
+  const proposalTask = runtime.proposals ? [{ name: 'proposals', baseMs: WATCH_INTERVAL_MS, run: () => runtime.proposals.tick({ onConfirmed: pollNow }) }] : [];
   return [
     ...activationTask,
     ...starterTask,
+    ...proposalTask,
     {
       name: 'poll',
       baseMs: POLL_INTERVAL_MS,
@@ -151,7 +155,8 @@ export function createRuntime({
       state.clearAlert('policy_pin');
     }
     const auth = createAuth({ bffUrl: config.bff_url, apiKey: config.api_key, tokenDir: path.join(dataDir, 'tokens'), fetchImpl, logger, signal });
-    const api = createMarketApi({ http: createMarketHttp({ bffUrl: config.bff_url, auth, fetchImpl, logger, signal }) });
+    const http = createMarketHttp({ bffUrl: config.bff_url, auth, fetchImpl, logger, signal });
+    const api = createMarketApi({ http });
     const orgs = createOrgs({ config, state, auth, logger });
     const skills = createSkills({
       api, state, orgs, logger, bffUrl: config.bff_url, skillsDir, dataDir, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal,
@@ -190,6 +195,7 @@ export function createRuntime({
       activation,
       reconcile,
       localSkills: createLocalSkillReporter({ api, state, orgs, logger, skillsDir, zylosDir }),
+      proposals: createProposalWatch({ http, dataDir, logger }),
     };
   } catch (err) {
     state.close();
@@ -260,7 +266,7 @@ export async function main({ dataDir } = {}) {
     return done;
   }
   const commands = spool(dataDir);
-  scheduler = createScheduler(buildTasks(logger, runtime, commands), { logger });
+  scheduler = createScheduler(buildTasks(logger, runtime, commands, { pollNow: () => scheduler?.runNow('poll') }), { logger });
   scheduler.start();
   keepAlive = setInterval(() => { if (commands.pending()) scheduler.runNow('poll'); }, SPOOL_CHECK_MS);
   return done;

@@ -49,7 +49,9 @@ const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); return
 // 1980-01-01 00:00 in MS-DOS format, so the same files always give the same bytes.
 const DOS_DATE = (0 << 9) | (1 << 5) | 1;
 
-// Deflated regular-file entries, no extra fields, unix mode 0644; reproducible for the same input.
+// Deflated regular-file entries, no extra fields, unix mode 0644; reproducible for the same input. File modes are not
+// carried: the install path writes every file 0600 whatever the archive says, so a skill runs its scripts through an
+// interpreter (`bash scripts/x.sh`, `node x.js`).
 export function buildZip(entries) {
   const parts = [];
   const central = [];

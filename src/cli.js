@@ -256,7 +256,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
     try {
       return SUBMIT_COMMANDS.has(cmd)
         ? await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger })
-        : await runMarketCommand(cmd, cmd === 'search' ? (pos.length ? [pos.join(' ')] : []) : pos, opts, { config, print, logger, afterConfirm });
+        : await runMarketCommand(cmd, cmd === 'search' ? (pos.length ? [pos.join(' ')] : []) : pos, opts, { config, dataDir, print, logger, afterConfirm });
     } catch (err) {
       print(`${cmd} failed: ${err.message}`);
       return EXIT.FAILED;

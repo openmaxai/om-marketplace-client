@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `market-client search`: search the skills listed for the organization.
-- `market-client install-permission`: who may confirm installs on this Agent.
+- `market-client install-permission`: who may confirm installs on this Agent
+  (display names when the market gives them, otherwise member ids).
+- The service checks each pending install request every ~15 seconds (backing
+  off on errors, stopping when it is decided or expires) and pulls the
+  install orders as soon as it is confirmed on the workspace card.
 - `market-client request-install`: propose 1 to 3 skills for this Agent;
   nothing is installed until a person chooses and confirms. `install-requests`
   lists the requests.
