@@ -7,7 +7,8 @@ back to the market.
 
 Only a person decides what is installed or upgraded: install and upgrade run
 only from orders placed in the workbench or install requests a person
-confirmed in the workspace. The Agent can search the market, request an install and, on its
+confirmed (in the workspace, or by the Agent's owner replying in a direct
+conversation with the Agent). The Agent can search the market, request an install and, on its
 owner's request, submit a new skill or expert template for review. Enable, disable, uninstall and
 rollback can also be run locally with `market-client`; the change is made
 first and then reported to the market.
@@ -158,14 +159,25 @@ starting meanwhile waits for the lock.
 
 These call the market directly (no state lock, not handed to the service) for
 the primary org, or `--org <org_id>`. All take `--json`. They need market
-support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
+support for client 0.8.0 (`confirm-install` and `decline-install`: market support for Agent-attested confirmation); an older market answers `CLIENT_VERSION_TOO_OLD`.
 
 | Command | Effect |
 |---|---|
 | `search [<words>] [--category-id <id>] [--limit 1-20]` | Skills listed for the org and visible to the Agent's owner, minus those already on the Agent, with description, examples, category and latest version. |
 | `install-permission` | Who may confirm installs on this Agent in the workspace (`who_can_install`: the owner and org admins); names when the market gives them, else member ids. |
-| `request-install <skill> [<skill> <skill>] --reason <text> [--reason <text> ...]` | Creates one install request with 1 to 3 candidates (slug or skill_id; one reason for all or one per skill), `pending_confirmation`, expiring after 24 hours. It replaces the Agent's pending request (that one becomes `superseded`), unless that one is being confirmed or already has orders placed: then it is refused with `INSTALL_PROPOSAL_PENDING` and the old one stays watched. A skill declined in the last 7 days (market default) is refused with `SKILL_RECENTLY_DECLINED`. Nothing is installed: a person (owner or org admin) confirms on the card in the workspace. Prints the market's confirm link (`confirm_url`) when given. The request is recorded in `install-requests.json` in the data dir (last 50). |
-| `install-requests [--state <state>]` | The requests recorded by `request-install` (newest 20), each refreshed from the market (the market has no list route for Agents), with the candidates and what was selected, marked as market data. |
+| `request-install <skill> [<skill> <skill>] --reason <text> [--reason <text> ...]` | Creates one install request with 1 to 3 candidates (slug or skill_id; one reason for all or one per skill), `pending_confirmation`, expiring after 24 hours. It replaces the Agent's pending request (that one becomes `superseded`), unless that one is being confirmed or already has orders placed: then it is refused with `INSTALL_PROPOSAL_PENDING` and the old one stays watched. A skill declined in the last 7 days (market default) is refused with `SKILL_RECENTLY_DECLINED`. Nothing is installed: the owner confirms in a direct conversation with the Agent (`confirm-install`), or an org admin installs it manually in the Workspace market. Prints the numbered candidates, a proposal for the owner and, for anyone else, links to the market skill pages (`/market/skills/{skill_id}`) and the Agent's page (`/agents?id={agent_id}`) on the Workspace origin the market reports (taken from the origin of its `confirm_url`; the confirm page itself is not linked), or the page names when there is none. The request is recorded in `install-requests.json` in the data dir (last 50). |
+| `install-requests [--state <state>]` | The requests recorded by `request-install` (newest 20), each refreshed from the market (the market has no list route for Agents), with the candidates numbered, what was selected and how it was confirmed (`card` or `agent_attested` with the channel and the owner's message), marked as market data. |
+| `confirm-install <proposal_id> (all \| <n\|skill_id> ...) --channel workspace\|lark\|telegram\|other [--channel-detail <text>] [--owner-message-id <id>] [--owner-message-file <path> \| --owner-message-text-stdin \| --owner-message-text <text>]` | The Agent attests that its owner chose these candidates in a direct conversation (`confirmed_via: agent_attested`). The selection is matched against the request's candidates only (1-based numbers or skill ids; `all` for every one) and sent with the versions the request pinned and the owner from `install-permission`. At least one of the message id and text is required. `--owner-message-file` reads the reply from a temp file: opened without following a symbolic link and without blocking, it must be a regular file owned by this user, with no other hard link, whose real path is directly in `/tmp` (fixed; `TMPDIR` is not used; `/tmp` must be root-owned, world-writable and sticky), and `--owner-message-text-stdin` from piped stdin (at most 64 KiB, one trailing newline dropped; stdin on a terminal is refused); only one of the three text options may be given. Evidence is sent as received (only values over 4 times the market limit are cut, and the cut value must still have something visible); the market cleans it and cuts it to 64 / 200 / 500 characters. The client applies the same cleaning only to refuse locally evidence with nothing visible left (`test/vectors/evidence-sanitize.json`). The request stays watched, so the orders are pulled within seconds. |
+| `decline-install <proposal_id> --channel ... [--owner-message-id <id>] [--owner-message-file <path> \| --owner-message-text-stdin \| --owner-message-text <text>]` | The owner declined in the conversation; same evidence, no skills. The request is no longer watched. |
+
+`confirm-install` and `decline-install` need market and cws-core support for
+Agent-attested confirmation. Roll out in this order: market, then cws-core,
+then this client. Against an older cws-core the confirm route answers 404; the
+client reads the request first, so a 404 on the confirm route is reported as
+"not supported yet" and the owner installs manually in the Workspace market. An older
+market answers `AGENT_CONFIRM_DISABLED`. The market's minimum client version
+is not raised for this feature. Local usage errors (selection, channel,
+missing evidence, a repeated option) exit 2.
 | `submit-skill <dir> [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links and files that may hold credentials — `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*` and other SSH keys, `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`, `credentials*`, and any `.json` up to 1 MiB that is a Google Cloud service-account key (detected by content) — refused and named), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin. |
 | `submit-template <manifest.json> [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review. |
 | `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |
@@ -173,7 +185,7 @@ support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
 While a request from `request-install` is pending, the service checks it every
 15 seconds (±20%; a failed check backs off from 30 seconds up to 5 minutes) and
 runs a poll round as soon as it is confirmed, so a confirmation made in the
-workspace installs within seconds. It stops when the request is decided, superseded, gone, or expired. The
+workspace or with `confirm-install` installs within seconds. It stops when the request is decided, superseded, gone, or expired. The
 pending requests are kept as files in `proposal-watch/` in the data dir.
 
 `submit-skill` does not keep file modes: installs write every file 0600 and

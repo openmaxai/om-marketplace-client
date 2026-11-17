@@ -1,0 +1,152 @@
+{
+  "description": "Owner evidence text (owner_message_text, owner_message_id, channel_detail) as the market stores it: input, max characters, market output, and whether nothing is left (the market refuses empty evidence). Expected values come from the market implementation.",
+  "vectors": [
+    {
+      "name": "plain",
+      "input": "yes, install 1 and 3",
+      "max": 500,
+      "market": "yes, install 1 and 3",
+      "empty": false
+    },
+    {
+      "name": "chinese reply",
+      "input": "\u88c5 1 \u548c 3",
+      "max": 500,
+      "market": "\u88c5 1 \u548c 3",
+      "empty": false
+    },
+    {
+      "name": "crlf: CR deleted, LF to space",
+      "input": "a\r\nb",
+      "max": 500,
+      "market": "a b",
+      "empty": false
+    },
+    {
+      "name": "tab and newline to spaces",
+      "input": "a\tb\nc",
+      "max": 500,
+      "market": "a b c",
+      "empty": false
+    },
+    {
+      "name": "line and paragraph separators to spaces",
+      "input": "a\u2028b\u2029c",
+      "max": 500,
+      "market": "a b c",
+      "empty": false
+    },
+    {
+      "name": "non-breaking space kept",
+      "input": "a\u00a0b",
+      "max": 500,
+      "market": "a\u00a0b",
+      "empty": false
+    },
+    {
+      "name": "hangul filler only",
+      "input": "\u3164",
+      "max": 500,
+      "market": "",
+      "empty": true
+    },
+    {
+      "name": "fillers inside text deleted",
+      "input": "x\u3164y \u034fz \u115fhi\uffa0 \u17b4ok",
+      "max": 500,
+      "market": "xy z hi ok",
+      "empty": false
+    },
+    {
+      "name": "bidi, zero-width, BOM, tag deleted",
+      "input": "\u202ea\u200bb\ufeffc\u2066d\udb40\udc41e",
+      "max": 500,
+      "market": "abcde",
+      "empty": false
+    },
+    {
+      "name": "C1 control and vertical tab deleted",
+      "input": "a\u0085b\u000bc",
+      "max": 500,
+      "market": "abc",
+      "empty": false
+    },
+    {
+      "name": "mongolian vowel separator deleted",
+      "input": "a\u180eb",
+      "max": 500,
+      "market": "ab",
+      "empty": false
+    },
+    {
+      "name": "only invisible characters",
+      "input": "\u200b\u202e\u2066\u2069\u00ad\ufeff\u3164\u115f\u1160\uffa0\u034f\u17b4\udb40\udc20",
+      "max": 500,
+      "market": "",
+      "empty": true
+    },
+    {
+      "name": "only whitespace and separators",
+      "input": " \t\r\n\u2028\u2029 ",
+      "max": 500,
+      "market": "",
+      "empty": true
+    },
+    {
+      "name": "NFC composes",
+      "input": "e\u0301",
+      "max": 500,
+      "market": "\u00e9",
+      "empty": false
+    },
+    {
+      "name": "joiner between base and combining mark",
+      "input": "e\u200d\u0301",
+      "max": 500,
+      "market": "e\u0301",
+      "empty": false
+    },
+    {
+      "name": "cut at max after cleaning",
+      "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\u3164yz",
+      "max": 500,
+      "market": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxy",
+      "empty": false
+    },
+    {
+      "name": "cut at max with combining mark",
+      "input": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u200d\u0301",
+      "max": 500,
+      "market": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u0301",
+      "empty": false
+    },
+    {
+      "name": "trailing space trimmed after cut",
+      "input": "abc def",
+      "max": 4,
+      "market": "abc",
+      "empty": false
+    },
+    {
+      "name": "message id cut to 200",
+      "input": "om_1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "max": 200,
+      "market": "om_11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "empty": false
+    },
+    {
+      "name": "channel detail cut to 64",
+      "input": "DM with dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "max": 64,
+      "market": "DM with dddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "empty": false
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "max": 500,
+      "market": "",
+      "empty": true
+    }
+  ]
+}

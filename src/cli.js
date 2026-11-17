@@ -26,8 +26,12 @@ const USAGE = `usage: market-client <command>
   submissions [--json]      submissions made from this Agent
   search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
   install-permission        who may confirm installs on this Agent (in the workspace)
-  request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
+  request-install <skill>...  propose 1-3 skills (slug or id) for your owner to confirm in chat; --reason <text> once, or per skill
   install-requests          install requests made from this Agent, refreshed from the market [--state <state>]
+  confirm-install <proposal_id> (all | <n|skill_id>...)  install what your owner chose in a direct conversation with you
+  decline-install <proposal_id>  record that your owner declined
+    both: --channel workspace|lark|telegram|other [--channel-detail <text>]
+    --owner-message-id <id> and/or the owner's reply verbatim: --owner-message-file <path>, --owner-message-text-stdin or --owner-message-text <text>
 submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
@@ -200,30 +204,153 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
   }
 }
 
-export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`) } = {}) {
+// Largest owner reply read from stdin or a file.
+export const MAX_OWNER_MESSAGE_BYTES = 64 * 1024;
+export class InputError extends Error {}
+
+const utf8 = (buf, what) => {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    throw new InputError(`${what} is not valid UTF-8`);
+  }
+};
+
+// Reads stdin, stopping as soon as it passes MAX_OWNER_MESSAGE_BYTES.
+export const readAllStdin = async (stream = process.stdin) => {
+  const chunks = [];
+  let size = 0;
+  for await (const c of stream) {
+    size += c.length;
+    if (size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`the owner's reply on stdin is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    chunks.push(c);
+  }
+  return utf8(Buffer.concat(chunks), 'the owner\'s reply on stdin');
+};
+
+// Reads the open file in chunks, refusing as soon as it passes MAX_OWNER_MESSAGE_BYTES.
+export function readCapped(fd, readSync = fs.readSync) {
+  const buf = Buffer.alloc(MAX_OWNER_MESSAGE_BYTES + 1);
+  let n = 0;
+  for (;;) {
+    const r = readSync(fd, buf, n, buf.length - n, null);
+    if (r === 0) return buf.subarray(0, n);
+    n += r;
+    if (n > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+  }
+}
+
+// The only directory a reply file may be in (directly). Fixed, never taken from the environment.
+export const TRUSTED_TMP = '/tmp';
+
+// A shared temp directory is safe only when root-owned, world-writable and sticky (others cannot replace our file).
+export function trustedDirProblem(st) {
+  if (!st.isDirectory()) return 'is not a directory';
+  if (st.uid !== 0) return 'is not owned by root';
+  if ((st.mode & 0o1002) !== 0o1002) return 'is not world-writable with the sticky bit';
+  return null;
+}
+
+// A reply file must be a regular file of this user with no other name (a hard link could expose any file).
+export function replyFileProblem(st, uid) {
+  if (!st.isFile()) return '--owner-message-file is not a regular file';
+  if (uid !== null && st.uid !== uid) return '--owner-message-file is not owned by this user';
+  if (st.nlink !== 1) return 'reply file has other links';
+  return null;
+}
+
+// Real path of an open file: /proc on Linux; elsewhere the name's real path, accepted only if it is the same file.
+function fdRealPath(fd, name, st) {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    const real = fs.realpathSync(name);
+    const again = fs.statSync(real);
+    if (again.dev !== st.dev || again.ino !== st.ino) throw new InputError('--owner-message-file changed while it was checked');
+    return real;
+  }
+}
+
+// The owner's reply from a temp file the Agent just wrote. Everything is decided on the opened descriptor: opened
+// without following a final symbolic link and without blocking (a FIFO cannot hang the command), it must be a regular
+// file of this user located directly in the trusted temp directory.
+export function readOwnerMessageFile(file, { trustedDir = TRUSTED_TMP, uid = typeof process.getuid === 'function' ? process.getuid() : null } = {}) {
+  const fail = (err) => new InputError(err.code === 'ELOOP' ? '--owner-message-file is a symbolic link'
+    : `--owner-message-file cannot be read (${err.code || 'error'})`);
+  let trusted;
+  try {
+    trusted = fs.realpathSync(trustedDir);
+    const problem = trustedDirProblem(fs.statSync(trusted));
+    if (problem) throw new InputError(`the temp directory ${trusted} ${problem}`);
+  } catch (err) {
+    if (err instanceof InputError) throw err;
+    throw new InputError(`the temp directory ${trustedDir} cannot be used (${err.code || 'error'})`);
+  }
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    throw fail(err);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    const problem = replyFileProblem(st, uid);
+    if (problem) throw new InputError(problem);
+    let real;
+    try { real = fdRealPath(fd, file, st); } catch (err) {
+      if (err instanceof InputError) throw err;
+      throw fail(err);
+    }
+    if (path.dirname(real) !== trusted) throw new InputError(`--owner-message-file must be a temp file you wrote, directly in ${trusted}`);
+    if (st.size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    let buf;
+    try {
+      buf = readCapped(fd);
+    } catch (err) {
+      if (err instanceof InputError) throw err;
+      throw fail(err);
+    }
+    return utf8(buf, '--owner-message-file');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`), readStdin = readAllStdin, stdinIsTTY = () => process.stdin.isTTY === true,
+} = {}) {
   const [cmd, ...rest] = argv;
   const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
   const VALUE_OPTS = {
     '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+    '--channel': 'channel', '--channel-detail': 'channelDetail', '--owner-message-id': 'ownerMessageId', '--owner-message-text': 'ownerMessageText',
+    '--owner-message-file': 'ownerMessageFile',
   };
   const submit = AGENT_COMMANDS.has(cmd);
   const pos = [];
   let badOpt = false;
+  let textFromStdin = false;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--json') opts.json = true;
+    else if (submit && rest[i] === '--owner-message-text-stdin') {
+      if (textFromStdin) badOpt = true;
+      textFromStdin = true;
+    }
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
     else if (SUBMIT_COMMANDS.has(cmd) && rest[i] === '--dry-run') opts.dryRun = true;
     else if (submit && VALUE_OPTS[rest[i]]) {
       if (i + 1 >= rest.length) badOpt = true;
       const k = VALUE_OPTS[rest[i]];
+      // Only --reason may be repeated; any other repeated option is a usage error.
+      if (k !== 'reason' && Object.hasOwn(opts, k)) badOpt = true;
       const v = rest[++i];
       opts[k] = k === 'reason' ? [...(opts.reason ?? []), v] : v;
     } else pos.push(rest[i]);
   }
-  const variadic = { search: [0, Infinity], 'request-install': [1, 3] }[cmd];
+  const variadic = { search: [0, Infinity], 'request-install': [1, 3], 'confirm-install': [2, 1 + 3] }[cmd];
   const arity = ['status', 'sync', 'start', 'submissions', 'install-requests', 'install-permission'].includes(cmd) ? 0
     : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
+  if ([textFromStdin, opts.ownerMessageText != null, opts.ownerMessageFile != null].filter(Boolean).length > 1) badOpt = true;
   if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
@@ -245,6 +372,19 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
       print(`start failed: ${err.message}`);
       return EXIT.FAILED;
     }
+  }
+  if (textFromStdin || opts.ownerMessageFile != null) {
+    try {
+      if (textFromStdin && stdinIsTTY()) throw new InputError('--owner-message-text-stdin needs the reply piped in; stdin is a terminal');
+      const raw = textFromStdin ? await readStdin() : readOwnerMessageFile(opts.ownerMessageFile);
+      // One trailing newline (from a heredoc or an editor) is not part of the owner's reply.
+      opts.ownerMessageText = raw.replace(/\r?\n$/, '');
+    } catch (err) {
+      if (!(err instanceof InputError)) throw err;
+      print(opts.json ? JSON.stringify({ ok: false, error: 'usage', message: err.message }, null, 2) : `${cmd} refused: ${err.message}`);
+      return EXIT.USAGE;
+    }
+    delete opts.ownerMessageFile;
   }
   let config;
   try {
