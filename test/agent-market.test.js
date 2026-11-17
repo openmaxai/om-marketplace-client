@@ -8,16 +8,20 @@ import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
 
 const A = `/api/v1/orgs/${ORG}/agents/${AGENT}`;
+const OWNER = U(11);
 const ITEM = {
   skill_id: U(1), slug: 'weekday-helper', name: 'Weekday helper', description: 'Tells the weekday.\u202e hidden',
-  category: { id: U(2), name: '效率', name_en: 'Productivity' }, skill_version_id: U(3), version: '1.2.0', source_market_id: U(4),
+  category: { id: U(2), name: 'Efficiency', name_en: 'Productivity' }, skill_version_id: U(3), version: '1.2.0', source_market_id: U(4),
   examples: [{ title: 'Which day', prompt: 'What day is 2026-11-20?' }], installed: false,
 };
-const proposal = (over = {}) => ({
-  proposal_id: U(10), agent_id: AGENT, owner_member_id: U(11), state: 'pending_confirmation', skill_id: U(1), skill_version_id: U(3),
-  version: '1.2.0', name: 'Weekday helper', description: 'Tells the weekday.', reason: 'The owner asks for weekdays daily.',
-  created_at: '2026-11-17T10:00:00Z', expires_at: '2026-11-18T10:00:00Z', decided_at: null, confirmed_via: null, intent_id: null, ...over,
+const cand = (n, over = {}) => ({
+  skill_id: U(n), skill_version_id: U(n + 50), version: '1.2.0', name: `Skill ${n}`, description: 'd', reason: `why ${n}`, selected: null, intent_id: null, ...over,
 });
+const proposal = (over = {}) => ({
+  proposal_id: U(10), agent_id: AGENT, owner_member_id: OWNER, state: 'pending_confirmation', candidates: [cand(1), cand(5)],
+  created_at: '2026-11-17T10:00:00Z', expires_at: '2026-11-18T10:00:00Z', decided_at: null, confirmed_via: null, confirmed_by_member_id: null, ...over,
+});
+const problem = (status, body, headers) => ({ status, headers, problem: { status, ...body } });
 
 async function setup(t) {
   const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
@@ -27,16 +31,16 @@ async function setup(t) {
   const config = loadConfig(dataDir);
   const out = [];
   const pulled = [];
-  const run = (cmd, arg, opts = {}) => runMarketCommand(cmd, arg, { json: false, ...opts }, {
-    config, print: (l) => out.push(l), afterConfirm: async (id) => { pulled.push(id); return 'install order pulled: poll round finished'; },
+  const run = (cmd, args = [], opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, {
+    config, print: (l) => out.push(l), afterConfirm: async (ids) => { pulled.push(...ids); return 'install orders pulled now'; },
   });
-  return { fake, out, run, pulled, text: () => out.join('\n') };
+  return { fake, out, run, pulled, text: () => out.join('\n'), reset: () => { out.length = 0; } };
 }
 
 test('search sends the query, shows market text as data with controls removed', async (t) => {
   const s = await setup(t);
   s.fake.script('POST', `${A}/market-skills:search`, { status: 200, json: { items: [ITEM, { bogus: true }] } });
-  assert.equal(await s.run('search', 'weekday', { limit: '5' }), 0);
+  assert.equal(await s.run('search', ['weekday'], { limit: '5' }), 0);
   const [req] = s.fake.market();
   assertMarketHeaders(req, { apiKey: FAKE_KEY });
   assert.deepEqual(req.json, { q: 'weekday', limit: 5 });
@@ -48,72 +52,101 @@ test('search sends the query, shows market text as data with controls removed', 
 
 test('search refuses bad options locally and explains a rate limit', async (t) => {
   const s = await setup(t);
-  assert.equal(await s.run('search', 'x', { limit: '21' }), 3);
-  assert.equal(await s.run('search', 'x'.repeat(101)), 3);
+  assert.equal(await s.run('search', ['x'], { limit: '21' }), 3);
+  assert.equal(await s.run('search', ['x'.repeat(101)]), 3);
   assert.equal(s.fake.requests.length, 0);
-  s.fake.script('POST', `${A}/market-skills:search`, { status: 429, headers: { 'retry-after': '30' }, problem: { status: 429, code: 'RATE_LIMITED', reason: 'agent_search' } });
-  assert.equal(await s.run('search', undefined), 3);
+  s.fake.script('POST', `${A}/market-skills:search`, problem(429, { code: 'RATE_LIMITED', reason: 'agent_search' }, { 'retry-after': '30' }));
+  assert.equal(await s.run('search'), 3);
   assert.match(s.text(), /search limit; try again in about 1 minute/);
 });
 
-test('request-install resolves a slug, sends the reason, and shows the pending request', async (t) => {
+test('install-permission reports who may confirm', async (t) => {
+  const s = await setup(t);
+  s.fake.script('GET', `${A}/install-permission`,
+    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [OWNER], owner_can_install: true, caller_can_install: false } },
+    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [U(20)], owner_can_install: false, caller_can_install: false } });
+  assert.equal(await s.run('install-permission'), 0);
+  assert.match(s.text(), /the owner may install/);
+  s.reset();
+  assert.equal(await s.run('install-permission'), 0);
+  assert.match(s.text(), new RegExp(`may not install.*${U(20)}.*workspace card`));
+});
+
+test('request-install proposes up to 3 candidates, resolving slugs, with one reason each', async (t) => {
   const s = await setup(t);
   s.fake.script('POST', `${A}/market-skills:search`, { status: 200, json: { items: [ITEM] } });
   s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() });
-  assert.equal(await s.run('request-install', 'weekday-helper', { reason: ' The owner asks for weekdays daily. ' }), 0);
+  assert.equal(await s.run('request-install', ['weekday-helper', U(5)], { reason: [' why 1 ', 'why 5'] }), 0);
   const req = s.fake.market()[1];
-  assert.deepEqual(Object.keys(req.json).sort(), ['reason', 'request_id', 'skill_id']);
-  assert.equal(req.json.skill_id, U(1));
-  assert.equal(req.json.reason, 'The owner asks for weekdays daily.');
-  assert.match(s.text(), /Weekday helper 1\.2\.0 pending_confirmation\n {2}waiting for a person to confirm/);
+  assert.deepEqual(Object.keys(req.json).sort(), ['candidates', 'request_id']);
+  assert.deepEqual(req.json.candidates, [{ skill_id: U(1), reason: 'why 1' }, { skill_id: U(5), reason: 'why 5' }]);
+  assert.match(s.text(), /pending_confirmation\n {2}waiting for a person to choose and confirm[\s\S]*1\. Skill 1 1\.2\.0[\s\S]*2\. Skill 5/);
 });
 
 test('request-install refusals', async (t) => {
   const s = await setup(t);
-  assert.equal(await s.run('request-install', U(1), {}), 3);
-  assert.match(s.text(), /--reason is required/);
+  assert.equal(await s.run('request-install', [U(1)], {}), 3);
+  assert.match(s.text(), /--reason/);
+  assert.equal(await s.run('request-install', [U(1), U(2)], { reason: ['a', 'b', 'c'] }), 3);
+  assert.equal(await s.run('request-install', [U(1), U(1)], { reason: ['a'] }), 3);
+  assert.equal(await s.run('request-install', [U(1), U(2), U(3), U(4)], { reason: ['a'] }), 3);
+  assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/install-proposals`,
-    { status: 409, problem: { status: 409, code: 'SKILL_ALREADY_INSTALLED' } },
-    { status: 409, problem: { status: 409, code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.8.0' } },
-    { status: 403, problem: { status: 403, code: 'AGENT_OWNER_REQUIRED' } },
-    { status: 404, problem: { status: 404, code: 'NOT_FOUND' } });
-  for (const re of [/already installed/, /0\.8\.0 or later/, /no active human owner/, /not visible to this organization/]) {
-    s.out.length = 0;
-    assert.equal(await s.run('request-install', U(1), { reason: 'r' }), 3);
+    problem(409, { code: 'SKILL_ALREADY_INSTALLED', field: '/candidates/1' }),
+    problem(409, { code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.8.0' }),
+    problem(403, { code: 'AGENT_OWNER_REQUIRED' }),
+    problem(404, { code: 'NOT_FOUND', field: '/candidates/0' }));
+  for (const re of [/already installed .*\(\/candidates\/1\)/, /0\.8\.0 or later/, /no active human owner/, /not found \(\/candidates\/0\)/]) {
+    s.reset();
+    assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 3);
     assert.match(s.text(), re);
   }
 });
 
-test('confirm-install records the chat confirmation and pulls the order at once', async (t) => {
+test('confirm-install sends the chosen skills with confirmed_via chat and pulls the orders', async (t) => {
   const s = await setup(t);
-  s.fake.script('POST', `${A}/install-proposals/${U(10)}:confirm`, { status: 200, json: proposal({ state: 'confirmed', confirmed_via: 'chat', intent_id: U(12) }) });
-  assert.equal(await s.run('confirm-install', U(10), { json: true }), 0);
-  assert.deepEqual(s.fake.market()[0].json, { confirmed_via: 'chat' });
+  s.fake.script('GET', `${A}/install-proposals/${U(10)}`, { status: 200, json: proposal() });
+  s.fake.script('POST', `${A}/install-proposals/${U(10)}:confirm`, {
+    status: 200,
+    json: proposal({ state: 'confirmed', confirmed_via: 'chat', confirmed_by_member_id: OWNER, candidates: [cand(1, { selected: false }), cand(5, { selected: true, intent_id: U(12) })] }),
+  });
+  assert.equal(await s.run('confirm-install', [U(10), '2'], { json: true }), 0);
+  const confirm = s.fake.market().find((r) => r.path.endsWith(':confirm'));
+  assert.deepEqual(confirm.json, { skill_ids: [U(5)], confirmed_via: 'chat' });
   assert.deepEqual(s.pulled, [U(12)]);
   const j = JSON.parse(s.text());
   assert.equal(j.state, 'confirmed');
-  assert.equal(j.pulled, 'install order pulled: poll round finished');
+  assert.equal(j.pulled, 'install orders pulled now');
 });
 
-test('confirm-install: not pending, owner without the right, malformed id', async (t) => {
+test('confirm-install: owner without the right gets who can install; not pending; bad input', async (t) => {
   const s = await setup(t);
-  assert.equal(await s.run('confirm-install', 'nope'), 3);
+  assert.equal(await s.run('confirm-install', ['nope', '1']), 3);
+  assert.equal(await s.run('confirm-install', [U(10), 'x']), 3);
+  assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/install-proposals/${U(10)}:confirm`,
-    { status: 409, problem: { status: 409, code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' } },
-    { status: 403, problem: { status: 403, code: 'NOT_AGENT_OWNER', reason: 'owner_only' } });
-  s.out.length = 0;
-  assert.equal(await s.run('confirm-install', U(10)), 3);
+    problem(403, { code: 'NOT_AGENT_OWNER', reason: 'owner_only', who_can_install: [U(20), 'not an id'] }),
+    problem(409, { code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' }));
+  s.reset();
+  assert.equal(await s.run('confirm-install', [U(10), U(1)], { json: true }), 3);
+  const j = JSON.parse(s.text());
+  assert.deepEqual(j.who_can_install, [U(20)]);
+  assert.match(j.message, new RegExp(`may not install.*${U(20)}.*confirm the request in the workspace`));
+  s.reset();
+  assert.equal(await s.run('confirm-install', [U(10), U(1)]), 3);
   assert.match(s.text(), /no longer pending \(expired\); make a new request/);
-  s.out.length = 0;
-  assert.equal(await s.run('confirm-install', U(10)), 3);
-  assert.match(s.text(), /confirm the request in the workspace/);
   assert.deepEqual(s.pulled, []);
 });
 
-test('install-requests lists with a state filter', async (t) => {
+test('decline-install and install-requests', async (t) => {
   const s = await setup(t);
+  s.fake.script('POST', `${A}/install-proposals/${U(10)}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'chat' }) });
+  assert.equal(await s.run('decline-install', [U(10)]), 0);
+  assert.deepEqual(s.fake.market()[0].json, { confirmed_via: 'chat' });
+  assert.match(s.text(), /declined/);
   s.fake.script('GET', `${A}/install-proposals?state=pending_confirmation`, { status: 200, json: { items: [proposal()] } });
-  assert.equal(await s.run('install-requests', undefined, { state: 'pending_confirmation' }), 0);
-  assert.match(s.text(), /install request .* pending_confirmation/);
-  assert.equal(await s.run('install-requests', undefined, { state: 'bogus' }), 3);
+  s.reset();
+  assert.equal(await s.run('install-requests', [], { state: 'pending_confirmation' }), 0);
+  assert.match(s.text(), /install request .*: pending_confirmation/);
+  assert.equal(await s.run('install-requests', [], { state: 'bogus' }), 3);
 });

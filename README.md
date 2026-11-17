@@ -148,9 +148,11 @@ support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
 | Command | Effect |
 |---|---|
 | `search [<words>] [--category-id <id>] [--limit 1-20]` | Skills listed for the org and visible to the Agent's owner, with description, examples, category, latest version and whether installed. |
-| `request-install <slug or skill_id> --reason <text>` | Creates an install request (`pending_confirmation`, expires after 24 hours). Nothing is installed. A pending request for the same skill is returned instead of a new one. |
-| `install-requests [--state <state>]` | This Agent's install requests, newest first. |
-| `confirm-install <proposal_id>` | Records that the owner confirmed in chat (`confirmed_via: chat`); the market checks the owner's install rights and creates the install order, which is then pulled at once (one poll round, handed to the service when it runs). In the workspace the owner confirms on the card instead. |
+| `install-permission` | Who may confirm installs on this Agent (`owner_can_install`, `who_can_install` member ids). |
+| `request-install <skill> [<skill> <skill>] --reason <text> [--reason <text> ...]` | Creates one install request with 1 to 3 candidates (slug or skill_id; one reason for all or one per skill), `pending_confirmation`, expiring after 24 hours. Nothing is installed. |
+| `install-requests [--state <state>]` | This Agent's install requests, newest first, with the candidates and what was selected. |
+| `confirm-install <request_id> <n or skill_id> ...` | Records that the owner chose these candidates in chat (`confirmed_via: chat`; no confirmer is sent, the market takes the owner and checks the owner's right) and creates the install orders, which are then pulled at once (one poll round, handed to the service when it runs). In the workspace a person confirms on the card instead. A refusal names who may install; that person confirms on the card. |
+| `decline-install <request_id>` | Records that the owner declined in chat. |
 | `submit-skill <dir> [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links refused), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin. |
 | `submit-template <manifest.json> [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review. |
 | `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |

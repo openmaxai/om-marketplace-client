@@ -188,9 +188,10 @@ test('CLI: usage for submit commands and dry-run through the binary', async () =
   assert.equal(JSON.parse(r.stdout).slug, 'weekday-helper');
   assert.match((await cli(['submissions'])).stdout, /no submissions/);
   assert.equal((await cli(['request-install'])).code, 2);
-  assert.equal((await cli(['confirm-install'])).code, 2);
+  assert.equal((await cli(['confirm-install', U(1)])).code, 2);
   assert.equal((await cli(['install-requests', 'x'])).code, 2);
   assert.equal((await cli(['search', '--limit'])).code, 2);
   assert.equal((await cli(['status', '--dry-run'])).code, 2);
-  assert.match((await cli(['request-install', 'weekday-helper'])).stdout, /--reason is required/);
+  assert.match((await cli(['request-install', 'weekday-helper'])).stdout, /--reason/);
+  assert.equal((await cli(['request-install', 'a', 'b', 'c', 'd', '--reason', 'r'])).code, 2);
 });

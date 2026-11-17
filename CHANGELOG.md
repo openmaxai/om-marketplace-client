@@ -11,11 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `market-client search`: search the skills listed for the organization.
-- `market-client request-install`: ask for a skill to be installed on this
-  Agent; nothing is installed until a person confirms. `install-requests`
+- `market-client install-permission`: who may confirm installs on this Agent.
+- `market-client request-install`: propose 1 to 3 skills for this Agent;
+  nothing is installed until a person chooses and confirms. `install-requests`
   lists the requests.
-- `market-client confirm-install`: record the owner's confirmation given in
-  chat on a non-workspace channel; the install order is pulled at once.
+- `market-client confirm-install` / `decline-install`: record the owner's
+  choice given in chat on a non-workspace channel; confirmed orders are
+  pulled at once.
 - `market-client submit-skill` and `submit-template`: submit a new skill (a
   directory with `SKILL.md`, packed and checked locally) or a new expert
   template manifest. Submissions land pending review. `--dry-run` runs the
@@ -27,10 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SKILL.md tells the Agent about the Agent Market: search when a task needs a
   capability it lacks, propose up to 3 skills, install only with a person's
   confirmation (workspace card, or the owner's explicit permission in chat
-  elsewhere); create skills and templates only at the owner's request.
+  elsewhere; nobody else's), and say who must confirm when the owner may
+  not; create skills and templates only at the owner's request.
 - Market problem responses keep the registered fields that explain a refusal
   (`field`, `rule`, `rule_class`, `sentence`, `file`, `skill_md_rule`,
-  `expected_slug`, `queue_limit`, ...); they are shown to the Agent, not
+  `expected_slug`, `queue_limit`, `who_can_install`, ...); they are shown to the Agent, not
   logged.
 
 ## [0.7.1] - 2026-11-17

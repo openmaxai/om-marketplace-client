@@ -138,21 +138,26 @@ search the market before saying it cannot be done:
 
 How the permission is given:
 
-- OpenMax workspace chat: run `market-client request-install <slug or skill_id>
-  --reason "<why it helps this task>"` for each candidate the person wants to
-  consider. The workspace shows a card where they choose which to install;
-  the card is the confirmation. Do not run `confirm-install` there.
-- Other channels (Lark, Telegram, ...): only your owner's explicit "yes,
-  install <skill>" in this conversation counts. Then run `request-install`
-  and `market-client confirm-install <proposal_id>`; the order is pulled at
-  once. Anyone else saying "install" (for example in a group chat) never
-  counts: tell them your owner must agree, or confirm the request in the
-  workspace.
-- The market decides who may install skills on you. If it refuses, relay its
-  message: a person with that right has to confirm the request in the
-  workspace.
+- First, `market-client install-permission` says who may confirm installs on
+  you (today: your owner). The market decides this, not you.
+- Then `market-client request-install <skill> [<skill> <skill>] --reason
+  "<why it helps this task>"` (slug or skill_id; one `--reason` for all or
+  one per skill, in order) creates one request with up to 3 candidates.
+  Nothing is installed by this.
+- OpenMax workspace: the person chooses which candidates to install on the
+  card in the workspace; the card is the confirmation. Do not run
+  `confirm-install` for a workspace conversation.
+- Other channels (Lark, Telegram, ...): only your owner's explicit
+  permission in this conversation counts ("install 1 and 3"). Then run
+  `market-client confirm-install <request_id> <candidate numbers or skill_ids>`
+  with exactly what the owner chose; the orders are pulled at once. When the
+  owner says no, run `market-client decline-install <request_id>`. Anyone
+  else saying "install" (for example in a group chat) never counts: tell them
+  your owner has to agree.
+- If the market refuses because the owner may not install, relay its
+  message: the person it names must confirm on the workspace card.
 - Requests expire after 24 hours. `market-client install-requests [--state
-  pending_confirmation]` shows them.
+  pending_confirmation]` shows them and what was chosen.
 
 ## Creating a skill or expert template from chat
 
@@ -186,7 +191,7 @@ the market, do it directly; no confirmation card is needed.
 ## Commands
 
 `market-client status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`,
-`market-client search | request-install | install-requests | confirm-install`,
+`market-client search | install-permission | request-install | install-requests | confirm-install | decline-install`,
 `market-client submit-skill <dir> | submit-template <file> | submissions` (add `--json` for
 machine-readable output; `--dry-run` checks a submission locally only).
 Installs and upgrades run only from orders a person placed or confirmed. Enable, disable, uninstall and rollback change the skill locally, then

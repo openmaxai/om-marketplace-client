@@ -60,6 +60,7 @@ function problemExtra(data) {
   const out = {};
   for (const [k, max] of Object.entries(EXTRA_TEXT)) if (typeof data[k] === 'string' && data[k].length <= max) out[k] = data[k];
   for (const k of ['index', 'queue_limit']) if (Number.isSafeInteger(data[k])) out[k] = data[k];
+  if (Array.isArray(data.who_can_install)) out.who_can_install = data.who_can_install.filter(isOrgOrMemberId).slice(0, 50);
   return Object.keys(out).length ? out : null;
 }
 
