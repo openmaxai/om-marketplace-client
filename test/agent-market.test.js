@@ -9,7 +9,7 @@ import { runMarketCommand } from '../src/agent/commands.js';
 
 const A = `/api/v1/orgs/${ORG}/agents/${AGENT}`;
 const ITEM = {
-  skill_id: U(1), slug: 'weekday-helper', name: 'Weekday helper', description: 'Tells the weekday.‮ hidden',
+  skill_id: U(1), slug: 'weekday-helper', name: 'Weekday helper', description: 'Tells the weekday.\u202e hidden',
   category: { id: U(2), name: '效率', name_en: 'Productivity' }, skill_version_id: U(3), version: '1.2.0', source_market_id: U(4),
   examples: [{ title: 'Which day', prompt: 'What day is 2026-11-20?' }], installed: false,
 };

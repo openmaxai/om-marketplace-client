@@ -13,7 +13,7 @@ const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 // Market text is shown to the Agent as data: control characters other than newline are dropped and length is capped.
 export const clean = (v, max = 500) => {
   if (typeof v !== 'string') return null;
-  const t = v.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, '').trim();
+  const t = v.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim();
   return [...t].length > max ? `${[...t].slice(0, max).join('')}…` : t;
 };
 const shape = (label, what) => new MarketError(`${label}: response ${what}`, { status: 200, code: 'RESPONSE_INVALID', transient: false });
