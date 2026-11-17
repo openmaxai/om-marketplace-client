@@ -466,13 +466,31 @@ for (const [name, over, opts] of [
   ['busy', { state: 'busy' }],
   ['an open turn', {}, { turn: () => true }],
 ]) {
-  test(`welcome: ${name} means no request and no wait`, async (t) => {
+  test(`welcome: ${name} means no request now; the message is held until the template is in a session`, async (t) => {
     const f = await harness(t, opts);
     const a = f.make();
     written(f, a);
     f.status(over);
+    assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
+    assert.deepEqual(f.controls, []);
+    assert.deepEqual(f.pending().welcome, [A1]);
+  });
+}
+
+for (const [name, opts, write] of [
+  ['no runtime status', {}, false],
+  ['a stale runtime status', {}, 'stale'],
+  ['the OpenMax turn state unreadable', { turn: () => new Error('no activity store') }, true],
+]) {
+  test(`welcome: ${name} means no request and no wait`, async (t) => {
+    const f = await harness(t, opts);
+    const a = f.make();
+    written(f, a);
+    if (write === 'stale') f.status({ idle_seconds: 30 }, STATUS_MAX_AGE_MS);
+    else if (write) f.status({ idle_seconds: 30 });
     assert.equal(await a.welcome(A1), null);
     assert.deepEqual(f.controls, []);
+    assert.equal(f.pending().welcome, undefined);
   });
 }
 
@@ -1117,4 +1135,60 @@ test('welcome: a restart during the hold keeps the message; it is sent once afte
   await s3.starter.runAll();
   assert.deepEqual([...s.sent, ...s2.sent, ...s3.sent], [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
   assert.equal(f.fake.requests.filter((x) => x.path === starterPath(A2, 'claim-starter')).length, 1);
+});
+
+test('welcome: busy at adoption, the message is held; once idle one starter request is made and the message sent once after the session', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ state: 'busy' });
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.deepEqual(f.controls, []);
+  for (let i = 0; i < 6; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ state: 'busy' });
+    assert.equal(await a.tick(), 'busy');
+    await s.starter.runWaiting();
+  }
+  await s.starter.runAll();
+  assert.equal(s.claims(), 0);
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.controls.length, 1);
+  const doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.welcome_requests.length], [0, 1]);
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 60 });
+  assert.equal(await a.tick(), 'waiting');
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, []);
+  await session(f, a, [[A1, S1]]);
+  await s.starter.runWaiting();
+  await s.starter.runAll();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  assert.equal(s.claims(), 1);
+  assert.equal(f.controls.length, 1);
+});
+
+test('welcome: busy at adoption and a restart during the hold; the message is sent once after the session', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ state: 'busy' });
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  const b = f.make();
+  const s2 = starterOf(f, b);
+  await s2.starter.runAll();
+  assert.deepEqual(s2.sent, []);
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await b.tick(), 'requested');
+  await session(f, b, [[A1, S1]]);
+  await s2.starter.runWaiting();
+  const s3 = starterOf(f, f.make());
+  await s3.starter.runAll();
+  assert.deepEqual([...s.sent, ...s2.sent, ...s3.sent], [`mkt-starter-${A1}`]);
+  assert.equal(f.fake.requests.filter((x) => x.path === starterPath(A1, 'claim-starter')).length, 1);
+  assert.equal(f.controls.length, 1);
 });

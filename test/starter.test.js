@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
 import {
-  STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
+  LOOKUP_SKEW_MS, STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_VERIFY_MS, STARTER_VERIFY_SETTLE_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
 } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
@@ -33,7 +33,7 @@ const marked = (result) => ({
 // send and may throw).
 function fakeIm({
   available = true, conv = { id: CONV, type: 'DM' }, members, sendError = null, dmError = null, busy = () => false, noRun = false,
-  structured = false, structuredError = null,
+  structured = false, structuredError = null, lookup = null,
 } = {}) {
   const calls = [];
   const list = members ?? [{ member_id: AGENT, display_name: 'Agent' }, { member_id: ADOPTER, display_name: '张三' }];
@@ -52,6 +52,8 @@ function fakeIm({
     },
     supportsNoRun: () => noRun,
     supportsStructured: () => structured,
+    // lookup(params) answers findMessage ('found' | 'absent' | 'unknown', or throws); without it the IM has no lookup.
+    ...(lookup ? { async findMessage(p) { calls.push(['find', p]); return lookup(p); } } : {}),
     async runInProgress(p) { calls.push(['run_check', p]); const b = busy(); if (b instanceof Error) throw b; return b; },
   };
 }
@@ -799,4 +801,74 @@ test('a structured send refused after the send deadline: no plain-text resend, m
   assert.equal(sends(im).length, 0);
   assert.deepEqual(reasonOf(h.s), ['send_refused_http_400']);
   assert.ok(h.s.lines.some((l) => l.includes('too late to send it as plain text')));
+});
+
+const finds = (im) => im.calls.filter(([c]) => c === 'find').map(([, p]) => p);
+
+test('send outcome unknown, then found by its client message id: marked sent, sent once', async (t) => {
+  const s = await setup(t, { im: fakeIm({ sendError: new ImError('timed out', { kind: 'timeout' }), lookup: () => 'found' }), mark: [marked('sent')] });
+  const t0 = s.clock.t;
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(sends(s.im).length, 1);
+  const id = sends(s.im)[0][1].clientMsgId;
+  assert.deepEqual(finds(s.im), [{ orgId: ORG, conversationId: CONV, clientMsgId: id, since: t0 - LOOKUP_SKEW_MS }]);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('send outcome unknown and the message absent: waits for the request to settle, then marked send_failed', async (t) => {
+  const s = await setup(t, { im: fakeIm({ sendError: new ImError('timed out', { kind: 'timeout' }), lookup: () => 'absent' }), mark: [marked('send_failed')] });
+  await s.starter.runAll();
+  assert.equal(s.jobs()[ADOPTION].stage, 'verifying');
+  s.clock.t += STARTER_VERIFY_SETTLE_MS - 1;
+  await s.starter.runWaiting();
+  assert.equal(s.jobs()[ADOPTION].stage, 'verifying');
+  s.clock.t += 1;
+  await s.starter.runWaiting();
+  assert.equal(sends(s.im).length, 1);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(reasonOf(s), ['send_lost']);
+  assert.deepEqual(s.jobs(), {});
+});
+
+for (const [name, lookup] of [['fails', () => { throw new ImError('timed out', { kind: 'timeout' }); }], ['cannot tell', () => 'unknown']]) {
+  test(`send outcome unknown and the lookup ${name}: retried, then dropped unmarked`, async (t) => {
+    const s = await setup(t, { im: fakeIm({ sendError: new ImError('timed out', { kind: 'timeout' }), lookup }) });
+    await s.starter.runAll();
+    for (let at = 0; at < STARTER_VERIFY_MS; at += STARTER_CHECK_MS) {
+      assert.equal(s.jobs()[ADOPTION].stage, 'verifying');
+      s.clock.t += STARTER_CHECK_MS;
+      await s.starter.runWaiting();
+    }
+    assert.equal(sends(s.im).length, 1);
+    assert.ok(finds(s.im).length > 1);
+    assert.deepEqual(s.market(), [[':claim-starter', {}]]);
+    assert.deepEqual(s.jobs(), {});
+  });
+}
+
+test('a job left in stage sending with its client message id is looked up after a restart, never sent again', async (t) => {
+  const s = await setup(t, { claim: [], mark: [marked('sent')], im: fakeIm({ lookup: () => 'found' }) });
+  s.state.update('starters', {}, (d) => {
+    Object.assign(d[ADOPTION], { stage: 'sending', conversation_id: CONV, client_msg_id: `mkt-starter-${ADOPTION}`, send_started_at: s.clock.t });
+  });
+  await s.starter.runAll();
+  assert.deepEqual(finds(s.im).map((p) => p.clientMsgId), [`mkt-starter-${ADOPTION}`]);
+  assert.equal(sends(s.im).length, 0);
+  assert.deepEqual(s.market(), [[':mark-starter-shown', { result: 'sent' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('the plain-text resend with an unknown outcome is looked up by its own client message id', async (t) => {
+  const s = await setup(t, {
+    im: fakeIm({
+      structured: true, noRun: true, structuredError: new ImError('HTTP 400', { status: 400, definite: true }),
+      sendError: new ImError('timed out', { kind: 'timeout' }), lookup: () => 'found',
+    }),
+    mark: [marked('sent')],
+  });
+  await s.starter.runAll();
+  assert.deepEqual(finds(s.im).map((p) => p.clientMsgId), [`mkt-starter-${ADOPTION}-text`]);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
 });

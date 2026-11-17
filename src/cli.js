@@ -10,17 +10,20 @@ import { createRuntime, pollRound } from './app.js';
 import { EXIT, execute, spool } from './commands.js';
 import { membershipMessage } from './orgs.js';
 import { STALE_AFTER_MS } from './revocations.js';
+import { startService } from './service.js';
 
 const USAGE = `usage: market-client <command>
+  start                     run post-install if needed, start the service under pm2 and check that it pulls from the market
   status [--json]           orgs, client version gate, last pulls, installed content, queue, alerts
   sync                      run one poll round now
   rollback <slug>           restore the version kept by the last upgrade
   enable <slug>             move a disabled skill back into the skills directory
   disable <slug>            move a skill out of the skills directory
   uninstall <slug>          remove a skill and its kept versions
-commands other than status wait up to --wait <seconds> (default 900) for a running service to answer`;
+commands other than status wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
 const SKILL_COMMANDS = new Set(['rollback', 'enable', 'disable', 'uninstall']);
 const DEFAULT_WAIT_S = 900;
+const START_WAIT_S = 300;
 const POLL_MS = 250;
 const RELOCK_MS = 2000;
 
@@ -188,20 +191,36 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
 
 export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`) } = {}) {
   const [cmd, ...rest] = argv;
-  const opts = { json: false, wait: DEFAULT_WAIT_S };
+  const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S };
   const pos = [];
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--json') opts.json = true;
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
     else pos.push(rest[i]);
   }
-  const arity = cmd === 'status' || cmd === 'sync' ? 0 : SKILL_COMMANDS.has(cmd) ? 1 : -1;
+  const arity = cmd === 'status' || cmd === 'sync' || cmd === 'start' ? 0 : SKILL_COMMANDS.has(cmd) ? 1 : -1;
   if (arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
   }
   const arg = pos[0];
   const dataDir = resolveDataDir(env);
+  if (cmd === 'start') {
+    const logger = createLogger(env.MARKET_CLIENT_LOG_LEVEL || 'warn', { log: (l) => process.stderr.write(`${l}\n`), error: (l) => process.stderr.write(`${l}\n`) });
+    try {
+      const r = await startService({
+        dataDir,
+        print,
+        readStatus: (config) => readStatus(dataDir, config),
+        sync: (config) => runCommand({ cmd: 'sync', arg: null, config, dataDir, logger, waitMs: opts.wait * 1000, print }),
+      });
+      print(r.message);
+      return r.code;
+    } catch (err) {
+      print(`start failed: ${err.message}`);
+      return EXIT.FAILED;
+    }
+  }
   let config;
   try {
     config = loadConfig(dataDir);
