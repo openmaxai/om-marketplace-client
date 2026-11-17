@@ -142,22 +142,22 @@ export function createOpenmaxIm({
     } catch { return false; }
   };
   const activity = path.join(openmaxDir(zylosDir), 'src', 'lib', 'activity');
-  const call = (command, params) => new Promise((resolve, reject) => {
+  const call = (command, params, { raw = false } = {}) => new Promise((resolve, reject) => {
     run(process.execPath, [cli, command, JSON.stringify(params)], {
       cwd: path.dirname(path.dirname(path.dirname(cli))), timeout: timeoutMs, maxBuffer: MAX_OUTPUT, windowsHide: true,
       env: { ...process.env, COCO_RPC_LOG: '0' },
     }, (err, stdout, stderr) => {
       if (err) return reject(errorOf(err, stderr));
-      try { resolve(unwrap(parseCliOutput(stdout))); } catch { reject(unreadable(stdout)); }
+      try { const out = parseCliOutput(stdout); resolve(raw ? out : unwrap(out)); } catch { reject(unreadable(stdout)); }
     });
   });
-  const read = async (command, params) => {
+  const read = async (command, params, opts) => {
     try {
-      return await call(command, params);
+      return await call(command, params, opts);
     } catch (err) {
       if (err.definite) throw err;
       await new Promise((r) => { setTimeout(r, retryDelayMs); });
-      return call(command, params);
+      return call(command, params, opts);
     }
   };
   return {
@@ -217,8 +217,10 @@ export function createOpenmaxIm({
     async findMessage({ orgId, conversationId, clientMsgId, since }) {
       let beforeSeq = null;
       for (let i = 0; i < MAX_LOOKUP_PAGES; i++) {
-        const r = await read('comm.get_messages', { org: orgId, conversationId, limit: LOOKUP_PAGE_SIZE, ...(beforeSeq ? { beforeSeq } : {}) });
-        const items = Array.isArray(r) ? r : Array.isArray(r?.items) ? r.items : null;
+        // Read whole: the answer is {data: [newest first], pagination: {next_cursor}}, and next_cursor is empty at
+        // the conversation's first message.
+        const r = await read('comm.get_messages', { org: orgId, conversationId, limit: LOOKUP_PAGE_SIZE, ...(beforeSeq ? { beforeSeq } : {}) }, { raw: true });
+        const items = Array.isArray(r) ? r : Array.isArray(r?.data) ? r.data : Array.isArray(r?.items) ? r.items : null;
         if (!items) throw new ImError('get_messages returned no list');
         if (items.some((m) => m?.client_msg_id === clientMsgId)) return 'found';
         if (!items.length || (!Array.isArray(r) && !r.pagination?.next_cursor)) return 'absent';

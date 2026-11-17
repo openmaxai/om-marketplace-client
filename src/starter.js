@@ -286,7 +286,7 @@ export function createStarter({
         orgId: job.org_id, conversationId: job.conversation_id, clientMsgId: job.client_msg_id, since: job.send_started_at - LOOKUP_SKEW_MS,
       });
     } catch (err) {
-      logger.debug(`${tag(job)}: lookup failed (${err.message})`);
+      logger.warn(`${tag(job)}: lookup failed (${err.message}); tried again next check`);
     }
     if (found === 'found') {
       logger.info(`${tag(job)} found in the conversation; marked sent`);

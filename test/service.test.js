@@ -12,7 +12,7 @@ import { SERVICE_NAME, createPm2, startService } from '../src/service.js';
 
 // startService with a fake pm2, post-install, status view and poll round. The status view reports the service as
 // holding the lock once pm2 started it, and the intents pull as `pull` at the fake time.
-function harness({ pm2Status = null, hook = 0, pull = 'ok', takesLock = true, writeConfigFile = true, configChanges = false } = {}) {
+function harness({ pm2Status = null, hook = 0, pull = 'ok', takesLock = true, writeConfigFile = true, configChanges = false, foreignLock = null } = {}) {
   const dataDir = path.join(tmpHome(), 'd');
   if (writeConfigFile) writeConfig(VALID_ENV, dataDir);
   const clock = { t: Date.parse('2026-11-17T00:00:00Z') };
@@ -30,12 +30,16 @@ function harness({ pm2Status = null, hook = 0, pull = 'ok', takesLock = true, wr
     if (configChanges) writeConfig({ ...VALID_ENV, COCO_API_KEY: `${FAKE_KEY}x` }, dataDir);
     return hook;
   };
+  // pull: the outcome of every round, or a list used in turn (the last one repeats).
+  const outcomes = [pull].flat();
+  let rounds = 0;
+  const outcome = () => outcomes[Math.min(rounds, outcomes.length) - 1];
   const readStatus = () => ({
-    service: takesLock && status === 'online' ? 4242 : null,
-    runs: pulledAt ? { intents: { outcome: pull, at: new Date(pulledAt).toISOString() } } : {},
-    alerts: pull === 'ok' ? {} : { intents_pull: { message: 'install intent pull rejected: 401 UNAUTHENTICATED' } },
+    service: foreignLock ?? (takesLock && status === 'online' ? 4242 : null),
+    runs: pulledAt ? { intents: { outcome: outcome(), at: new Date(pulledAt).toISOString() } } : {},
+    alerts: outcome() === 'ok' ? {} : { intents_pull: { message: 'install intent pull rejected: 401 UNAUTHENTICATED' } },
   });
-  const sync = async () => { calls.push(['sync']); pulledAt = clock.t; return { code: 0, message: 'poll round finished' }; };
+  const sync = async () => { calls.push(['sync']); rounds += 1; pulledAt = clock.t; return { code: 0, message: 'poll round finished' }; };
   const run = (extra = {}) => startService({
     dataDir, pm2, postInstall, readStatus, sync, now: () => clock.t, wait: async (ms) => { clock.t += ms; }, ecosystem: '/eco.cjs', ...extra,
   });
@@ -102,6 +106,31 @@ test('start: a pull the market did not answer fails with the last outcome and th
   assert.match(r.message, /has not pulled install orders from the market .*last pull: rejected at/);
   assert.match(r.message, /intents_pull: install intent pull rejected: 401/);
 });
+
+test('start: a transient pull is tried again, up to two more rounds', async () => {
+  let h = harness({ pull: ['transient', 'backoff', 'ok'] });
+  let r = await h.run();
+  assert.equal(r.code, 0, r.message);
+  assert.equal(h.names().filter((c) => c === 'sync').length, 3);
+  h = harness({ pull: ['transient', 'error', 'transient', 'ok'] });
+  r = await h.run();
+  assert.equal(r.code, 1);
+  assert.match(r.message, /last pull: transient at/);
+  assert.equal(h.names().filter((c) => c === 'sync').length, 3);
+  h = harness({ pull: 'rejected' });
+  await h.run();
+  assert.equal(h.names().filter((c) => c === 'sync').length, 1);
+});
+
+for (const [name, holder] of [['a process pm2 does not run', 5151], ['a process that cannot be identified', -1]]) {
+  test(`start: a state lock held by ${name} fails without starting another instance`, async () => {
+    const h = harness({ foreignLock: holder });
+    const r = await h.run();
+    assert.equal(r.code, 1);
+    assert.match(r.message, /state lock is held by .*which pm2 does not run \(pm2 status: not registered\)/);
+    assert.deepEqual(h.names(), ['post-install', 'status']);
+  });
+}
 
 test('pm2 status reads jlist, also after leading noise, and finds the app by name', async () => {
   const out = `noise\n${JSON.stringify([{ name: 'other', pm2_env: { status: 'online' } }, { name: SERVICE_NAME, pm2_env: { status: 'stopped' } }])}`;

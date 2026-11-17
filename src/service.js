@@ -12,6 +12,10 @@ export const POST_INSTALL = path.join(SKILL_ROOT, 'hooks', 'post-install.js');
 export const LOCK_WAIT_MS = 30 * 1000;
 // Intent pull outcomes that mean the market answered the pull.
 const PULLED = new Set(['ok', 'partial', 'queue_full']);
+// Outcomes worth another poll round before start gives up, and how many more rounds it runs.
+const TRANSIENT = new Set(['transient', 'backoff', 'error']);
+export const PULL_RETRIES = 2;
+export const PULL_RETRY_DELAY_MS = 15 * 1000;
 const PM2_TIMEOUT_MS = 30 * 1000;
 
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
@@ -53,11 +57,12 @@ const readText = (file) => { try { return fs.readFileSync(file, 'utf8'); } catch
 
 // Makes sure the service runs and has pulled install orders from the market: runs the post-install hook (keeps an
 // existing config), starts the pm2 app when it is not online or its config changed, saves the pm2 process list, asks
-// the service for one poll round and checks that its install order pull succeeded. Returns {code, message}.
+// the service for a poll round (up to PULL_RETRIES more after a transient failure) and checks that its install order
+// pull succeeded. A state lock held by a process pm2 does not run fails at once. Returns {code, message}.
 // sync(config) runs one poll round (handed to the service); readStatus(config) is the `status --json` view.
 export async function startService({
   dataDir, pm2 = createPm2(), postInstall = () => runPostInstall(), sync, readStatus, print = () => {}, now = Date.now, wait = sleep,
-  lockWaitMs = LOCK_WAIT_MS, ecosystem = ECOSYSTEM,
+  lockWaitMs = LOCK_WAIT_MS, ecosystem = ECOSYSTEM, retries = PULL_RETRIES, retryDelayMs = PULL_RETRY_DELAY_MS,
 }) {
   const fail = (message, code = 1) => ({ code, message });
   const before = readText(configPath(dataDir));
@@ -78,6 +83,11 @@ export async function startService({
   } catch (err) {
     return fail(`${err.message}; the service cannot be started without pm2`);
   }
+  const holder = readStatus(config).service;
+  if (st !== 'online' && holder !== null) {
+    return fail(`the state lock is held by ${holder > 0 ? `process ${holder}` : 'a process that cannot be identified'}, which pm2 does not run `
+      + `(pm2 status: ${st ?? 'not registered'}): another service instance or a running market-client command; stop it, then run start again`);
+  }
   try {
     if (st !== 'online' || changed) {
       if (st !== null) await pm2.remove(SERVICE_NAME);
@@ -93,10 +103,20 @@ export async function startService({
     if (now() >= end) return fail(`the service did not start within ${lockWaitMs / 1000} s; see pm2 logs ${SERVICE_NAME}`);
     await wait(500);
   }
-  const round = await sync(config);
-  const s = readStatus(config);
-  const run = s.runs?.intents;
-  const pulled = run && PULLED.has(run.outcome) && Date.parse(run.at) >= since - 1000;
+  const fresh = (r) => r && Date.parse(r.at) >= since - 1000;
+  let round;
+  let s;
+  let run;
+  for (let attempt = 0; ; attempt++) {
+    round = await sync(config);
+    s = readStatus(config);
+    run = s.runs?.intents;
+    const transient = round.code !== 0 || !fresh(run) || TRANSIENT.has(run.outcome);
+    if ((fresh(run) && PULLED.has(run.outcome)) || !transient || attempt >= retries) break;
+    print(`install order pull not done yet (${fresh(run) ? run.outcome : round.message}); trying again in ${retryDelayMs / 1000} s`);
+    await wait(retryDelayMs);
+  }
+  const pulled = fresh(run) && PULLED.has(run.outcome);
   try {
     st = await pm2.status(SERVICE_NAME);
   } catch (err) {

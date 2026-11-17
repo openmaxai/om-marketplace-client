@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { tmpHome } from './helpers.js';
+import { ROOT, tmpHome } from './helpers.js';
 import {
   ImError, OPENMAX_NORUN_MIN_VERSION, OPENMAX_STRUCTURED_MIN_VERSION, STARTER_SCHEMA, createOpenmaxIm, openmaxCommCli, parseCliOutput, redact,
   sendParams, versionAtLeast,
@@ -411,7 +411,8 @@ test('starter_message.structured false on openmax 2.32.0: today\'s AGENT_TEXT bo
 test('findMessage: reads back page by page until the message, the conversation start or the given time', async () => {
   const msg = (seq, at, id = `c_${seq}`) => ({ seq, created_at: new Date(at).toISOString(), client_msg_id: id });
   const T = Date.parse('2026-11-17T10:00:00Z');
-  const page = (items, more) => ({ stdout: JSON.stringify({ items, ...(more ? { pagination: { next_cursor: 'x' } } : {}) }) });
+  // The real comm.get_messages answer: {data, pagination: {next_cursor}}, next_cursor empty at the first message.
+  const page = (items, more) => ({ stdout: JSON.stringify({ data: items, pagination: { next_cursor: more ? '9' : '' } }) });
   const find = async (answers, clientMsgId = 'want') => {
     const f = fakeRun({ 'comm.get_messages': answers });
     const im = createOpenmaxIm({ zylosDir: tmpHome(), run: f.run, retryDelayMs: 0 });
@@ -430,4 +431,14 @@ test('findMessage: reads back page by page until the message, the conversation s
   const exit = Object.assign(new Error('exit'), { code: 1 });
   await assert.rejects(find([{ err: exit, stderr: JSON.stringify({ error: 'no', status: 403 }) }]), ImError);
   await assert.rejects(find([{ stdout: JSON.stringify({ nope: 1 }) }]), /no list/);
+});
+
+test('findMessage reads a real comm.get_messages answer (fixture): found by client message id, absent at the first message', async () => {
+  const real = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'comm-get-messages.json'), 'utf8');
+  // The CLI prints trace lines and the pretty-printed answer.
+  const stdout = `[rpc] GET /conversations/x/messages\n${JSON.stringify(JSON.parse(real), null, 2)}\n`;
+  const find = (clientMsgId) => createOpenmaxIm({ zylosDir: tmpHome(), run: fakeRun({ 'comm.get_messages': { stdout } }).run })
+    .findMessage({ orgId: ORG, conversationId: 'cv-1', clientMsgId, since: Date.parse('2026-11-17T10:00:00Z') });
+  assert.equal(await find('mkt-starter-00000000-0000-4000-8000-000000000021'), 'found');
+  assert.equal(await find('mkt-starter-other'), 'absent');
 });

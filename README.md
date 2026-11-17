@@ -63,8 +63,12 @@ manually with `zylos add openmaxai/om-marketplace-client`.
    post-install hook (an existing config.json is kept), starts the PM2 app
    from `ecosystem.config.cjs` when it is not online (or restarts it when the
    hook changed config.json), runs `pm2 save`, waits up to 30 seconds for the
-   service to take the state lock, asks it for one poll round and checks that
-   its install order pull succeeded. It exits 0 only then; otherwise it exits
+   service to take the state lock, asks it for a poll round and checks that
+   its install order pull succeeded. A pull that failed transiently (server
+   error, timeout, Retry-After) gets up to 2 more rounds, 15 seconds apart. When
+   pm2 does not run the service but another process holds the state lock (a
+   service started by hand, or a running `market-client` command), it fails at
+   once and starts nothing. It exits 0 only then; otherwise it exits
    1 (78 for a configuration error) and prints the last pull outcome and the
    alerts. The install is complete only when it exits 0.
 6. Restart the Agent session once.
@@ -301,6 +305,8 @@ session, so the starter tasks run against it:
   the 12 are used. This hold is ended by the confirmation, by the adoption no
   longer waiting (removed, revoked, reported as inject missing), or after 24
   hours at the latest, and the message is then handled as below.
+  An Agent that stays busy the whole time therefore gets the message up to 24
+  hours late; it is then sent without a new session.
 - When the runtime status file is missing or stale, or the OpenMax turn state
   cannot be read, no session can be asked for, so the message is handled at
   once, as before.
@@ -379,7 +385,9 @@ The message is still sent at most once (the claim, and the client message id
    result is `sent`. Not found once the pages reach that time or the start of
    the DM, and the send started at least 60 seconds ago: `send_failed`
    (reason `send_lost`). The lookup is repeated every 30 seconds; when it still
-   cannot tell 10 minutes after the send, the job is dropped unreported.
+   cannot tell 10 minutes after the send, the job is dropped unreported. The
+   market takes the first mark whenever it comes, so a `sent` found after its
+   10-minute grace still removes the fallback card shown meanwhile.
 7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
    A `send_failed` or `rejected_content` result is logged with a short reason
    code (`dm_check_<failure>` such as `dm_check_unreadable_output`,

@@ -117,7 +117,9 @@ through the control queue, to start a new session with the new-session skill
 per change). A template adopted with a starter message is asked for at once on
 its own budget (Agent idle 30 seconds, at least 2 minutes apart, 12 a day,
 apart from the automatic 4); when the Agent is busy or that budget does not
-allow it, the starter message waits until the template is in a session. Templates adopted before 0.6.0 are confirmed by the next natural
+allow it, the starter message waits until the template is in a session, at most
+24 hours (an Agent busy that long gets it then, without a new session). When the
+Agent's runtime status or turn state cannot be read, it is sent at once. Templates adopted before 0.6.0 are confirmed by the next natural
 session. The first shard records what the
 session was given in `injected.json`; from that the client reports
 `template_activated` (or `template_inject_missing`) to the market at once.
@@ -129,8 +131,9 @@ session was given in `injected.json`; from that the client reports
 the service start; run `market-client start` after it. `start` runs the
 post-install hook (an existing config is kept), starts the pm2 service when it
 is not online (or restarts it when the config changed), runs `pm2 save`, then
-asks the service for one poll round and exits 0 only when the service runs and
-its install order pull succeeded.
+asks the service for a poll round (up to 2 more after a transient failure) and
+exits 0 only when the service runs and its install order pull succeeded. A state
+lock held by a process pm2 does not run makes it fail without starting anything.
 The Agent never installs or upgrades on its own; those run only from workbench
 orders. Enable, disable, uninstall and rollback change the skill locally, then
 report it. While the service runs, commands are handed to it. Exit codes: 0 done,
