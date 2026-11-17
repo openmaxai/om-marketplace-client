@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-17
+
+### Changed
+- Starter message: with openmax 2.32.0 or later it is sent as the welcome card,
+  an `AGENT_STRUCTURED` message with the same text, metadata
+  `market_starter_tasks: {schema: "market.starter-tasks.v1", adoption_id}`, a
+  fallback text and client message id `mkt-starter-<adoption_id>`. The fallback
+  text is the whole message up to 8192 bytes; a longer one is cut at a
+  character boundary with the truncation suffix. With an older or unreadable
+  openmax version the message is sent as plain text exactly as in 0.6.1.
+- When the welcome card is refused for certain (HTTP 4xx other than 408 and
+  429, or refused by the client), the refusal is logged and the message is sent
+  once as plain text with id `mkt-starter-<adoption_id>-text`. A server error,
+  timeout or unreadable answer is not retried, as before.
+- The client refuses the metadata key `context` and a fallback text over 8192
+  bytes itself, since openmax 2.32 does not check them.
+
+### Added
+- `starter_message.structured` in `config.json` (default `true`); `false` sends
+  the starter message as plain text, as in 0.6.1.
+
 ## [0.6.1] - 2026-11-17
 
 ### Fixed
