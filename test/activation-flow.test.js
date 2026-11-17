@@ -11,7 +11,9 @@ import { fakeControl } from './fake/control.js';
 import { createIntentPuller } from '../src/intents.js';
 import { createTemplates } from '../src/templates.js';
 import { createReconciler } from '../src/reconcile.js';
-import { ACTIVATION_CHECK_MS, NEW_SESSION_TEXT, WELCOME_HOLD_MS, createActivation } from '../src/activation.js';
+import {
+  ACTIVATION_CHECK_MS, DAILY_WELCOME_REQUESTS, NEW_SESSION_TEXT, WELCOME_HOLD_MS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, createActivation,
+} from '../src/activation.js';
 import { ensureDeclarations, readSlots } from '../src/shards.js';
 import { MARKER_FILE, emitSlot } from '../src/shard-emitter.js';
 import { POLICY_SHA256 } from '../src/policy/pin.js';
@@ -142,6 +144,30 @@ test('starter message: an Agent idle 30 s is asked for a new session at once and
   f.fake.script('POST', C10, recordAll);
   assert.equal(await f.activation.tick(), 'confirmed');
   assert.equal(f.activation.isPending(ADOPTION), false);
+});
+
+test('starter message: 10 minutes after an automatic request, the Agent is still asked at once and the message held', async (t) => {
+  const f = await flow(t, { starterMessage: true });
+  f.state.update('activation', {}, (d) => ({ ...d, requests: [new Date(f.clock.t - 10 * 60 * 1000).toISOString()] }));
+  await f.order('write_template');
+  f.status({ idle_seconds: 45 });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.controls().length, 1);
+  assert.equal(f.starts[0].holdUntil, f.clock.t + WELCOME_HOLD_MS);
+});
+
+test('starter message: with the starter requests of the day used up, the message is held until the session', async (t) => {
+  const f = await flow(t, { starterMessage: true });
+  // Earlier today (the fake clock starts at midnight UTC), the last one 2 minutes ago, so only the daily cap blocks.
+  f.clock.t += 4 * 60 * 1000;
+  const used = Array.from({ length: DAILY_WELCOME_REQUESTS }, (_, i) => new Date(f.clock.t - WELCOME_REQUEST_INTERVAL_MS - i * 5000).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, welcome_requests: used }));
+  await f.order('write_template');
+  f.status({ idle_seconds: 45 });
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.deepEqual(f.controls(), []);
+  assert.equal(f.starts[0].holdUntil, f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.deepEqual(f.state.read('activation', null).pending.welcome, [ADOPTION]);
 });
 
 test('starter message: a busy Agent is not asked at once and the message is not held', async (t) => {

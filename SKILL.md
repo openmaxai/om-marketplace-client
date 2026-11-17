@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.7.0
+version: 0.7.1
 description: >-
   Agent Market client. Pulls install intents placed by humans in the Agent Market
   workbench, installs approved skills and expert templates into this Agent after
@@ -108,7 +108,10 @@ reaches the Agent at its next session start. Once the Agent has been idle for 5
 minutes with no open OpenMax turn and runtime health ok, the client asks it,
 through the control queue, to start a new session with the new-session skill
 (one queued request at a time, at most every 30 minutes, 4 times a day, 3 times
-per change). Templates adopted before 0.6.0 are confirmed by the next natural
+per change). A template adopted with a starter message is asked for at once on
+its own budget (Agent idle 30 seconds, at least 2 minutes apart, 12 a day,
+apart from the automatic 4); when that budget does not allow it, the starter
+message waits until the template is in a session. Templates adopted before 0.6.0 are confirmed by the next natural
 session. The first shard records what the
 session was given in `injected.json`; from that the client reports
 `template_activated` (or `template_inject_missing`) to the market at once.

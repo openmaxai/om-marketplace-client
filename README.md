@@ -208,7 +208,10 @@ chance. It is always on; there is no setting to turn it off.
    conversation has an open turn, nor one closed by a reply within the last 10
    minutes (openmax's own activity store); the last automatic request was 30
    minutes ago or more; fewer than 4 were made this UTC day. A missing or stale
-   status file means no request.
+   status file means no request. Requests for a starter message (see
+   [Starter message](#starter-message) below) follow their own rules and are
+   counted apart: they neither use the 4 automatic requests nor wait for the
+   30-minute cooldown, and automatic requests do not use theirs.
 3. The request goes to the zylos control queue: "Agent Market templates were
    updated; please use the new-session skill to start a new session.", held
    until the Agent is idle, without an ack suffix, with a 6-hour ack deadline
@@ -256,6 +259,7 @@ item not delivered for 7 days is dropped. A report never carries both
 `template_inject_missing` was reported for an adoption, an activation of it
 still waiting is dropped.
 
+## Starter message
 
 After the market accepted the first write of an adopted expert template whose
 order carries `starter_message`, the client sends the adopter one welcome
@@ -264,11 +268,38 @@ reaches the model. With openmax 2.32.0 or later it is sent as the welcome card
 (see step 6); the web chat draws the card from the template, and the message
 text is shown wherever the card is not.
 
-When the Agent has been idle for 30 seconds with no open OpenMax turn at that
-moment, the client asks for a new session at once (see
-[Template activation](#template-activation)) and holds the message until the
-session has the template, or for at most 3 minutes. Otherwise the message is
-handled at once, as below. The claim always comes right before the send.
+The message should reach the adopter after the template is in the Agent's
+session, so the starter tasks run against it:
+
+- A new-session request still on its way (in the control queue, or delivered
+  less than 15 minutes ago with no session started since) is joined: the
+  message is held until the session has the template, or for at most 3
+  minutes. So adoptions close together share one request.
+- Otherwise, when the Agent has been idle for 30 seconds with no open OpenMax
+  turn at that moment, the client asks for a new session at once (see
+  [Template activation](#template-activation)) and holds the message the same
+  way. These requests are not subject to the automatic 30-minute cooldown or
+  the 4 automatic requests a day. They have their own budget: at least 2
+  minutes between two, at most 12 per UTC day (loop protection).
+- When that budget does not allow a request (within 2 minutes of the last
+  one, or 12 made today), the message is held until the session has the
+  template. The 30-second check asks for the session as soon as the 2 minutes
+  have passed (Agent idle 30 seconds), or by the automatic rules once the 12
+  are used. This hold is ended by the confirmation, by the adoption no longer
+  waiting (removed, revoked, reported as inject missing), or after 24 hours at
+  the latest, and the message is then handled as below.
+- Otherwise (the Agent busy or in an open turn) the message is handled at once,
+  as before.
+
+The hold is kept in the client state with the message job, so a restart
+during it neither loses nor repeats the message. The claim always comes right
+before the send, after any hold: the 8- and 9-minute limits below count from
+the claim, and so does the market's 10-minute grace, so a hold of any length
+never ends in `too_late` or `send_failed`. While the message is held it is not
+claimed yet; the workbench shows the fallback card for an unclaimed message, as
+it did during the earlier 3-minute hold, and stops showing it at the claim.
+The message is still sent at most once (the claim, and the client message id
+`mkt-starter-<adoption_id>`).
 
 1. The client claims the message with the market (`:claim-starter`). Anything
    but `claimed` (`already_claimed`, `already_shown`, `disabled`,
