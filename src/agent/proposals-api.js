@@ -9,10 +9,20 @@ export const MAX_REASON_CHARS = 500;
 export const MAX_LIMIT = 20;
 export const MAX_CANDIDATES = 3;
 export const PROPOSAL_STATES = new Set(['pending_confirmation', 'confirming', 'confirmed', 'declined', 'superseded', 'expired']);
-// States the list route filters by.
-export const QUERY_STATES = new Set(['pending_confirmation', 'confirmed', 'declined', 'expired']);
-// Where the user confirms; the market gives no link.
+// Where the user confirms when the market gives no link.
 export const CONFIRM_HINT = '请到工作台和我的私聊里确认';
+export const confirmPhrase = (url) => (url ? `请点这个链接确认：${url}` : CONFIRM_HINT);
+
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+// The workspace link to confirm a request: https (http only on loopback), no credentials, at most 2048 characters.
+export function confirmUrl(v) {
+  if (typeof v !== 'string' || v.length > 2048) return null;
+  let u;
+  try { u = new URL(v); } catch { return null; }
+  if (u.username || u.password) return null;
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOOPBACK.has(u.hostname))) return null;
+  return u.href;
+}
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 // Market text is shown to the Agent as data: control characters other than newline are dropped and length is capped.
@@ -62,6 +72,7 @@ export function proposalView(v) {
     expires_at: clean(v.expires_at, 40),
     decided_at: clean(v.decided_at, 40),
     confirmed_via: v.confirmed_via === 'card' || v.confirmed_via === 'chat' ? v.confirmed_via : null,
+    confirm_url: confirmUrl(v.confirm_url),
   };
 }
 
@@ -84,12 +95,6 @@ export async function proposeInstall({ http, orgId, agentId, candidates, request
   const p = proposalView(d);
   if (!p) throw shape('market install proposal', 'is not a proposal');
   return p;
-}
-
-export async function listProposals({ http, orgId, agentId, state = null }) {
-  const d = (await http.request('GET', orgId, `${agentPath(agentId)}/install-proposals`, undefined, { query: state ? { state } : null })).data;
-  if (!isObject(d) || !Array.isArray(d.items)) throw shape('market install proposals', 'has no items');
-  return d.items.map(proposalView).filter(Boolean);
 }
 
 export async function getProposal({ http, orgId, agentId, proposalId }) {

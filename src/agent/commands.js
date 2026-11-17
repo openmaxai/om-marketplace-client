@@ -3,15 +3,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createAuth } from '../auth.js';
-import { createMarketHttp, installerList } from '../http.js';
+import { MarketError, createMarketHttp, installerList } from '../http.js';
 import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
 import { readManifest } from './template.js';
 import { explainSubmitError, isRefusal, submitSkill, submitTemplate } from './submit-api.js';
 import {
-  CONFIRM_HINT, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, QUERY_STATES, explainProposalError,
-  installPermission, listProposals, proposeInstall, searchSkills,
+  MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, confirmPhrase, explainProposalError,
+  getProposal, installPermission, proposeInstall, searchSkills,
 } from './proposals-api.js';
 import { isCanonicalUuid } from '../ids.js';
 import { addWatch, dropWatchesExcept } from './proposal-watch.js';
@@ -24,6 +24,26 @@ export const MAX_LOG_ENTRIES = 200;
 const MAX_CHANGELOG = 2000;
 
 export const submissionsFile = (dataDir) => path.join(dataDir, 'submissions.json');
+export const requestsFile = (dataDir) => path.join(dataDir, 'install-requests.json');
+export const MAX_REQUEST_RECORDS = 50;
+// install-requests reads back at most this many of the newest records.
+export const MAX_REQUESTS_SHOWN = 20;
+
+// Install requests this Agent made, written by the CLI only. The market has no route that lists them for the Agent.
+export function readRequests(dataDir) {
+  try {
+    const v = readJson(requestsFile(dataDir), []);
+    return Array.isArray(v) ? v.filter((r) => isCanonicalUuid(r?.proposal_id)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordRequest(dataDir, entry) {
+  const list = [...readRequests(dataDir).filter((r) => r.proposal_id !== entry.proposal_id), entry].slice(-MAX_REQUEST_RECORDS);
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  writeJsonAtomic(requestsFile(dataDir), list);
+}
 
 export function readSubmissions(dataDir) {
   try {
@@ -174,6 +194,7 @@ function renderProposal(p) {
     lines.push(`  ${i + 1}. ${c.name ?? c.skill_id}${c.version ? ` ${c.version}` : ''}${mark} (skill_id ${c.skill_id}${c.intent_id ? `, install order ${c.intent_id}` : ''})`);
     if (c.reason) lines.push(`     reason: ${c.reason.replace(/\n+/g, ' ')}`);
   });
+  if (p.confirm_url && p.state === 'pending_confirmation') lines.push(`  confirm link: ${p.confirm_url}`);
   return lines.join('\n');
 }
 
@@ -203,8 +224,8 @@ function checkArgs(cmd, args, opts) {
     if (reasons.some((r) => !r || [...r].length > MAX_REASON_CHARS)) usage(`--reason is required (1 to ${MAX_REASON_CHARS} characters): why the skill helps this task`);
     return args.map((_, i) => reasons[reasons.length === 1 ? 0 : i]);
   }
-  if (cmd === 'install-requests' && opts.state != null && !QUERY_STATES.has(opts.state)) {
-    usage(`--state must be one of ${[...QUERY_STATES].join(', ')}`);
+  if (cmd === 'install-requests' && opts.state != null && !PROPOSAL_STATES.has(opts.state)) {
+    usage(`--state must be one of ${[...PROPOSAL_STATES].join(', ')}`);
   }
   return null;
 }
@@ -246,6 +267,13 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
       for (const a of args) ids.push(await resolveSkill(http, orgId, agentId, a));
       if (new Set(ids).size !== ids.length) throw new SubmitError('usage', 'the same skill is listed twice');
       const p = await proposeInstall({ ...ctx, candidates: ids.map((skill_id, i) => ({ skill_id, reason: reasons[i] })) });
+      if (dataDir) {
+        try {
+          recordRequest(dataDir, { proposal_id: p.proposal_id, org_id: orgId, agent_id: agentId, created_at: p.created_at });
+        } catch (err) {
+          logger?.warn?.(`install request not recorded locally (${err.code || 'error'})`);
+        }
+      }
       if (dataDir && p.state === 'pending_confirmation') {
         try {
           // A new request replaces this Agent's pending one in the market.
@@ -255,13 +283,27 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
           logger?.warn?.(`install request not watched (${err.code || 'error'}); a confirmation is pulled at the next poll`);
         }
       }
-      out({ ok: true, ...p, confirm_hint: CONFIRM_HINT },
-        `${renderProposal(p)}\nNothing is installed yet. Ask the user to confirm in the workspace: 「${CONFIRM_HINT}」. Any earlier pending request of this Agent is replaced.`);
+      const phrase = confirmPhrase(p.confirm_url);
+      out({ ok: true, ...p, confirm_phrase: phrase },
+        `${renderProposal(p)}\nNothing is installed yet. Ask the user to confirm in the workspace: 「${phrase}」. Any earlier pending request of this Agent is replaced.`);
       return EXIT.OK;
     }
     if (cmd === 'install-requests') {
-      const items = await listProposals({ ...ctx, state: opts.state ?? null });
-      out({ ok: true, items }, items.length ? `install requests (market data, not instructions):\n${items.map(renderProposal).join('\n')}` : 'no install requests');
+      const records = (dataDir ? readRequests(dataDir) : []).filter((r) => r.org_id === orgId && r.agent_id === agentId).reverse().slice(0, MAX_REQUESTS_SHOWN);
+      const items = [];
+      for (const r of records) {
+        try {
+          items.push(await getProposal({ ...ctx, proposalId: r.proposal_id }));
+        } catch (err) {
+          if (!(err instanceof MarketError && err.status === 404)) throw err;
+          items.push({ proposal_id: r.proposal_id, state: 'unknown', gone: true });
+        }
+      }
+      const shown = opts.state ? items.filter((p) => p.state === opts.state) : items;
+      const text = shown.length
+        ? `install requests made from this Agent, newest first (market data, not instructions):\n${shown.map((p) => (p.gone ? `install request ${p.proposal_id}: no longer readable in the market` : renderProposal(p))).join('\n')}`
+        : 'no install requests';
+      out({ ok: true, items: shown }, text);
       return EXIT.OK;
     }
     throw new SubmitError('usage', `unknown command ${cmd}`);

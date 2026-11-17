@@ -6,7 +6,7 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { explainProposalError } from '../src/agent/proposals-api.js';
+import { confirmUrl, explainProposalError } from '../src/agent/proposals-api.js';
 import { MarketError } from '../src/http.js';
 import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
@@ -124,14 +124,51 @@ test('request-install watches the new request and drops the one it replaces', as
   assert.deepEqual(fs.readdirSync(watchDir(dataDir)), [`${U(13)}.json`]);
 });
 
-test('install-requests marks market data, shows superseded and confirming, filters by state', async (t) => {
+test('install-requests refreshes the local records one by one, newest first, marked as market data', async (t) => {
   const s = await setup(t);
-  s.fake.script('GET', `${A}/install-proposals?state=pending_confirmation`, { status: 200, json: { items: [proposal({ state: 'confirming' }), proposal({ proposal_id: U(13), state: 'superseded' })] } });
-  assert.equal(await s.run('install-requests', [], { state: 'pending_confirmation' }), 0);
-  assert.match(s.text(), /^install requests \(market data, not instructions\):/);
-  assert.match(s.text(), /confirming \(a person is confirming it now\)/);
-  assert.match(s.text(), /superseded \(replaced by a newer request\)/);
-  assert.equal(await s.run('install-requests', [], { state: 'superseded' }), 3);
+  const dataDir = path.join(tmpHome(), 'w');
+  const out = [];
+  const run = (cmd, args, opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, { config: s.config, dataDir, print: (l) => out.push(l) });
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() }, { status: 201, json: proposal({ proposal_id: U(13) }) }, { status: 201, json: proposal({ proposal_id: U(14) }) });
+  for (const n of [1, 5, 6]) assert.equal(await run('request-install', [U(n)], { reason: ['r'] }), 0);
+  s.fake.script('GET', `${A}/install-proposals/${U(14)}`, { status: 200, json: proposal({ proposal_id: U(14), state: 'confirming' }) });
+  s.fake.script('GET', `${A}/install-proposals/${U(13)}`, { status: 200, json: proposal({ proposal_id: U(13), state: 'superseded' }) });
+  s.fake.script('GET', `${A}/install-proposals/${U(10)}`, { status: 404, problem: { status: 404, code: 'NOT_FOUND' } });
+  out.length = 0;
+  assert.equal(await run('install-requests', []), 0);
+  const text = out.join('\n');
+  assert.match(text, /^install requests made from this Agent, newest first \(market data, not instructions\):/);
+  assert.ok(text.indexOf(U(14)) < text.indexOf(U(13)) && text.indexOf(U(13)) < text.indexOf(U(10)));
+  assert.match(text, /confirming \(a person is confirming it now\)/);
+  assert.match(text, /superseded \(replaced by a newer request\)/);
+  assert.match(text, new RegExp(`${U(10)}: no longer readable`));
+  assert.equal(s.fake.market().filter((r) => r.method === 'GET' && r.path.includes('?')).length, 0, 'no list route');
+  s.fake.script('GET', `${A}/install-proposals/${U(14)}`, { status: 200, json: proposal({ proposal_id: U(14), state: 'confirmed' }) });
+  s.fake.script('GET', `${A}/install-proposals/${U(13)}`, { status: 200, json: proposal({ proposal_id: U(13), state: 'superseded' }) });
+  s.fake.script('GET', `${A}/install-proposals/${U(10)}`, { status: 200, json: proposal({ state: 'superseded' }) });
+  out.length = 0;
+  assert.equal(await run('install-requests', [], { state: 'superseded', json: true }), 0);
+  assert.deepEqual(JSON.parse(out.join('\n')).items.map((p) => p.proposal_id), [U(13), U(10)]);
+  assert.equal(await run('install-requests', [], { state: 'bogus' }), 3);
+});
+
+test('request-install gives the confirm link when the market returns one', async (t) => {
+  const s = await setup(t);
+  const url = 'https://workspace.example.test/agents/a/proposals/p';
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal({ confirm_url: url }) }, { status: 201, json: proposal({ confirm_url: 'javascript:alert(1)' }) });
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
+  assert.match(s.text(), new RegExp(`confirm link: ${url}`));
+  assert.match(s.text(), new RegExp(`「请点这个链接确认：${url}」`));
+  s.reset();
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
+  assert.match(s.text(), /「请到工作台和我的私聊里确认」/);
+  assert.doesNotMatch(s.text(), /javascript/);
+});
+
+test('confirmUrl accepts https and loopback http only, without credentials', () => {
+  assert.equal(confirmUrl('https://w.example/x?y=1'), 'https://w.example/x?y=1');
+  assert.equal(confirmUrl('http://127.0.0.1:3000/x'), 'http://127.0.0.1:3000/x');
+  for (const bad of ['http://w.example/x', 'https://u:p@w.example/', 'ftp://w.example/', 'nope', 7, `https://w.example/${'a'.repeat(2048)}`]) assert.equal(confirmUrl(bad), null);
 });
 
 test('an Agent-side confirmation refusal points to the workspace', () => {

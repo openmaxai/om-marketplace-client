@@ -25,7 +25,7 @@ const USAGE = `usage: market-client <command>
   search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
   install-permission        who may confirm installs on this Agent (in the workspace)
   request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
-  install-requests          this Agent's install requests [--state pending_confirmation|confirmed|declined|expired]
+  install-requests          install requests made from this Agent, refreshed from the market [--state <state>]
 submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)

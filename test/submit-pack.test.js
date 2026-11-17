@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
-import { SubmitError, buildZip, packSkill } from '../src/agent/pack.js';
+import { SubmitError, buildZip, isSecretFile, packSkill } from '../src/agent/pack.js';
 import { inspectPackage } from '../src/pkg/hygiene.js';
 import { checkManifest, readManifest } from '../src/agent/template.js';
 
@@ -75,4 +75,20 @@ test('readManifest reports unreadable, non-JSON and invalid files', () => {
   assert.throws(() => readManifest(f), /\/id: bad_value/);
   fs.writeFileSync(f, JSON.stringify(MANIFEST));
   assert.equal(readManifest(f).manifest.id, 'weekly-reporter');
+});
+
+test('files that may hold credentials refuse the package and are all named', () => {
+  const dir = skillDir({
+    'SKILL.md': SKILL_MD, '.env': 'A=1', 'conf/.env.local': 'B=2', 'certs/server.pem': 'x', 'tls.KEY': 'x', 'ssh/id_rsa.pub': 'x',
+    'id_ed25519': 'x', '.npmrc': 'x', '.netrc': 'x', 'credentials': 'x', 'aws/credentials.json': 'x', 'notes.md': '# n\n', 'keys.md': '# k\n',
+  });
+  let err;
+  try { packSkill(dir); } catch (e) { err = e; }
+  assert.equal(err?.code, 'secret_file');
+  for (const f of ['.env', 'conf/.env.local', 'certs/server.pem', 'tls.KEY', 'ssh/id_rsa.pub', 'id_ed25519', '.npmrc', '.netrc', 'credentials', 'aws/credentials.json']) {
+    assert.ok(err.message.includes(f), f);
+  }
+  assert.ok(!err.message.includes('notes.md') && !err.message.includes('keys.md'));
+  assert.equal(isSecretFile('environment.md'), false);
+  assert.equal(isSecretFile('.envrc'), true);
 });

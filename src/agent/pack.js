@@ -9,6 +9,10 @@ import { validSlug } from '../pkg/frontmatter.js';
 
 // Version-control and OS metadata never belong in a package.
 const SKIP = new Set(['.git', '.DS_Store', 'Thumbs.db']);
+// Files that usually hold credentials. Their presence refuses the package instead of being skipped, so the author
+// moves them out knowingly.
+const SECRET_FILE = [/^\.env/i, /\.pem$/i, /\.key$/i, /^id_(rsa|dsa|ecdsa|ed25519)/i, /^\.npmrc$/i, /^\.netrc$/i, /^credentials(\..*)?$/i];
+export const isSecretFile = (name) => SECRET_FILE.some((re) => re.test(name));
 
 export class SubmitError extends Error {
   constructor(code, message) {
@@ -24,6 +28,7 @@ export function listFiles(dir) {
   try { st = fs.lstatSync(dir); } catch { throw new SubmitError('not_found', `${dir} does not exist`); }
   if (!st.isDirectory()) throw new SubmitError('not_directory', `${dir} is not a directory`);
   const out = [];
+  const secrets = [];
   let total = 0;
   const walk = (abs, rel) => {
     for (const d of fs.readdirSync(abs, { withFileTypes: true })) {
@@ -32,6 +37,7 @@ export function listFiles(dir) {
       const r = rel ? `${rel}/${d.name}` : d.name;
       if (d.isSymbolicLink()) throw new SubmitError('link', `${r} is a symbolic link; copy the file instead`);
       if (d.isDirectory()) walk(a, r);
+      else if (d.isFile() && isSecretFile(d.name)) secrets.push(r);
       else if (d.isFile()) {
         total += fs.statSync(a).size;
         if (out.length >= MAX_PACKAGE_FILES) throw new SubmitError('too_many_files', `more than ${MAX_PACKAGE_FILES} files`);
@@ -41,6 +47,10 @@ export function listFiles(dir) {
     }
   };
   walk(dir, '');
+  if (secrets.length) {
+    const shown = secrets.sort().slice(0, 20).join(', ');
+    throw new SubmitError('secret_file', `the directory has files that may hold credentials: ${shown}${secrets.length > 20 ? ', ...' : ''}. Move them out of the skill directory (never package credentials) and submit again`);
+  }
   return out.sort((x, y) => Buffer.compare(Buffer.from(x[0]), Buffer.from(y[0])));
 }
 
