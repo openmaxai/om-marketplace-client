@@ -10,6 +10,7 @@ import { createRuntime, pollRound } from './app.js';
 import { EXIT, execute, spool } from './commands.js';
 import { membershipMessage } from './orgs.js';
 import { STALE_AFTER_MS } from './revocations.js';
+import { SUBMIT_COMMANDS, runSubmitCommand } from './submit/commands.js';
 
 const USAGE = `usage: market-client <command>
   status [--json]           orgs, client version gate, last pulls, installed content, queue, alerts
@@ -18,7 +19,12 @@ const USAGE = `usage: market-client <command>
   enable <slug>             move a disabled skill back into the skills directory
   disable <slug>            move a skill out of the skills directory
   uninstall <slug>          remove a skill and its kept versions
-commands other than status wait up to --wait <seconds> (default 900) for a running service to answer`;
+  submit-skill <dir>        package a directory with SKILL.md and submit it as a new skill (pending review)
+  submit-template <file>    submit an expert template manifest (JSON) as a new template (pending review)
+  submissions [--json]      submissions made from this Agent
+submit options: --dry-run (local checks only), --json, --changelog <text>, --category-id <id>, --org <org_id>,
+  --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
+rollback, enable, disable, uninstall and sync wait up to --wait <seconds> (default 900) for a running service to answer`;
 const SKILL_COMMANDS = new Set(['rollback', 'enable', 'disable', 'uninstall']);
 const DEFAULT_WAIT_S = 900;
 const POLL_MS = 250;
@@ -188,15 +194,22 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
 
 export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`) } = {}) {
   const [cmd, ...rest] = argv;
-  const opts = { json: false, wait: DEFAULT_WAIT_S };
+  const opts = { json: false, wait: DEFAULT_WAIT_S, dryRun: false };
+  const VALUE_OPTS = { '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org' };
+  const submit = SUBMIT_COMMANDS.has(cmd);
   const pos = [];
+  let badOpt = false;
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--json') opts.json = true;
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
-    else pos.push(rest[i]);
+    else if (submit && rest[i] === '--dry-run') opts.dryRun = true;
+    else if (submit && VALUE_OPTS[rest[i]]) {
+      if (i + 1 >= rest.length) badOpt = true;
+      opts[VALUE_OPTS[rest[i]]] = rest[++i];
+    } else pos.push(rest[i]);
   }
-  const arity = cmd === 'status' || cmd === 'sync' ? 0 : SKILL_COMMANDS.has(cmd) ? 1 : -1;
-  if (arity !== pos.length || !(opts.wait >= 0)) {
+  const arity = cmd === 'status' || cmd === 'sync' || cmd === 'submissions' ? 0 : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
+  if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
   }
@@ -216,6 +229,14 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
     return EXIT.OK;
   }
   const logger = createLogger(env.MARKET_CLIENT_LOG_LEVEL || 'warn', { log: (l) => process.stderr.write(`${l}\n`), error: (l) => process.stderr.write(`${l}\n`) });
+  if (submit) {
+    try {
+      return await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger });
+    } catch (err) {
+      print(`${cmd} failed: ${err.message}`);
+      return EXIT.FAILED;
+    }
+  }
   try {
     const r = await runCommand({ cmd, arg, config, dataDir, logger, waitMs: opts.wait * 1000, print });
     print(r.message);

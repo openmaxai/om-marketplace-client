@@ -14,11 +14,11 @@ export const SILENT_LOGGER = Object.freeze({ debug() {}, info() {}, warn() {}, e
 export class MarketError extends Error {
   constructor(message, {
     status = 0, code = null, reason = null, min_version = null, installed_by_org_id = null,
-    errors = null, details = null, retryAfterMs = null, transient,
+    errors = null, details = null, extra = null, retryAfterMs = null, transient,
   } = {}) {
     super(message);
     this.name = 'MarketError';
-    Object.assign(this, { status, code, reason, min_version, installed_by_org_id, errors, details, retryAfterMs });
+    Object.assign(this, { status, code, reason, min_version, installed_by_org_id, errors, details, extra, retryAfterMs });
     this.transient = transient ?? (TRANSIENT_STATUS.has(status) || status >= 500);
   }
 }
@@ -50,7 +50,17 @@ function problemFields(data) {
     installed_by_org_id: isOrgOrMemberId(data.installed_by_org_id) ? data.installed_by_org_id : null,
     errors: Array.isArray(data.errors) ? data.errors : null,
     details: data.details && typeof data.details === 'object' ? data.details : null,
+    extra: problemExtra(data),
   };
+}
+
+// Registered problem extension fields that explain a refused submission to its author; never logged.
+const EXTRA_TEXT = { detail: 512, field: 256, rule: 64, rule_class: 64, sentence: 1000, skill_md_rule: 64, file: 512, expected_slug: 64, previous_version: 64 };
+function problemExtra(data) {
+  const out = {};
+  for (const [k, max] of Object.entries(EXTRA_TEXT)) if (typeof data[k] === 'string' && data[k].length <= max) out[k] = data[k];
+  if (Number.isSafeInteger(data.index)) out.index = data.index;
+  return Object.keys(out).length ? out : null;
 }
 
 export function errorFromResponse(label, r, nowMs = Date.now()) {
