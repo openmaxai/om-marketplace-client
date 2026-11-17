@@ -182,3 +182,37 @@ test('template activation is checked by its own task, every 30 s, apart from the
   assert.deepEqual(ticks, [1]);
   assert.equal(buildTasks(logger, {}).some((x) => x.name === 'activation'), false);
 });
+
+// Like pm2: a 'message' listener on the IPC channel keeps the process alive after main() returns.
+async function runSupervised(t, dataDir) {
+  const hold = path.join(tmpHome(), 'hold-ipc.cjs');
+  fs.writeFileSync(hold, "process.on('message', () => {});\n");
+  const child = spawn(process.execPath, ['--require', hold, path.join(ROOT, 'src/main.js')],
+    { env: baseEnv(dataDir), stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+  t.after(() => clearTimeout(timer));
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  const exited = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  return { ...exited, stderr };
+}
+
+test('a configuration error exits with 78 even when a supervisor IPC channel holds the event loop', async (t) => {
+  const r = await runSupervised(t, path.join(tmpHome(), 'd'));
+  assert.deepEqual([r.code, r.signal], [78, null]);
+  assert.match(r.stderr, /cannot start: config not found/);
+});
+
+test('a start-up error that is not a configuration error exits with 1 so pm2 restarts the service', async (t) => {
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: 'https://127.0.0.1:9/' }, dataDir);
+  fs.writeFileSync(path.join(dataDir, 'state'), '');
+  const r = await runSupervised(t, dataDir);
+  assert.deepEqual([r.code, r.signal], [1, null]);
+  assert.match(r.stderr, /cannot start:/);
+});
+
+test('the pm2 ecosystem stops the service on exit 78 instead of restarting it', async () => {
+  const { default: eco } = await import(path.join(ROOT, 'ecosystem.config.cjs'));
+  assert.ok(eco.apps[0].stop_exit_codes.includes(78));
+});

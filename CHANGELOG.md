@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before. Previously such a send was never marked, so the workbench showed
   the fallback card 10 minutes after the claim even when the message had
   arrived.
+- Service: a configuration error at start-up now ends the process with exit
+  code 78 after the error is logged. Under pm2 the process used to stay online
+  with only the exit code set, so pm2 never stopped it and an unconfigured
+  client looked running. Any other start-up error (for example an I/O or
+  permission error on the state directory) now exits with code 1, so pm2
+  restarts the service instead of stopping it. CLI commands keep their exit
+  codes.
 
 ## [0.7.1] - 2026-11-17
 
