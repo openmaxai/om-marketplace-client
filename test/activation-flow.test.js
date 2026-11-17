@@ -170,13 +170,14 @@ test('starter message: with the starter requests of the day used up, the message
   assert.deepEqual(f.state.read('activation', null).pending.welcome, [ADOPTION]);
 });
 
-test('starter message: a busy Agent is not asked at once and the message is not held', async (t) => {
+test('starter message: a busy Agent is not asked at once; the message is held until the template is in a session', async (t) => {
   const f = await flow(t, { starterMessage: true });
   await f.order('write_template');
   f.status({ state: 'busy', idle_seconds: 0 });
   assert.equal(await f.templates.runNext(), 'succeeded');
   assert.deepEqual(f.controls(), []);
-  assert.equal(f.starts[0].holdUntil, null);
+  assert.equal(f.starts[0].holdUntil, f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.deepEqual(f.state.read('activation', null).pending.welcome, [ADOPTION]);
 });
 
 test('the marker is written by the first shard only, also when nothing is printed, and never breaks the shard', async (t) => {
