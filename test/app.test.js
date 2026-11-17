@@ -182,3 +182,24 @@ test('template activation is checked by its own task, every 30 s, apart from the
   assert.deepEqual(ticks, [1]);
   assert.equal(buildTasks(logger, {}).some((x) => x.name === 'activation'), false);
 });
+
+test('a configuration error exits with 78 even when a supervisor IPC channel holds the event loop', async (t) => {
+  const dataDir = path.join(tmpHome(), 'd');
+  // Like pm2: a 'message' listener on the IPC channel keeps the process alive after main() returns.
+  const hold = path.join(tmpHome(), 'hold-ipc.cjs');
+  fs.writeFileSync(hold, "process.on('message', () => {});\n");
+  const child = spawn(process.execPath, ['--require', hold, path.join(ROOT, 'src/main.js')],
+    { env: baseEnv(dataDir), stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+  t.after(() => clearTimeout(timer));
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  const exited = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  assert.deepEqual(exited, { code: 78, signal: null });
+  assert.match(stderr, /cannot start: config not found/);
+});
+
+test('the pm2 ecosystem stops the service on exit 78 instead of restarting it', async () => {
+  const { default: eco } = await import(path.join(ROOT, 'ecosystem.config.cjs'));
+  assert.ok(eco.apps[0].stop_exit_codes.includes(78));
+});
