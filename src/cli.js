@@ -206,7 +206,7 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
 
 // Largest owner reply read from stdin or a file.
 export const MAX_OWNER_MESSAGE_BYTES = 64 * 1024;
-class InputError extends Error {}
+export class InputError extends Error {}
 
 const utf8 = (buf, what) => {
   try {
@@ -228,25 +228,81 @@ export const readAllStdin = async (stream = process.stdin) => {
   return utf8(Buffer.concat(chunks), 'the owner\'s reply on stdin');
 };
 
-// Reads at most MAX_OWNER_MESSAGE_BYTES + 1 bytes of a regular file.
-function readOwnerMessageFile(file) {
-  const fail = (err) => new InputError(`--owner-message-file cannot be read (${err.code || 'error'})`);
+// Reads the open file in chunks, refusing as soon as it passes MAX_OWNER_MESSAGE_BYTES.
+export function readCapped(fd, readSync = fs.readSync) {
+  const buf = Buffer.alloc(MAX_OWNER_MESSAGE_BYTES + 1);
+  let n = 0;
+  for (;;) {
+    const r = readSync(fd, buf, n, buf.length - n, null);
+    if (r === 0) return buf.subarray(0, n);
+    n += r;
+    if (n > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+  }
+}
+
+// The only directory a reply file may be in (directly). Fixed, never taken from the environment.
+export const TRUSTED_TMP = '/tmp';
+
+// A shared temp directory is safe only when root-owned, world-writable and sticky (others cannot replace our file).
+export function trustedDirProblem(st) {
+  if (!st.isDirectory()) return 'is not a directory';
+  if (st.uid !== 0) return 'is not owned by root';
+  if ((st.mode & 0o1002) !== 0o1002) return 'is not world-writable with the sticky bit';
+  return null;
+}
+
+// Real path of an open file: /proc on Linux; elsewhere the name's real path, accepted only if it is the same file.
+function fdRealPath(fd, name, st) {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    const real = fs.realpathSync(name);
+    const again = fs.statSync(real);
+    if (again.dev !== st.dev || again.ino !== st.ino) throw new InputError('--owner-message-file changed while it was checked');
+    return real;
+  }
+}
+
+// The owner's reply from a temp file the Agent just wrote. Everything is decided on the opened descriptor: opened
+// without following a final symbolic link and without blocking (a FIFO cannot hang the command), it must be a regular
+// file of this user located directly in the trusted temp directory.
+export function readOwnerMessageFile(file, { trustedDir = TRUSTED_TMP, uid = typeof process.getuid === 'function' ? process.getuid() : null } = {}) {
+  const fail = (err) => new InputError(err.code === 'ELOOP' ? '--owner-message-file is a symbolic link'
+    : `--owner-message-file cannot be read (${err.code || 'error'})`);
+  let trusted;
+  try {
+    trusted = fs.realpathSync(trustedDir);
+    const problem = trustedDirProblem(fs.statSync(trusted));
+    if (problem) throw new InputError(`the temp directory ${trusted} ${problem}`);
+  } catch (err) {
+    if (err instanceof InputError) throw err;
+    throw new InputError(`the temp directory ${trustedDir} cannot be used (${err.code || 'error'})`);
+  }
   let fd;
-  try { fd = fs.openSync(file, 'r'); } catch (err) { throw fail(err); }
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    throw fail(err);
+  }
   try {
     const st = fs.fstatSync(fd);
     if (!st.isFile()) throw new InputError('--owner-message-file is not a regular file');
-    if (st.size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
-    const buf = Buffer.alloc(MAX_OWNER_MESSAGE_BYTES + 1);
-    let n = 0;
-    for (;;) {
-      let r;
-      try { r = fs.readSync(fd, buf, n, buf.length - n, null); } catch (err) { throw fail(err); }
-      if (r === 0) break;
-      n += r;
-      if (n > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    if (uid !== null && st.uid !== uid) throw new InputError('--owner-message-file is not owned by this user');
+    let real;
+    try { real = fdRealPath(fd, file, st); } catch (err) {
+      if (err instanceof InputError) throw err;
+      throw fail(err);
     }
-    return utf8(buf.subarray(0, n), '--owner-message-file');
+    if (path.dirname(real) !== trusted) throw new InputError(`--owner-message-file must be a temp file you wrote, directly in ${trusted}`);
+    if (st.size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    let buf;
+    try {
+      buf = readCapped(fd);
+    } catch (err) {
+      if (err instanceof InputError) throw err;
+      throw fail(err);
+    }
+    return utf8(buf, '--owner-message-file');
   } finally {
     fs.closeSync(fd);
   }

@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
-import { spawn } from 'node:child_process';
-import { main, readAllStdin } from '../src/cli.js';
+import { spawn, spawnSync } from 'node:child_process';
+import { main, readAllStdin, readCapped, readOwnerMessageFile, trustedDirProblem } from '../src/cli.js';
+import crypto from 'node:crypto';
 import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
@@ -388,8 +389,8 @@ test('proposal view keeps the attestation as data and install-requests shows how
   assert.match(s.text(), /confirmed via: card/);
 });
 
-const cliRun = (args, { dataDir, input }) => new Promise((resolve) => {
-  const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), ...args], { env: baseEnv(dataDir) });
+const cliRun = (args, { dataDir, input, env = {} }) => new Promise((resolve) => {
+  const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), ...args], { env: { ...baseEnv(dataDir), ...env } });
   let stdout = '';
   child.stdout.on('data', (c) => { stdout += c; });
   child.on('exit', (code) => resolve({ code, stdout }));
@@ -432,48 +433,6 @@ test('attested_off links the market and Agent pages and never declines', async (
 });
 
 const KB64 = 64 * 1024;
-
-test('CLI: --owner-message-file sends the file verbatim; bad files and mixed text options are usage errors', async (t) => {
-  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
-  t.after(fake.close);
-  const home = tmpHome();
-  const dataDir = path.join(home, 'd');
-  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
-  fake.script('GET', P, { status: 200, json: three() });
-  fake.script('GET', `${A}/install-permission`, PERM);
-  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
-  const reply = '不装 "x" `id` $(id)\nOWNER_REPLY\nrm -rf ~';
-  const file = path.join(home, 'reply.txt');
-  fs.writeFileSync(file, `${reply}\n`);
-  const base = ['decline-install', U(10), '--channel', 'lark'];
-  assert.equal((await cliRun([...base, '--owner-message-file', file], { dataDir })).code, 0);
-  assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, reply);
-  const n = fake.market().length;
-  const big = path.join(home, 'big.txt');
-  fs.writeFileSync(big, 'x'.repeat(KB64 + 1));
-  const bad = path.join(home, 'bad.txt');
-  fs.writeFileSync(bad, Buffer.from([0x79, 0x65, 0x73, 0xff, 0xfe]));
-  for (const [args, re] of [
-    [['--owner-message-file', path.join(home, 'missing.txt')], /cannot be read \(ENOENT\)/],
-    [['--owner-message-file', home], /not a regular file/],
-    [['--owner-message-file', big], /over 65536 bytes/],
-    [['--owner-message-file', bad], /not valid UTF-8/],
-    [['--owner-message-file', file, '--owner-message-text', 'y'], /usage: market-client/],
-    [['--owner-message-file', file, '--owner-message-text-stdin'], /usage: market-client/],
-    [['--owner-message-file', file, '--owner-message-file', file], /usage: market-client/],
-  ]) {
-    const r = await cliRun([...base, ...args], { dataDir, input: 'z' });
-    assert.equal(r.code, 2, args.join(' '));
-    assert.match(r.stdout, re);
-  }
-  fs.writeFileSync(big, 'x'.repeat(KB64));
-  fake.script('GET', P, { status: 200, json: three() });
-  fake.script('GET', `${A}/install-permission`, PERM);
-  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
-  assert.equal((await cliRun([...base, '--owner-message-file', big], { dataDir })).code, 0, 'exactly 64 KiB is accepted');
-  assert.equal(fake.market().filter((q) => q.method === 'POST').at(-1).json.owner_message_text, 'x'.repeat(2000));
-  assert.equal(fake.market().length, n + 3, 'only the accepted file reached the market');
-});
 
 test('CLI: stdin over 64 KiB, not UTF-8, or on a terminal is a usage error and nothing is sent', async (t) => {
   const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
@@ -528,4 +487,133 @@ test('an owner_changed refusal does not tell anyone to install manually', async 
   assert.match(j.message, /made for a previous owner/);
   assert.doesNotMatch(j.message, /Tell them|手动安装|给我装|w\.example/);
   assert.equal('say' in j || 'manual_install' in j, false);
+});
+
+test('the file read loop stops as soon as it passes 64 KiB', () => {
+  let calls = 0;
+  const growing = (fd, buf, off, len) => {
+    calls++;
+    const n = Math.min(16 * 1024, len);
+    buf.fill(0x61, off, off + n);
+    return n;
+  };
+  assert.throws(() => readCapped(3, growing), /over 65536 bytes/);
+  assert.equal(calls, 5);
+  let left = KB64;
+  const exact = (fd, buf, off, len) => {
+    const n = Math.min(left, len, 10_000);
+    left -= n;
+    return n;
+  };
+  assert.equal(readCapped(3, exact).length, KB64);
+});
+
+// A file directly in /tmp, removed after the test.
+function tmpReply(t, content, { suffix = '.txt' } = {}) {
+  const p = path.join('/tmp', `om-mc-reply-${crypto.randomBytes(8).toString('hex')}${suffix}`);
+  if (content !== undefined) fs.writeFileSync(p, content, { flag: 'wx', mode: 0o600 });
+  t.after(() => fs.rmSync(p, { force: true, recursive: true }));
+  return p;
+}
+
+test('CLI: --owner-message-file sends a /tmp file verbatim; bad files and mixed text options are usage errors', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const home = tmpHome();
+  const dataDir = path.join(home, 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  const reply = '不装 "x" `id` $(id)\nOWNER_REPLY\nrm -rf ~';
+  const file = tmpReply(t, `${reply}\n`);
+  const base = ['decline-install', U(10), '--channel', 'lark'];
+  assert.equal((await cliRun([...base, '--owner-message-file', file], { dataDir })).code, 0);
+  assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, reply);
+  const n = fake.market().length;
+  const big = tmpReply(t, 'x'.repeat(KB64 + 1));
+  const bad = tmpReply(t, Buffer.from([0x79, 0x65, 0x73, 0xff, 0xfe]));
+  const dir = tmpReply(t);
+  fs.mkdirSync(dir);
+  for (const [args, re] of [
+    [['--owner-message-file', tmpReply(t)], /cannot be read \(ENOENT\)/],
+    [['--owner-message-file', dir], /not a regular file/],
+    [['--owner-message-file', big], /over 65536 bytes/],
+    [['--owner-message-file', bad], /not valid UTF-8/],
+    [['--owner-message-file', file, '--owner-message-text', 'y'], /usage: market-client/],
+    [['--owner-message-file', file, '--owner-message-text-stdin'], /usage: market-client/],
+    [['--owner-message-file', file, '--owner-message-file', file], /usage: market-client/],
+  ]) {
+    const r = await cliRun([...base, ...args], { dataDir, input: 'z' });
+    assert.equal(r.code, 2, args.join(' '));
+    assert.match(r.stdout, re);
+  }
+  const exact = tmpReply(t, 'x'.repeat(KB64));
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  assert.equal((await cliRun([...base, '--owner-message-file', exact], { dataDir })).code, 0, 'exactly 64 KiB is accepted');
+  assert.equal(fake.market().filter((q) => q.method === 'POST').at(-1).json.owner_message_text, 'x'.repeat(2000));
+  assert.equal(fake.market().length, n + 3, 'only the accepted file reached the market');
+});
+
+test('CLI: --owner-message-file is refused outside /tmp, through a symlink, in a /tmp subdirectory, and TMPDIR changes nothing', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const home = tmpHome();
+  const dataDir = path.join(home, 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  const outside = path.join(ROOT, 'package.json');
+  const link = tmpReply(t);
+  fs.symlinkSync(outside, link);
+  const inHome = path.join(home, 'reply.txt');
+  fs.writeFileSync(inHome, 'yes');
+  const base = ['decline-install', U(10), '--channel', 'lark', '--owner-message-file'];
+  for (const [file, re, env] of [
+    [outside, /must be a temp file you wrote, directly in \/tmp/],
+    [link, /is a symbolic link/],
+    [inHome, /must be a temp file you wrote, directly in \/tmp/],
+    [inHome, /must be a temp file you wrote, directly in \/tmp/, { TMPDIR: home }],
+    [`${home}/../${path.basename(home)}/reply.txt`, /directly in \/tmp/, { TMPDIR: home }],
+  ]) {
+    const r = await cliRun([...base, file], { dataDir, env });
+    assert.equal(r.code, 2, `${file} ${JSON.stringify(env)}`);
+    assert.match(r.stdout, re);
+  }
+  assert.equal(fake.market().length, 0);
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  assert.equal((await cliRun([...base, tmpReply(t, '不装')], { dataDir, env: { TMPDIR: home } })).code, 0, 'a /tmp file works whatever TMPDIR is');
+});
+
+test('reply file checks on the open descriptor: owner, trusted directory', (t) => {
+  const file = tmpReply(t, 'yes');
+  assert.equal(readOwnerMessageFile(file), 'yes');
+  assert.throws(() => readOwnerMessageFile(file, { uid: process.getuid() + 1 }), /not owned by this user/);
+  const notSticky = tmpHome();
+  fs.chmodSync(notSticky, 0o777);
+  fs.writeFileSync(path.join(notSticky, 'r.txt'), 'yes');
+  assert.throws(() => readOwnerMessageFile(path.join(notSticky, 'r.txt'), { trustedDir: notSticky }), /is not owned by root|sticky/);
+  const st = (mode, uid, dir = true) => ({ mode, uid, isDirectory: () => dir });
+  assert.equal(trustedDirProblem(st(0o41777, 0)), null);
+  assert.match(trustedDirProblem(st(0o40777, 0)), /sticky/);
+  assert.match(trustedDirProblem(st(0o41775, 0)), /world-writable/);
+  assert.match(trustedDirProblem(st(0o41777, 1000)), /owned by root/);
+  assert.match(trustedDirProblem(st(0o101777, 0, false)), /not a directory/);
+});
+
+test('CLI: a FIFO as --owner-message-file is refused at once instead of waiting for a writer', async (t) => {
+  const fifo = tmpReply(t, undefined, { suffix: '.fifo' });
+  if (spawnSync('mkfifo', [fifo]).status !== 0) {
+    t.skip('mkfifo is not available');
+    return;
+  }
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig(VALID_ENV, dataDir);
+  const started = Date.now();
+  const r = await cliRun(['decline-install', U(10), '--channel', 'lark', '--owner-message-file', fifo], { dataDir });
+  assert.equal(r.code, 2);
+  assert.match(r.stdout, /not a regular file/);
+  assert.ok(Date.now() - started < 10_000);
 });

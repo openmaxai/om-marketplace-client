@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel DM), the Agent confirms or declines it as `agent_attested`, with
   `--channel workspace|lark|telegram|other`, optional `--channel-detail` and
   the owner's reply as `--owner-message-id` and/or `--owner-message-text`
-  (or `--owner-message-file`, or `--owner-message-text-stdin`; at most
-  64 KiB, a terminal stdin is refused) (at least one). The selection is matched
+  (or `--owner-message-file` with a regular file of this user directly in
+  `/tmp`, or `--owner-message-text-stdin`; at most 64 KiB,
+  a terminal stdin is refused) (at least one). The selection is matched
   against the request's candidates only (numbers or skill ids) and sent with
   the versions the request pinned; the owner comes from `install-permission`.
   Evidence is sent as received; the market cleans and caps it, and the
