@@ -23,11 +23,9 @@ const USAGE = `usage: market-client <command>
   submit-template <file>    submit an expert template manifest (JSON) as a new template (pending review)
   submissions [--json]      submissions made from this Agent
   search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
-  install-permission        who may confirm installs on this Agent
-  request-install <skill>...  propose 1-3 skills (slug or id) for a person to choose from; --reason <text> once, or per skill
+  install-permission        who may confirm installs on this Agent (in the workspace)
+  request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
   install-requests          this Agent's install requests [--state pending_confirmation|confirmed|declined|expired]
-  confirm-install <request> <n|skill_id>...  the owner chose these candidates in this chat; then pull the orders
-  decline-install <request> the owner declined in this chat
 submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
@@ -219,7 +217,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
       opts[k] = k === 'reason' ? [...(opts.reason ?? []), v] : v;
     } else pos.push(rest[i]);
   }
-  const variadic = { search: [0, Infinity], 'request-install': [1, 3], 'confirm-install': [2, 4] }[cmd];
+  const variadic = { search: [0, Infinity], 'request-install': [1, 3] }[cmd];
   const arity = ['status', 'sync', 'submissions', 'install-requests', 'install-permission'].includes(cmd) ? 0
     : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
@@ -244,19 +242,10 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   }
   const logger = createLogger(env.MARKET_CLIENT_LOG_LEVEL || 'warn', { log: (l) => process.stderr.write(`${l}\n`), error: (l) => process.stderr.write(`${l}\n`) });
   if (submit) {
-    // The order a confirmation creates is pulled at once rather than at the next poll.
-    const afterConfirm = async () => {
-      try {
-        const r = await runCommand({ cmd: 'sync', arg: undefined, config, dataDir, logger, waitMs: Math.min(opts.wait, 120) * 1000, print: () => {} });
-        return r.code === EXIT.OK ? `install orders pulled now (${r.message}); see \`market-client status\`` : `the install orders are pulled at the next poll (${r.message})`;
-      } catch (err) {
-        return `the install orders are pulled at the next poll (${err.message})`;
-      }
-    };
     try {
       return SUBMIT_COMMANDS.has(cmd)
         ? await runSubmitCommand(cmd, pos[0], opts, { config, dataDir, print, logger })
-        : await runMarketCommand(cmd, cmd === 'search' ? (pos.length ? [pos.join(' ')] : []) : pos, opts, { config, dataDir, print, logger, afterConfirm });
+        : await runMarketCommand(cmd, cmd === 'search' ? (pos.length ? [pos.join(' ')] : []) : pos, opts, { config, dataDir, print, logger });
     } catch (err) {
       print(`${cmd} failed: ${err.message}`);
       return EXIT.FAILED;

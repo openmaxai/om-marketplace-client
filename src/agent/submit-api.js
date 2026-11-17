@@ -1,6 +1,6 @@
 // Market calls for an Agent submitting a new skill or expert template. Every submission lands as pending review.
 import crypto from 'node:crypto';
-import { MarketError, backoffMs } from '../http.js';
+import { MarketError, backoffMs, marketQuote } from '../http.js';
 import { downloadUrlAllowed } from '../download.js';
 import { isCanonicalUuid } from '../ids.js';
 
@@ -118,7 +118,7 @@ export function explainCommonError(err) {
 
 export function explainOther(err) {
   const x = err.extra ?? {};
-  const tail = x.detail ? `: ${x.detail}` : '';
+  const tail = x.detail ? ` ${marketQuote(x.detail)}` : '';
   if (err.transient) return `${err.message}${tail}; the market did not confirm it. Try again later`;
   return `${err.message}${err.reason ? ` (${err.reason})` : ''}${tail}`;
 }
@@ -136,7 +136,7 @@ export function explainSubmitError(err) {
       if (err.reason === 'existing_template') return 'refused: an expert template with this id already exists. An Agent can only create new templates: change the manifest id or ask a person to publish a new version in the workbench';
       return 'refused: Agent submissions are turned off in this market';
     case 'TEMPLATE_MANIFEST_INVALID':
-      if (x.rule_class) return `manifest refused: unsafe instruction (${x.rule_class})${at}${x.sentence ? `: "${x.sentence}"` : ''}`;
+      if (x.rule_class) return `manifest refused: unsafe instruction (${x.rule_class})${at}${x.sentence ? ` ${marketQuote(x.sentence)}` : ''}`;
       if (err.reason === 'version_not_greater') return `manifest refused: version must be greater than ${x.previous_version ?? 'the existing one'}`;
       return `manifest refused: ${err.reason ?? 'invalid'}${at}${x.rule ? ` (rule ${x.rule})` : ''}`;
     case 'TEMPLATE_REF_INVALID':
@@ -150,7 +150,7 @@ export function explainSubmitError(err) {
       return `package refused by the skill policy: ${err.code}${where ? ` at ${where}` : ''}`;
     }
     case 'VALIDATION_FAILED': {
-      if (err.reason === 'unsafe_instruction') return `refused: unsafe instruction (${x.rule_class ?? 'unknown'})${x.sentence ? `: "${x.sentence}"` : ''}`;
+      if (err.reason === 'unsafe_instruction') return `refused: unsafe instruction (${x.rule_class ?? 'unknown'})${x.sentence ? ` ${marketQuote(x.sentence)}` : ''}`;
       if (err.reason === 'skill_md_name_mismatch') return `refused: SKILL.md name must be ${x.expected_slug ?? 'the skill slug'}`;
       const list = (err.errors ?? []).slice(0, 5).map((e) => `${e?.field ?? 'request'}: ${e?.message ?? 'invalid'}`).join('; ');
       return `refused: validation failed${list ? ` (${list})` : ''}`;

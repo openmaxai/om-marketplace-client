@@ -39,9 +39,11 @@ test('nothing pending: no market call', async (t) => {
   assert.equal(pulled, 0);
 });
 
-test('a card confirmation pulls once; pending stays watched; declined and gone are dropped', async (t) => {
+test('a confirmation pulls once; pending and confirming stay watched; declined, superseded and gone are dropped', async (t) => {
   const s = await setup(t);
-  for (const n of [10, 11, 12, 13]) s.add(n);
+  for (const n of [10, 11, 12, 13, 14, 15]) s.add(n);
+  s.fake.script('GET', `${A}/install-proposals/${U(14)}`, { status: 200, json: view(U(14), 'confirming') });
+  s.fake.script('GET', `${A}/install-proposals/${U(15)}`, { status: 200, json: view(U(15), 'superseded') });
   s.fake.script('GET', `${A}/install-proposals/${U(10)}`, { status: 200, json: view(U(10), 'confirmed') });
   s.fake.script('GET', `${A}/install-proposals/${U(11)}`, { status: 200, json: view(U(11), 'pending_confirmation') });
   s.fake.script('GET', `${A}/install-proposals/${U(12)}`, { status: 200, json: view(U(12), 'declined') });
@@ -49,7 +51,7 @@ test('a card confirmation pulls once; pending stays watched; declined and gone a
   let pulled = 0;
   assert.equal(await s.watch.tick({ onConfirmed: () => { pulled++; } }), 1);
   assert.equal(pulled, 1);
-  assert.deepEqual(s.watched(), [`${U(11)}.json`]);
+  assert.deepEqual(s.watched(), [`${U(11)}.json`, `${U(14)}.json`]);
 });
 
 test('errors back off exponentially up to the cap, then a success resets', async (t) => {

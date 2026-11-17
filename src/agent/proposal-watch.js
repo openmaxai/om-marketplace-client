@@ -32,6 +32,13 @@ export function dropWatch(dataDir, id) {
   try { fs.unlinkSync(fileOf(dataDir, id)); } catch { /* already gone */ }
 }
 
+// Drops the other watched requests of this Agent in this org (a new request supersedes them).
+export function dropWatchesExcept(dataDir, { orgId, agentId, keep }) {
+  for (const w of readWatches(dataDir)) {
+    if (w.org_id === orgId && w.agent_id === agentId && w.proposal_id !== keep) dropWatch(dataDir, w.proposal_id);
+  }
+}
+
 function readWatches(dataDir) {
   let names;
   try { names = fs.readdirSync(watchDir(dataDir)); } catch { return []; }
@@ -66,7 +73,7 @@ export function createProposalWatch({ http, dataDir, logger, now = Date.now }) {
         if (t < (w.next_at ?? 0)) continue;
         try {
           const p = await getProposal({ http, orgId: w.org_id, agentId: w.agent_id, proposalId: w.proposal_id });
-          if (p.state === 'pending_confirmation') {
+          if (p.state === 'pending_confirmation' || p.state === 'confirming') {
             if (w.failures) writeJsonAtomic(fileOf(dataDir, w.proposal_id), { ...w, failures: 0, next_at: 0 });
             continue;
           }

@@ -11,18 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `market-client search`: search the skills listed for the organization.
-- `market-client install-permission`: who may install on this Agent (the
-  owner, org admins) and who may confirm in chat (the owner), with display
-  names when the market gives them.
+- `market-client install-permission`: who may confirm installs on this Agent
+  in the workspace (the owner, org admins), with display names when the
+  market gives them.
 - The service checks each pending install request every ~15 seconds (backing
   off on errors, stopping when it is decided or expires) and pulls the
   install orders as soon as it is confirmed in the workspace.
 - `market-client request-install`: propose 1 to 3 skills for this Agent;
-  nothing is installed until a person chooses and confirms. `install-requests`
-  lists the requests.
-- `market-client confirm-install` / `decline-install`: record the owner's
-  choice given in chat on a non-workspace channel; confirmed orders are
-  pulled at once.
+  nothing is installed until a person (owner or org admin) confirms on the
+  card in the workspace. A new request replaces the pending one; a skill
+  declined in the last 7 days is refused. `install-requests` lists the
+  requests.
 - `market-client submit-skill` and `submit-template`: submit a new skill (a
   directory with `SKILL.md`, packed and checked locally) or a new expert
   template manifest. Submissions land pending review. `--dry-run` runs the
@@ -32,15 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - SKILL.md tells the Agent about the Agent Market: search when a task needs a
-  capability it lacks, propose up to 3 skills, install only with a person's
-  confirmation (the owner's explicit permission in the conversation, then
-  `confirm-install`; nobody else's), and say an org admin must install it
-  when the Agent has no owner; create skills and templates only at the
-  owner's request.
+  capability it lacks, propose up to 3 skills, and send the user to the
+  workspace to confirm (the Agent never confirms); create skills and
+  templates only at the owner's request. User-facing phrasing is given in
+  Chinese.
 - Market problem responses keep the registered fields that explain a refusal
   (`field`, `rule`, `rule_class`, `sentence`, `file`, `skill_md_rule`,
-  `expected_slug`, `queue_limit`, `who_can_install`, ...); they are shown to the Agent, not
-  logged.
+  `expected_slug`, `queue_limit`, ...); they are shown to the Agent, not
+  logged. Text the market echoes back is quoted as market data.
 
 ## [0.7.1] - 2026-11-17
 
