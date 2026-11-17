@@ -1,6 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
-import { EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
+import { ConfigError, EXIT_CONFIG, loadConfig, resolveDataDir } from './config.js';
 import { CLIENT_VERSION } from './version.js';
 import { createLogger } from './logger.js';
 import { createScheduler, POLL_INTERVAL_MS } from './scheduler.js';
@@ -200,6 +200,9 @@ export function createRuntime({
 const LOCK_RETRY_MS = 2000;
 const SPOOL_CHECK_MS = 1000;
 
+// Only a configuration error stops the service under pm2 (exit 78); any other start-up error restarts it.
+const startupExit = (err) => (err instanceof ConfigError ? EXIT_CONFIG : EXIT.FAILED);
+
 // Signal handlers are installed before any state is opened, so a stop request during start-up still releases the lock.
 export async function main({ dataDir } = {}) {
   scrubInstallEnv(process.env, createLogger());
@@ -209,7 +212,7 @@ export async function main({ dataDir } = {}) {
     config = loadConfig(dataDir);
   } catch (err) {
     createLogger().error(`cannot start: ${err.message}`);
-    return EXIT_CONFIG;
+    return startupExit(err);
   }
   const logger = createLogger(config.log_level);
 
@@ -252,7 +255,7 @@ export async function main({ dataDir } = {}) {
       process.off('SIGTERM', onTerm);
       process.off('SIGINT', onInt);
       logger.error(`cannot start: ${err.message}`);
-      return EXIT_CONFIG;
+      return startupExit(err);
     }
   }
   if (stopping) {
