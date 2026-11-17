@@ -175,7 +175,8 @@ the market, do it directly; no confirmation card is needed.
   `version` (e.g. `1.0.0`). No credentials, no `.claude/` directory, no npm
   install hooks or dependencies, no inline commands (`` !` ``) in Markdown.
   The directory must not contain files that may hold credentials (`.env*`,
-  `*.pem`, `*.key`, `id_rsa*`, `.npmrc`, `.netrc`, `credentials*`);
+  `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `.npmrc`, `.netrc`,
+  `.pypirc`, `.git-credentials`, `credentials*`, service-account JSON keys);
   `submit-skill` refuses it and names them.
   Installed files are not executable: have SKILL.md run scripts through
   their interpreter (`bash scripts/run.sh`, `node scripts/run.js`).

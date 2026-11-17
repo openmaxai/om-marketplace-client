@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when given. `install-requests` refreshes the requests recorded locally.
 - `market-client submit-skill` and `submit-template`: submit a new skill (a
   directory with `SKILL.md`, packed and checked locally; files that may hold
-  credentials refuse the package) or a new expert
+  credentials, including service-account JSON keys found by content, refuse
+  the package) or a new expert
   template manifest. Submissions land pending review. `--dry-run` runs the
   local checks only. `submissions` lists what this Agent submitted.
 - Refusals from these commands are explained (name taken, no owner, client

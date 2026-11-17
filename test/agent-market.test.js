@@ -66,7 +66,7 @@ test('install-permission lists who may confirm in the workspace', async (t) => {
   const s = await setup(t);
   const admins = { role: 'org_admins', member_id: null, display_name: null };
   s.fake.script('GET', `${A}/install-permission`,
-    { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'owner', member_id: OWNER, display_name: 'Ana' }, admins], chat_confirm_by: { member_id: OWNER, display_name: 'Ana' }, caller_can_install: false } });
+    { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'owner', member_id: OWNER, display_name: 'Ana' }, admins], caller_can_install: false } });
   assert.equal(await s.run('install-permission'), 0);
   assert.equal(s.text(), `may confirm installs on this Agent, in the workspace: the owner Ana (${OWNER}), org admins`);
 });

@@ -11,8 +11,23 @@ import { validSlug } from '../pkg/frontmatter.js';
 const SKIP = new Set(['.git', '.DS_Store', 'Thumbs.db']);
 // Files that usually hold credentials. Their presence refuses the package instead of being skipped, so the author
 // moves them out knowingly.
-const SECRET_FILE = [/^\.env/i, /\.pem$/i, /\.key$/i, /^id_(rsa|dsa|ecdsa|ed25519)/i, /^\.npmrc$/i, /^\.netrc$/i, /^credentials(\..*)?$/i];
+const SECRET_FILE = [
+  /^\.env/i, /\.pem$/i, /\.key$/i, /\.p12$/i, /\.pfx$/i, /^id_(rsa|dsa|ecdsa|ed25519)/i, /^\.npmrc$/i, /^\.netrc$/i, /^\.pypirc$/i,
+  /^\.git-credentials$/i, /^credentials(\..*)?$/i,
+];
 export const isSecretFile = (name) => SECRET_FILE.some((re) => re.test(name));
+// JSON files up to this size are read to find service-account keys whatever their name.
+const MAX_SCANNED_JSON = 1 << 20;
+
+// A Google Cloud service-account key: a JSON object with type "service_account" and a private_key.
+export function isServiceAccountKey(buf) {
+  try {
+    const v = JSON.parse(buf.toString('utf8'));
+    return v !== null && typeof v === 'object' && v.type === 'service_account' && typeof v.private_key === 'string';
+  } catch {
+    return false;
+  }
+}
 
 export class SubmitError extends Error {
   constructor(code, message) {
@@ -39,7 +54,12 @@ export function listFiles(dir) {
       if (d.isDirectory()) walk(a, r);
       else if (d.isFile() && isSecretFile(d.name)) secrets.push(r);
       else if (d.isFile()) {
-        total += fs.statSync(a).size;
+        const size = fs.statSync(a).size;
+        if (/\.json$/i.test(d.name) && size <= MAX_SCANNED_JSON && isServiceAccountKey(fs.readFileSync(a))) {
+          secrets.push(r);
+          continue;
+        }
+        total += size;
         if (out.length >= MAX_PACKAGE_FILES) throw new SubmitError('too_many_files', `more than ${MAX_PACKAGE_FILES} files`);
         if (total > MAX_PACKAGE_BYTES) throw new SubmitError('too_large', `files exceed ${MAX_PACKAGE_BYTES} bytes`);
         out.push([r, a]);

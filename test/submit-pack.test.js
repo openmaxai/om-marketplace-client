@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
-import { SubmitError, buildZip, isSecretFile, packSkill } from '../src/agent/pack.js';
+import { SubmitError, buildZip, isSecretFile, isServiceAccountKey, packSkill } from '../src/agent/pack.js';
 import { inspectPackage } from '../src/pkg/hygiene.js';
 import { checkManifest, readManifest } from '../src/agent/template.js';
 
@@ -91,4 +91,19 @@ test('files that may hold credentials refuse the package and are all named', () 
   assert.ok(!err.message.includes('notes.md') && !err.message.includes('keys.md'));
   assert.equal(isSecretFile('environment.md'), false);
   assert.equal(isSecretFile('.envrc'), true);
+});
+
+test('certificate bundles, package-index and git credentials, and service-account keys by content are refused', () => {
+  const sa = JSON.stringify({ type: 'service_account', project_id: 'p', private_key: 'fake-key-for-test' });
+  const dir = skillDir({
+    'SKILL.md': SKILL_MD, 'a.p12': 'x', 'b.PFX': 'x', '.pypirc': 'x', '.git-credentials': 'x', 'gcp/deploy.json': sa,
+    'data/config.json': JSON.stringify({ type: 'service_account' }), 'data/list.json': '[1]', 'data/bad.json': '{',
+  });
+  let err;
+  try { packSkill(dir); } catch (e) { err = e; }
+  assert.equal(err?.code, 'secret_file');
+  for (const f of ['a.p12', 'b.PFX', '.pypirc', '.git-credentials', 'gcp/deploy.json']) assert.ok(err.message.includes(f), f);
+  for (const f of ['config.json', 'list.json', 'bad.json']) assert.ok(!err.message.includes(f), f);
+  assert.equal(isServiceAccountKey(Buffer.from(sa)), true);
+  assert.equal(isServiceAccountKey(Buffer.from('{"type":"service_account"}')), false);
 });

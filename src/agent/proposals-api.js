@@ -71,7 +71,7 @@ export function proposalView(v) {
     created_at: clean(v.created_at, 40),
     expires_at: clean(v.expires_at, 40),
     decided_at: clean(v.decided_at, 40),
-    confirmed_via: v.confirmed_via === 'card' || v.confirmed_via === 'chat' ? v.confirmed_via : null,
+    confirmed_via: v.confirmed_via === 'card' ? 'card' : null,
     confirm_url: confirmUrl(v.confirm_url),
   };
 }
