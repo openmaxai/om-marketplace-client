@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-18
+
+### Added
+- `market-client confirm-install <proposal_id> (all | <n|slug|skill_id> ...)`
+  and `decline-install <proposal_id>`: when the Agent's owner replies to an
+  install request in a direct conversation with the Agent (Workspace or a
+  channel DM), the Agent confirms or declines it as `agent_attested`, with
+  `--channel workspace|lark|telegram|other`, optional `--channel-detail` and
+  the owner's reply as `--owner-message-id` and/or `--owner-message-text`
+  (at least one). The selection is matched against the request's candidates
+  only and sent with the versions the request pinned; the owner comes from
+  `install-permission`. Text is cleaned and capped as the market does.
+  Channel, evidence, selection and a missing owner are checked before
+  anything is sent. A confirmed request stays watched so its orders are
+  pulled within seconds; a declined one is no longer watched.
+- Messages for `AGENT_ATTESTATION_REFUSED` (`not_owner`, `owner_changed`),
+  `INSTALL_PROPOSAL_STALE`, `INSTALL_PROPOSAL_NOT_PENDING` and
+  `VALIDATION_FAILED` fields.
+
+### Changed
+- `request-install` and `install-requests` number the candidates (1 to 3)
+  with name and a one-line purpose; `request-install` prints a ready
+  proposal for the owner (`owner_prompt` in `--json`).
+  `install-requests` shows how a request was confirmed (`card` or
+  `agent_attested` with the channel and the owner's message).
+- `AGENT_CONFIRM_DISABLED` now means a client bug (wrong `confirmed_via`):
+  report it, do not retry. `AGENT_OWNER_REQUIRED` on install requests says
+  only an org admin can install, on the confirm link.
+- SKILL.md: the Agent proposes in its owner's conversation with numbered
+  candidates and reply options, acts only on its owner's own reply in a
+  direct conversation (never a group chat or another member), quotes that
+  reply verbatim, sends anyone else to the confirm link, and reports what
+  was installed and what was not selected.
+
 ## [0.8.0] - 2026-11-17
 
 ### Added

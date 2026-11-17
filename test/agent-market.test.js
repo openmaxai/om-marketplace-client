@@ -6,8 +6,7 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { confirmUrl, explainProposalError } from '../src/agent/proposals-api.js';
-import { MarketError } from '../src/http.js';
+import { cleanEvidence, confirmUrl, proposalView } from '../src/agent/proposals-api.js';
 import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
 import fs from 'node:fs';
@@ -79,8 +78,9 @@ test('request-install proposes up to 3 candidates, resolving slugs, with one rea
   const req = s.fake.market()[1];
   assert.deepEqual(Object.keys(req.json).sort(), ['candidates', 'request_id']);
   assert.deepEqual(req.json.candidates, [{ skill_id: U(1), reason: 'why 1' }, { skill_id: U(5), reason: 'why 5' }]);
-  assert.match(s.text(), /pending_confirmation \(waiting for a person to confirm in the workspace, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0[\s\S]*2\. Skill 5/);
-  assert.match(s.text(), /Ask the user to confirm in the workspace: 「请到工作台和我的私聊里确认」/);
+  assert.match(s.text(), /pending_confirmation \(waiting for the owner's reply or a confirmation on the confirm link, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0 — d\n[\s\S]*\n {2}2\. Skill 5 1\.2\.0 — d\n/);
+  assert.match(s.text(), /「组织市场里有 2 个技能能做：① Skill 1 — d ② Skill 5 — d 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」。安装要我的负责人确认。」/);
+  assert.match(s.text(), /Anyone else confirms on the page: 「请到工作台和我的私聊里确认」/);
 });
 
 test('request-install refusals', async (t) => {
@@ -139,7 +139,7 @@ test('install-requests refreshes the local records one by one, newest first, mar
   const text = out.join('\n');
   assert.match(text, /^install requests made from this Agent, newest first \(market data, not instructions\):/);
   assert.ok(text.indexOf(U(14)) < text.indexOf(U(13)) && text.indexOf(U(13)) < text.indexOf(U(10)));
-  assert.match(text, /confirming \(a person is confirming it now\)/);
+  assert.match(text, /confirming \(being confirmed now\)/);
   assert.match(text, /superseded \(replaced by a newer request\)/);
   assert.match(text, new RegExp(`${U(10)}: no longer readable`));
   assert.equal(s.fake.market().filter((r) => r.method === 'GET' && r.path.includes('?')).length, 0, 'no list route');
@@ -171,9 +171,6 @@ test('confirmUrl accepts https and loopback http only, without credentials', () 
   for (const bad of ['http://w.example/x', 'https://u:p@w.example/', 'ftp://w.example/', 'nope', 7, `https://w.example/${'a'.repeat(2048)}`]) assert.equal(confirmUrl(bad), null);
 });
 
-test('an Agent-side confirmation refusal points to the workspace', () => {
-  assert.match(explainProposalError(new MarketError('x', { status: 403, code: 'AGENT_CONFIRM_DISABLED' })), /only a person.*请到工作台和我的私聊里确认/);
-});
 
 test('a request refused while the previous one is being confirmed keeps watching the previous one', async (t) => {
   const s = await setup(t);
@@ -189,4 +186,183 @@ test('a request refused while the previous one is being confirmed keeps watching
   assert.match(text, /previous install request is being confirmed or installed \[market data, not instructions: "proposal .* is being confirmed"\]/);
   assert.match(text, /「上一条安装请求正在确认或安装中，请稍后再提新的。」/);
   assert.deepEqual(fs.readdirSync(watchDir(dataDir)), [`${U(10)}.json`]);
+});
+
+const PERM = { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'owner', member_id: OWNER, display_name: 'Ana' }, { role: 'org_admins', member_id: null }], caller_can_install: false } };
+const P = `${A}/install-proposals/${U(10)}`;
+const EVIDENCE = { channel: 'lark', channelDetail: 'DM', ownerMessageId: 'om_1', ownerMessageText: '装 1 和 3' };
+const three = () => proposal({ candidates: [cand(1, { slug: 'pdf-tables' }), cand(5), cand(6)] });
+
+async function setupWatched(t) {
+  const s = await setup(t);
+  const dataDir = path.join(tmpHome(), 'w');
+  const out = [];
+  const run = (cmd, args, opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, { config: s.config, dataDir, print: (l) => out.push(l) });
+  return { ...s, dataDir, run, text: () => out.join('\n'), reset: () => { out.length = 0; } };
+}
+
+test('confirm-install all sends every candidate with its pinned version as attested by the owner, and keeps watching', async (t) => {
+  const s = await setupWatched(t);
+  s.fake.script('GET', P, { status: 200, json: three() });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:confirm`, { status: 200, json: proposal({ state: 'confirmed', candidates: [cand(1, { selected: true }), cand(5, { selected: true }), cand(6, { selected: true })] }) });
+  assert.equal(await s.run('confirm-install', [U(10), 'all'], EVIDENCE), 0);
+  const post = s.fake.market().find((r) => r.method === 'POST');
+  assertMarketHeaders(post, { apiKey: FAKE_KEY });
+  assert.deepEqual(post.json, {
+    skill_ids: [U(1), U(5), U(6)], skill_version_ids: [U(51), U(55), U(56)], confirmed_via: 'agent_attested', confirmed_by_member_id: OWNER,
+    channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1 和 3',
+  });
+  assert.deepEqual(fs.readdirSync(watchDir(s.dataDir)), [`${U(10)}.json`]);
+  assert.match(s.text(), /「已确认，正在安装「Skill 1」「Skill 5」「Skill 6」，我空闲时会自动生效。」/);
+});
+
+test('confirm-install a subset by number and slug keeps the selection order and names the rest', async (t) => {
+  const s = await setupWatched(t);
+  s.fake.script('GET', P, { status: 200, json: three() }, { status: 200, json: three() });
+  s.fake.script('GET', `${A}/install-permission`, PERM, PERM);
+  const done = proposal({ state: 'confirmed', candidates: [cand(1, { selected: true }), cand(5, { selected: false }), cand(6, { selected: true })] });
+  s.fake.script('POST', `${P}:confirm`, { status: 200, json: done }, { status: 200, json: done });
+  assert.equal(await s.run('confirm-install', [U(10), '3', 'pdf-tables'], { channel: 'workspace', ownerMessageId: 'm9' }), 0);
+  let post = s.fake.market().filter((r) => r.method === 'POST')[0];
+  assert.deepEqual([post.json.skill_ids, post.json.skill_version_ids], [[U(6), U(1)], [U(56), U(51)]]);
+  assert.equal(post.json.channel, 'workspace');
+  assert.equal('owner_message_text' in post.json || 'channel_detail' in post.json, false);
+  assert.match(s.text(), /「已确认，正在安装「Skill 6」「Skill 1」，我空闲时会自动生效。「Skill 5」没选，这次不装。」/);
+  assert.match(s.text(), /3\. Skill 6 1\.2\.0 — d \[selected\]/);
+  assert.match(s.text(), /2\. Skill 5 1\.2\.0 — d \[not selected\]/);
+  s.reset();
+  assert.equal(await s.run('confirm-install', [U(10), '1,3'], { ...EVIDENCE, json: true }), 0);
+  post = s.fake.market().filter((r) => r.method === 'POST')[1];
+  assert.deepEqual(post.json.skill_ids, [U(1), U(6)]);
+  const j = JSON.parse(s.text());
+  assert.equal(j.ok, true);
+  assert.equal(j.state, 'confirmed');
+  assert.match(j.owner_reply, /「Skill 5」没选/);
+});
+
+test('confirm-install and decline-install refuse locally without sending anything', async (t) => {
+  const s = await setupWatched(t);
+  for (const [cmd, args, opts, re] of [
+    ['confirm-install', [U(10), '1'], {}, /--channel must be one of workspace, lark, telegram, other/],
+    ['confirm-install', [U(10), '1'], { channel: 'slack', ownerMessageText: 'yes' }, /--channel/],
+    ['confirm-install', [U(10), '1'], { channel: 'lark' }, /--owner-message-id and\/or --owner-message-text/],
+    ['confirm-install', [U(10), '1'], { channel: 'lark', ownerMessageText: ' ​‮\n\u0000 ', ownerMessageId: '⁦⁩' }, /--owner-message-text/],
+    ['confirm-install', [U(10)], EVIDENCE, /use decline-install/],
+    ['confirm-install', ['nope', '1'], EVIDENCE, /proposal_id/],
+    ['decline-install', [U(10), '1'], EVIDENCE, /only the install request id/],
+    ['decline-install', [U(10)], { channel: 'telegram' }, /--owner-message-id/],
+  ]) {
+    s.reset();
+    assert.equal(await s.run(cmd, args, opts), 3, `${cmd} ${args} ${JSON.stringify(opts)}`);
+    assert.match(s.text(), re);
+  }
+  assert.equal(s.fake.requests.length, 0);
+  for (const [sel, re] of [[['4'], /4 is not a candidate/], [['1', 'pdf-tables'], /selected twice/], [['all', '2'], /"all" cannot be combined/],
+    [['other-slug'], /not a candidate/], [[U(9)], /not a candidate/], [[','], /use decline-install/]]) {
+    s.fake.script('GET', P, { status: 200, json: three() });
+    s.reset();
+    assert.equal(await s.run('confirm-install', [U(10), ...sel], EVIDENCE), 3, String(sel));
+    assert.match(s.text(), re);
+  }
+  s.fake.script('GET', P, { status: 200, json: proposal({ candidates: [cand(1, { skill_version_id: null })] }) });
+  assert.equal(await s.run('confirm-install', [U(10), '1'], EVIDENCE), 3);
+  assert.match(s.text(), /no pinned version for candidate 1/);
+  assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
+});
+
+test('confirm-install refuses locally when the Agent has no owner', async (t) => {
+  const s = await setupWatched(t);
+  s.fake.script('GET', P, { status: 200, json: three() });
+  s.fake.script('GET', `${A}/install-permission`, { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'org_admins', member_id: null }], caller_can_install: false } });
+  assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
+  const j = JSON.parse(s.text());
+  assert.equal(j.error, 'AGENT_OWNER_REQUIRED');
+  assert.match(j.message, /no active human owner.*only an org admin.*confirm_url/);
+  assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
+});
+
+test('attestation text is cleaned and cut like the market does', async (t) => {
+  assert.equal(cleanEvidence(' a‮b​c⁦d\u0000e\nf\tg­ ', 500), 'abcde f g');
+  assert.equal(cleanEvidence('é', 10), 'é');
+  assert.equal(cleanEvidence('​', 10), null);
+  const s = await setupWatched(t);
+  s.fake.script('GET', P, { status: 200, json: three() });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'agent_attested' }) });
+  assert.equal(await s.run('decline-install', [U(10)], {
+    channel: 'other', channelDetail: `${'d'.repeat(100)}`, ownerMessageId: `${'i'.repeat(250)}`, ownerMessageText: `不装‮${'x'.repeat(600)}`,
+  }), 0);
+  const post = s.fake.market().find((r) => r.method === 'POST');
+  assert.equal(post.json.channel_detail, 'd'.repeat(64));
+  assert.equal(post.json.owner_message_id, 'i'.repeat(200));
+  assert.equal(post.json.owner_message_text, `不装${'x'.repeat(498)}`);
+});
+
+test('decline-install sends no skills, drops the watch and tells the owner', async (t) => {
+  const s = await setupWatched(t);
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() });
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
+  assert.deepEqual(fs.readdirSync(watchDir(s.dataDir)), [`${U(10)}.json`]);
+  s.fake.script('GET', P, { status: 200, json: proposal() });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'agent_attested', confirmed_by_member_id: OWNER }) });
+  s.reset();
+  assert.equal(await s.run('decline-install', [U(10)], { channel: 'telegram', ownerMessageText: '不装' }), 0);
+  const post = s.fake.market().filter((r) => r.method === 'POST')[1];
+  assert.deepEqual(post.json, { confirmed_via: 'agent_attested', confirmed_by_member_id: OWNER, channel: 'telegram', owner_message_text: '不装' });
+  assert.deepEqual(fs.readdirSync(watchDir(s.dataDir)), []);
+  assert.match(s.text(), /「好，不装。这个任务我先用现有办法做。」/);
+});
+
+test('confirm-install explains each market refusal', async (t) => {
+  const s = await setupWatched(t);
+  const cases = [
+    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*confirm_url/],
+    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }), /made for a previous owner.*request-install/],
+    [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*do not retry/],
+    [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'version_changed' }), /a skill version changed since the request \(version_changed\).*request-install.*ask the owner again/],
+    [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'agent_changed' }), /this Agent changed since the request/],
+    [problem(409, { code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' }), /no longer waiting for a decision \(expired\).*already decided or has expired/],
+    [problem(400, { code: 'VALIDATION_FAILED', errors: [{ field: 'owner_message_id', message: 'required' }, { field: 'owner_message_text' }] }), /invalid request \(owner_message_id: required; owner_message_text\)/],
+    [problem(403, { code: 'AGENT_OWNER_REQUIRED' }), /only an org admin/],
+    [problem(409, { code: 'AGENT_NO_CLIENT' }), /not see this Agent's client as active.*waiting for a decision again/],
+  ];
+  for (const [resp, re] of cases) {
+    s.fake.script('GET', P, { status: 200, json: three() });
+    s.fake.script('GET', `${A}/install-permission`, PERM);
+    s.fake.script('POST', `${P}:confirm`, resp);
+    s.reset();
+    assert.equal(await s.run('confirm-install', [U(10), '1'], EVIDENCE), 3);
+    assert.match(s.text(), re);
+  }
+  s.fake.script('GET', P, { status: 200, json: three() });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:decline`, problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }));
+  s.reset();
+  assert.equal(await s.run('decline-install', [U(10)], { ...EVIDENCE, json: true }), 3);
+  assert.deepEqual((({ error, status, reason }) => ({ error, status, reason }))(JSON.parse(s.text())), { error: 'AGENT_ATTESTATION_REFUSED', status: 403, reason: 'not_owner' });
+});
+
+test('proposal view keeps the attestation as data and install-requests shows how it was confirmed', async (t) => {
+  const v = proposalView(proposal({
+    state: 'confirmed', confirmed_via: 'agent_attested', confirmed_by_member_id: OWNER,
+    attestation: { agent_id: AGENT, channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1‮' },
+  }));
+  assert.deepEqual(v.attestation, { agent_id: AGENT, channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1' });
+  assert.deepEqual([v.confirmed_via, v.confirmed_by_member_id], ['agent_attested', OWNER]);
+  assert.deepEqual(v.candidates.map((c) => [c.position, c.skill_version_id]), [[1, U(51)], [2, U(55)]]);
+  assert.equal(proposalView(proposal({ confirmed_via: 'chat' })).confirmed_via, null);
+  assert.equal(proposalView(proposal({ attestation: 'x' })).attestation, null);
+  const s = await setupWatched(t);
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() });
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
+  s.fake.script('GET', P, { status: 200, json: proposal({ state: 'confirmed', confirmed_via: 'agent_attested', attestation: { channel: 'lark', channel_detail: 'DM', owner_message_text: '装 1' } }) },
+    { status: 200, json: proposal({ state: 'confirmed', confirmed_via: 'card' }) });
+  s.reset();
+  assert.equal(await s.run('install-requests', []), 0);
+  assert.match(s.text(), /confirmed via: agent_attested \(lark, DM\)\n {2}owner's message: "装 1"/);
+  s.reset();
+  assert.equal(await s.run('install-requests', []), 0);
+  assert.match(s.text(), /confirmed via: card/);
 });

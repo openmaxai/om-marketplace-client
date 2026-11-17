@@ -28,6 +28,10 @@ const USAGE = `usage: market-client <command>
   install-permission        who may confirm installs on this Agent (in the workspace)
   request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
   install-requests          install requests made from this Agent, refreshed from the market [--state <state>]
+  confirm-install <proposal_id> (all | <n|slug|skill_id>...)  install what your owner chose in a direct conversation with you
+  decline-install <proposal_id>  record that your owner declined
+    both: --channel workspace|lark|telegram|other [--channel-detail <text>]
+    --owner-message-id <id> and/or --owner-message-text <the owner's reply, verbatim>
 submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
@@ -205,6 +209,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
   const VALUE_OPTS = {
     '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+    '--channel': 'channel', '--channel-detail': 'channelDetail', '--owner-message-id': 'ownerMessageId', '--owner-message-text': 'ownerMessageText',
   };
   const submit = AGENT_COMMANDS.has(cmd);
   const pos = [];
@@ -220,7 +225,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
       opts[k] = k === 'reason' ? [...(opts.reason ?? []), v] : v;
     } else pos.push(rest[i]);
   }
-  const variadic = { search: [0, Infinity], 'request-install': [1, 3] }[cmd];
+  const variadic = { search: [0, Infinity], 'request-install': [1, 3], 'confirm-install': [2, 1 + 3] }[cmd];
   const arity = ['status', 'sync', 'start', 'submissions', 'install-requests', 'install-permission'].includes(cmd) ? 0
     : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
