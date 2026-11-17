@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { domainToASCII } from 'node:url';
 import { looksLikeSecret } from '../secretscan.js';
 import { credentialRequest } from './credential.js';
-import { TRUNCATION_SUFFIX, withinLimits } from './limits.js';
+import { MAX_FALLBACK_BYTES, TRUNCATION_SUFFIX, utf8Bytes, withinLimits } from './limits.js';
 
 export const PREFIX = '｜ ';
 export const END_LINE = '（以上为模板作者提供的内容）';
@@ -223,4 +223,33 @@ export function fitContent(clean, limits = {}) {
     else hi = mid - 1;
   }
   return cut(lo);
+}
+
+// The leading part of text that fits maxBytes UTF-8 bytes together with TRUNCATION_SUFFIX, cut at a character
+// (grapheme) boundary and with links removed after the cut, then the suffix; text itself when it fits.
+export function cutToBytes(text, maxBytes) {
+  if (utf8Bytes(text) <= maxBytes) return text;
+  const room = maxBytes - utf8Bytes(TRUNCATION_SUFFIX);
+  if (room < 0) return '';
+  const chars = graphemes(text);
+  let bytes = 0;
+  let n = 0;
+  while (n < chars.length && bytes + utf8Bytes(chars[n]) <= room) bytes += utf8Bytes(chars[n++]);
+  // LINK_REMOVED can be longer than the link it replaces, so the cut is measured again after the links are removed.
+  for (; n >= 0; n--) {
+    const kept = trimEnd(linkFree(trimEnd(markerSafeCut(chars, n))));
+    if (utf8Bytes(kept) <= room) return kept + TRUNCATION_SUFFIX;
+  }
+  return TRUNCATION_SUFFIX;
+}
+
+// The fallback text of the starter message rendered from clean for addressee: the whole message when it is at most
+// maxFallbackBytes, otherwise the message with first_guide cut as fitContent cuts it for that size; when even that
+// does not fit, the message itself cut to the size. The result is always within maxFallbackBytes.
+export function fitFallback(clean, addressee, { maxFallbackBytes = MAX_FALLBACK_BYTES } = {}) {
+  const text = renderStarter({ ...clean, addressee });
+  if (utf8Bytes(text) <= maxFallbackBytes) return text;
+  const fitted = fitContent(clean, { maxBodyBytes: maxFallbackBytes });
+  const short = fitted && renderStarter({ ...fitted, addressee });
+  return short && utf8Bytes(short) <= maxFallbackBytes ? short : cutToBytes(text, maxFallbackBytes);
 }

@@ -213,10 +213,11 @@ export function validateConfig(obj) {
   if (obj.storage_emulator_origin != null) config.storage_emulator_origin = emulatorOrigin(obj.storage_emulator_origin, config.bff_url);
   if (obj.starter_message != null) {
     const sm = obj.starter_message;
-    if (typeof sm !== 'object' || Array.isArray(sm) || Object.keys(sm).some((k) => k !== 'enabled') || typeof (sm.enabled ?? true) !== 'boolean') {
-      throw new ConfigError('config.json starter_message must be {"enabled": true|false}');
+    if (typeof sm !== 'object' || Array.isArray(sm) || Object.keys(sm).some((k) => k !== 'enabled' && k !== 'structured')
+      || typeof (sm.enabled ?? true) !== 'boolean' || typeof (sm.structured ?? true) !== 'boolean') {
+      throw new ConfigError('config.json starter_message must be {"enabled": true|false, "structured": true|false}');
     }
-    config.starter_message = { enabled: sm.enabled !== false };
+    config.starter_message = { enabled: sm.enabled !== false, structured: sm.structured !== false };
   }
   return config;
 }

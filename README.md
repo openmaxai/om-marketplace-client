@@ -110,7 +110,7 @@ write into a directory that is accessible by group or other.
 | `orgs` | `{"<org_id>": {"member_id": "<id>"}}`: further orgs whose orders this Agent executes. Post-install adds the other enabled orgs of the openmax component config when the primary org is one of them. `member_id` may be left out; it is then read from the org-scoped token. Orders from an org not listed are not executed and are reported as `org_not_configured`. Edit by hand, then restart the service; post-install keeps the map. |
 | `log_level` | `debug`, `info` (default), `warn` or `error`. |
 | `storage_emulator_origin` | Development only; accepted only with a loopback `bff_url`. |
-| `starter_message` | `{"enabled": false}` stops this Agent from sending starter messages (default: enabled). Restart the service after changing it. |
+| `starter_message` | `{"enabled": false}` stops this Agent from sending starter messages (default: enabled). `{"structured": false}` sends them as plain text (`AGENT_TEXT`, as before 0.7.0) instead of the welcome card (default: true). Restart the service after changing it. |
 
 ## Commands
 
@@ -258,9 +258,11 @@ still waiting is dropped.
 
 
 After the market accepted the first write of an adopted expert template whose
-order carries `starter_message`, the client sends the adopter one plain-text
-welcome message from this Agent's own OpenMax IM account. The template text
-never reaches the model.
+order carries `starter_message`, the client sends the adopter one welcome
+message from this Agent's own OpenMax IM account. The template text never
+reaches the model. With openmax 2.32.0 or later it is sent as the welcome card
+(see step 6); the web chat draws the card from the template, and the message
+text is shown wherever the card is not.
 
 When the Agent has been idle for 30 seconds with no open OpenMax turn at that
 moment, the client asks for a new session at once (see
@@ -309,9 +311,24 @@ handled at once, as below. The claim always comes right before the send.
    changed DM or any failing step means no send and `send_failed`, and so does
    a check that ends 9 minutes or more after the claim (`too_late`), so no send
    can still run when the market's 10-minute grace ends.
-6. One `comm.send`, plain text, no mentions, never retried. A refused send is
-   `send_failed`. A send whose outcome is unknown (timeout, server error) is
-   not reported at all, so it is not counted as failed.
+6. One `comm.send`, no mentions. With openmax 2.32.0 or later
+   (`OPENMAX_STRUCTURED_MIN_VERSION`) and `starter_message.structured` not
+   `false`, the pre-built body is `type: AGENT_STRUCTURED` with the same text
+   in `content.body.text`, `metadata: {market_starter_tasks: {schema:
+   "market.starter-tasks.v1", adoption_id}}` and `fallback_text`, and the
+   client message id is `mkt-starter-<adoption_id>`. The openmax CLI sends a
+   pre-built body as given (since 2.18) without checking metadata or the
+   fallback text, so the client refuses the reserved metadata keys and a
+   fallback text over 8192 bytes itself. When that send is refused for
+   certain (an HTTP 4xx other than 408 and 429, or the client's own refusal),
+   the refusal is logged and the message is sent once more as plain text
+   (`AGENT_TEXT`, id `mkt-starter-<adoption_id>-text`), if that can still
+   start within the 9-minute deadline. Otherwise, and on an older or
+   unreadable openmax version, it is sent as plain text (`AGENT_TEXT`, id
+   `cmsg_<uuidv7>`) exactly as before 0.7.0. No other send is retried. A
+   refused send is `send_failed`. A send whose outcome is unknown (timeout,
+   server error, unreadable output) is not reported at all, so it is not
+   counted as failed.
 7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
    A `send_failed` or `rejected_content` result is logged with a short reason
    code (`dm_check_<failure>` such as `dm_check_unreadable_output`,
@@ -336,11 +353,15 @@ send; the card covers it.
 
 Size limits (`src/starter/limits.js`, UTF-8 bytes): the message body at most
 16384, any fallback text at most 8192; the IM service refuses a larger message
-rather than cutting it. Both are checked before the claim, with room for the
+rather than cutting it. The fallback text of the welcome card is the whole
+message when it fits 8192 bytes; otherwise its first guide is cut for that
+size as described below (the tasks are kept), and if even that does not fit,
+the message itself is cut at a character boundary and ends with the same
+suffix. Both are checked before the claim, with room for the
 longest adopter name. When the message is too large, the first guide is cut at
 a character boundary and ends with `…（完整内容见 Agent 详情）`; when it still
 does not fit, nothing is claimed. The message never carries the reserved
-metadata keys `agent_run` and `cap_notice`.
+metadata keys `agent_run`, `cap_notice` and `context`.
 
 The credential rules mirror the market's `internal/domain/credentialask.go`.
 `test/fixtures/credential_requests.tsv` is the market's

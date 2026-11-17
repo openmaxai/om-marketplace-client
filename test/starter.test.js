@@ -6,7 +6,7 @@ import {
 } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
-import { MAX_BODY_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
+import { MAX_BODY_BYTES, MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 import { WELCOME_HOLD_MS } from '../src/activation.js';
 
 const ADOPTION = U(21);
@@ -29,7 +29,12 @@ const marked = (result) => ({
 });
 
 // Fake IM recording every call in order; members, conv and failures are set per test.
-function fakeIm({ available = true, conv = { id: CONV, type: 'DM' }, members, sendError = null, dmError = null, busy = () => false, noRun = false } = {}) {
+// structured: the openmax supports the AGENT_STRUCTURED send; structuredError fails it (a function is called with the
+// send and may throw).
+function fakeIm({
+  available = true, conv = { id: CONV, type: 'DM' }, members, sendError = null, dmError = null, busy = () => false, noRun = false,
+  structured = false, structuredError = null,
+} = {}) {
   const calls = [];
   const list = members ?? [{ member_id: AGENT, display_name: 'Agent' }, { member_id: ADOPTER, display_name: '张三' }];
   return {
@@ -39,18 +44,27 @@ function fakeIm({ available = true, conv = { id: CONV, type: 'DM' }, members, se
     async getConversation(p) { calls.push(['get_conversation', p]); return conv; },
     async memberList(p) { calls.push(['member_list', p]); return list; },
     async sendText(p) { calls.push(['send', p]); if (sendError) throw sendError; return { id: 'm1' }; },
+    async sendStructured(p) {
+      calls.push(['send_structured', p]);
+      if (typeof structuredError === 'function') structuredError(p);
+      else if (structuredError) throw structuredError;
+      return { id: 'm1' };
+    },
     supportsNoRun: () => noRun,
+    supportsStructured: () => structured,
     async runInProgress(p) { calls.push(['run_check', p]); const b = busy(); if (b instanceof Error) throw b; return b; },
   };
 }
 
-async function setup(t, { im = fakeIm(), content = CONTENT, enabled = true, claim = [claimed()], mark = [], fromOrder } = {}) {
+async function setup(t, { im = fakeIm(), content = CONTENT, enabled = true, claim = [claimed()], mark = [], fromOrder, structured } = {}) {
   const h = await pullHarness(t);
   if (claim.length) h.fake.script('POST', CLAIM, ...claim);
   if (mark.length) h.fake.script('POST', MARK, ...mark);
   const contentCalls = [];
   const source = fromOrder === undefined ? { content: async (job) => { contentCalls.push(job.adoption_id); return content; } } : {};
-  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, enabled, now: h.now, ...source });
+  const starter = createStarter({
+    api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, enabled, now: h.now, ...source, ...(structured === undefined ? {} : { structured }),
+  });
   starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, ...(fromOrder === undefined ? {} : { content: fromOrder }) });
   const market = () => h.fake.market().map((r) => [r.path.slice(B.length), r.json]);
   return { ...h, im, starter, market, contentCalls, jobs: () => h.state.read('starters', {}) };
@@ -623,4 +637,137 @@ test('a starter message without a hold is claimed and sent in the same round as 
   await s.starter.runAll();
   assert.deepEqual(s.market().map(([p]) => p), [':claim-starter', ':mark-starter-shown']);
   assert.equal(s.jobs()[ADOPTION], undefined);
+});
+
+const structuredSends = (im) => im.calls.filter(([c]) => c === 'send_structured');
+
+test('structured: one AGENT_STRUCTURED send with client_msg_id mkt-starter-<adoption id>, the same text and noRun, marked sent', async (t) => {
+  const s = await setup(t, { im: fakeIm({ structured: true, noRun: true }), mark: [marked('sent')] });
+  await s.starter.runAll();
+  assert.equal(sends(s.im).length, 0);
+  assert.equal(structuredSends(s.im).length, 1);
+  const sent = structuredSends(s.im)[0][1];
+  const text = renderStarter({ ...cleanContent({ ...CONTENT, addressee: '张三' }) });
+  assert.deepEqual(sent, {
+    orgId: ORG, conversationId: CONV, text, noRun: true, clientMsgId: `mkt-starter-${ADOPTION}`, adoptionId: ADOPTION, fallbackText: text,
+  });
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('structured: noRun follows the openmax as before; without noRun the run state is still checked first', async (t) => {
+  const s = await setup(t, { im: fakeIm({ structured: true, noRun: false }), mark: [marked('sent')] });
+  await s.starter.runAll();
+  assert.ok(s.im.calls.some(([c]) => c === 'run_check'));
+  assert.equal(structuredSends(s.im)[0][1].noRun, false);
+});
+
+test('structured: a message over the fallback limit keeps its whole text and gets a cut fallback text', async (t) => {
+  const content = { ...CONTENT, firstGuide: '中'.repeat(10) + '😀'.repeat(1990) };
+  const s = await setup(t, { im: fakeIm({ structured: true, noRun: true }), content, mark: [marked('sent')] });
+  await s.starter.runAll();
+  const { text, fallbackText } = structuredSends(s.im)[0][1];
+  assert.ok(utf8Bytes(text) > MAX_FALLBACK_BYTES);
+  assert.equal(text, renderStarter({ ...cleanContent({ ...content, addressee: '张三' }) }));
+  assert.ok(utf8Bytes(fallbackText) <= MAX_FALLBACK_BYTES, String(utf8Bytes(fallbackText)));
+  assert.ok(fallbackText.isWellFormed());
+  assert.ok(fallbackText.includes(TRUNCATION_SUFFIX));
+  assert.equal(fallbackText.split('\n').at(-1), END_LINE);
+});
+
+test('starter_message.structured false: AGENT_TEXT with a cmsg_ id even when openmax supports the structured send', async (t) => {
+  const s = await setup(t, { im: fakeIm({ structured: true, noRun: true }), structured: false, mark: [marked('sent')] });
+  await s.starter.runAll();
+  assert.equal(structuredSends(s.im).length, 0);
+  assert.equal(sends(s.im).length, 1);
+  assert.match(sends(s.im)[0][1].clientMsgId, /^cmsg_/);
+  assert.equal(sends(s.im)[0][1].noRun, true);
+});
+
+test('an openmax without the structured send: AGENT_TEXT with a cmsg_ id, as in 0.6.1', async (t) => {
+  const s = await setup(t, { im: fakeIm({ structured: false }), mark: [marked('sent')] });
+  await s.starter.runAll();
+  assert.equal(structuredSends(s.im).length, 0);
+  assert.deepEqual(Object.keys(sends(s.im)[0][1]).sort(), ['clientMsgId', 'conversationId', 'noRun', 'orgId', 'text']);
+  assert.match(sends(s.im)[0][1].clientMsgId, /^cmsg_/);
+});
+
+for (const [name, err] of [
+  ['HTTP 400', new ImError('HTTP 400: metadata not allowed', { status: 400, definite: true, kind: 'http' })],
+  ['HTTP 422', new ImError('HTTP 422: bad type', { status: 422, definite: true, kind: 'http' })],
+  ['a client-side refusal', new ImError('reserved metadata key context', { definite: true, kind: 'refused' })],
+]) {
+  test(`structured send refused with ${name}: sent once more as AGENT_TEXT with id mkt-starter-<id>-text, reason logged`, async (t) => {
+    const s = await setup(t, { im: fakeIm({ structured: true, noRun: true, structuredError: err }), mark: [marked('sent')] });
+    await s.starter.runAll();
+    await s.starter.runAll();
+    assert.equal(structuredSends(s.im).length, 1);
+    assert.equal(sends(s.im).length, 1);
+    const first = structuredSends(s.im)[0][1];
+    const retry = sends(s.im)[0][1];
+    assert.deepEqual(retry, { orgId: ORG, conversationId: CONV, text: first.text, noRun: true, clientMsgId: `mkt-starter-${ADOPTION}-text` });
+    assert.ok(s.lines.some((l) => l.includes(`structured send refused (${err.message}); sending it once as plain text`)), s.lines.join('\n'));
+    assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+    assert.deepEqual(s.jobs(), {});
+  });
+}
+
+test('the plain-text resend refused too: two sends in all, marked send_failed', async (t) => {
+  const err = new ImError('HTTP 400: no', { status: 400, definite: true, kind: 'http' });
+  const s = await setup(t, { im: fakeIm({ structured: true, noRun: true, structuredError: err, sendError: err }), mark: [marked('send_failed')] });
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(structuredSends(s.im).length + sends(s.im).length, 2);
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'send_failed' }]]);
+  assert.deepEqual(reasonOf(s), ['send_refused_http_400']);
+});
+
+test('the plain-text resend with an unknown outcome: not sent again, not reported', async (t) => {
+  const s = await setup(t, {
+    im: fakeIm({ structured: true, noRun: true, structuredError: new ImError('HTTP 400', { status: 400, definite: true }), sendError: new ImError('timed out', { kind: 'timeout' }) }),
+  });
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(structuredSends(s.im).length + sends(s.im).length, 2);
+  assert.deepEqual(s.market(), [[':claim-starter', {}]]);
+  assert.deepEqual(s.jobs(), {});
+});
+
+for (const [name, err] of [
+  ['HTTP 500', new ImError('HTTP 500', { status: 500, kind: 'http' })],
+  ['HTTP 503', new ImError('HTTP 503', { status: 503, kind: 'http' })],
+  ['HTTP 408', new ImError('HTTP 408', { status: 408, kind: 'http' })],
+  ['HTTP 429', new ImError('HTTP 429', { status: 429, kind: 'http' })],
+  ['a timeout', new ImError('timed out', { kind: 'timeout' })],
+  ['unreadable output', new ImError('unreadable output', { kind: 'unreadable' })],
+  ['exit 1', new ImError('exit 1', { kind: 'exit' })],
+]) {
+  test(`structured send fails with ${name}: no plain-text resend, not reported, job dropped`, async (t) => {
+    const s = await setup(t, { im: fakeIm({ structured: true, noRun: true, structuredError: err }) });
+    await s.starter.runAll();
+    await s.starter.runAll();
+    assert.equal(structuredSends(s.im).length, 1);
+    assert.equal(sends(s.im).length, 0);
+    assert.deepEqual(s.market(), [[':claim-starter', {}]]);
+    assert.deepEqual(s.jobs(), {});
+    assert.ok(s.lines.some((l) => l.includes('send outcome unknown')));
+  });
+}
+
+test('a structured send refused after the send deadline: no plain-text resend, marked send_failed', async (t) => {
+  const h = { s: null };
+  const im = fakeIm({
+    structured: true,
+    noRun: true,
+    structuredError: () => {
+      h.s.clock.t += STARTER_SEND_BY_MS;
+      throw new ImError('HTTP 400', { status: 400, definite: true, kind: 'http' });
+    },
+  });
+  h.s = await setup(t, { im, mark: [marked('send_failed')] });
+  await h.s.starter.runAll();
+  assert.equal(structuredSends(im).length, 1);
+  assert.equal(sends(im).length, 0);
+  assert.deepEqual(reasonOf(h.s), ['send_refused_http_400']);
+  assert.ok(h.s.lines.some((l) => l.includes('too late to send it as plain text')));
 });

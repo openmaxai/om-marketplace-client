@@ -170,6 +170,7 @@ export function createRuntime({
     const activation = createActivation({ state, dataDir, zylosDir, logger, im, flush: () => reconcile?.flushUrgent() });
     const starter = createStarter({
       api, state, orgs, logger, im, enabled: config.starter_message?.enabled !== false, activation,
+      structured: config.starter_message?.structured !== false,
     });
     templates = createTemplates({
       api, state, orgs, logger, dataDir, zylosDir, revocations, emulatorOrigin: config.storage_emulator_origin ?? null, fetchImpl, signal, starter,

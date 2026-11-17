@@ -2,7 +2,9 @@ import crypto from 'node:crypto';
 import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, uuidv7 } from './ids.js';
 import { ImError } from './starter/im.js';
-import { LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, hasContent, renderStarter } from './starter/render.js';
+import {
+  LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, fitFallback, hasContent, renderStarter,
+} from './starter/render.js';
 import { withinLimits } from './starter/limits.js';
 
 // sha256 of the content as canonical JSON (object keys sorted at every level).
@@ -45,9 +47,13 @@ export function imReason(err) {
 // happens right before the send.
 // content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available;
 // by default it is the starter_content the market put on the write order.
+// With structured (starter_message.structured, default true) and an openmax that supports it, the message is sent as
+// AGENT_STRUCTURED with client_msg_id mkt-starter-<adoption id>, so the web chat can draw it as the welcome card; a
+// definite refusal of that send is followed by one AGENT_TEXT send with id mkt-starter-<adoption id>-text. Otherwise
+// it is sent as AGENT_TEXT with a cmsg_<uuidv7> id.
 export function createStarter({
   api, state, orgs, logger, im, content = async (job) => job.content ?? null, enabled = true, now = Date.now, limits = {},
-  activation = null,
+  activation = null, structured = true,
 }) {
   const iso = () => new Date(now()).toISOString();
   const jobs = () => state.read('starters', {});
@@ -101,8 +107,9 @@ export function createStarter({
       return { why: 'it asks for a credential', reason: 'asks_for_credential', credential: true };
     }
     const text = renderStarter({ ...clean, addressee: addressee ?? '' });
-    if (!withinLimits({ text }, limits)) return { why: 'the message does not fit the IM size limit', reason: 'too_large' };
-    return { text };
+    const fallbackText = fitFallback(clean, addressee ?? '', limits);
+    if (!withinLimits({ text, fallbackText }, limits)) return { why: 'the message does not fit the IM size limit', reason: 'too_large' };
+    return { text, fallbackText };
   }
 
   async function claimAndSend(job) {
@@ -198,7 +205,7 @@ export function createStarter({
         return finish(job, 'send_failed', 'dm_busy');
       }
     }
-    const { text, why, reason } = await renderAgain(job);
+    const { text, fallbackText, why, reason } = await renderAgain(job);
     if (!text) {
       logger.warn(`${tag(job)} not sent: ${why}`);
       return finish(job, 'send_failed', reason);
@@ -208,8 +215,26 @@ export function createStarter({
       return finish(job, 'send_failed', 'too_late');
     }
     put(job.adoption_id, { stage: 'sending' });
+    const to = { orgId: job.org_id, conversationId: job.conversation_id, text, noRun };
+    const id = job.adoption_id;
     try {
-      await im.sendText({ orgId: job.org_id, conversationId: job.conversation_id, text, clientMsgId: `cmsg_${uuidv7(now())}`, noRun });
+      if (structured && im.supportsStructured?.()) {
+        try {
+          await im.sendStructured({ ...to, clientMsgId: `mkt-starter-${id}`, adoptionId: id, fallbackText });
+        } catch (err) {
+          // Only a definite refusal is sure to have sent nothing, so only then is the plain text sent, once. It must
+          // start within the same deadline as the first send, so it too ends before the market's grace.
+          if (!(err instanceof ImError && err.definite)) throw err;
+          if (now() - job.claimed_local_at >= STARTER_SEND_BY_MS) {
+            logger.warn(`${tag(job)}: structured send refused (${err.message}); too late to send it as plain text`);
+            throw err;
+          }
+          logger.warn(`${tag(job)}: structured send refused (${err.message}); sending it once as plain text`);
+          await im.sendText({ ...to, clientMsgId: `mkt-starter-${id}-text` });
+        }
+      } else {
+        await im.sendText({ ...to, clientMsgId: `cmsg_${uuidv7(now())}` });
+      }
     } catch (err) {
       if (err instanceof ImError && err.definite) {
         logger.warn(`${tag(job)}: send refused (${err.message}); not retried`);

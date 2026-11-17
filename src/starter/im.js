@@ -2,11 +2,17 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { RESERVED_METADATA_KEYS } from './limits.js';
+import { MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, utf8Bytes } from './limits.js';
 
 export const IM_TIMEOUT_MS = 30_000;
 // First openmax release whose comm.send takes noRun.
 export const OPENMAX_NORUN_MIN_VERSION = '2.32.0';
+// First openmax release on which the starter message is sent as AGENT_STRUCTURED. comm.send passes a pre-built body
+// through as given (metadata and fallback_text included) since 2.18, but checks neither, so sendParams does; the
+// market installs this client only on openmax 2.32.0 or later, and noRun needs that version too.
+export const OPENMAX_STRUCTURED_MIN_VERSION = '2.32.0';
+// metadata.market_starter_tasks.schema of the starter message; the web chat draws the welcome card from it.
+export const STARTER_SCHEMA = 'market.starter-tasks.v1';
 const MAX_OUTPUT = 1024 * 1024;
 // Pause before the one retry of a read-only call.
 export const IM_RETRY_DELAY_MS = 1000;
@@ -95,8 +101,24 @@ export function assertNoReservedMetadata(body) {
   if (bad.length) throw new ImError(`reserved metadata key ${bad.join(', ')}`, { definite: true, kind: 'refused' });
 }
 
-export function sendParams({ orgId, conversationId, text, clientMsgId, noRun = false }) {
-  const body = { type: 'AGENT_TEXT', content: { content_type: 'text', body: { text }, attachments: [] } };
+// The comm.send parameters: plain AGENT_TEXT, or with structured ({adoptionId, fallbackText}) the AGENT_STRUCTURED
+// starter message with the same text, its metadata nested under market_starter_tasks and its fallback text. Both go
+// in the pre-built body, which the CLI sends as given.
+export function sendParams({ orgId, conversationId, text, clientMsgId, noRun = false, structured = null }) {
+  const content = { content_type: 'text', body: { text }, attachments: [] };
+  let body = { type: 'AGENT_TEXT', content };
+  if (structured) {
+    const { adoptionId, fallbackText } = structured;
+    if (typeof fallbackText !== 'string' || utf8Bytes(fallbackText) > MAX_FALLBACK_BYTES) {
+      throw new ImError(`fallback text over ${MAX_FALLBACK_BYTES} bytes`, { definite: true, kind: 'refused' });
+    }
+    body = {
+      type: 'AGENT_STRUCTURED',
+      content,
+      metadata: { market_starter_tasks: { schema: STARTER_SCHEMA, adoption_id: adoptionId } },
+      fallback_text: fallbackText,
+    };
+  }
   assertNoReservedMetadata(body);
   return { org: orgId, conversationId, clientMsgId, body, ...(noRun ? { noRun: true } : {}) };
 }
@@ -106,9 +128,16 @@ export function sendParams({ orgId, conversationId, text, clientMsgId, noRun = f
 // a refusal, such as unreadable output or a timeout; comm.send is never tried again.
 export function createOpenmaxIm({
   zylosDir, timeoutMs = IM_TIMEOUT_MS, run = execFile, noRunMinVersion = OPENMAX_NORUN_MIN_VERSION, now = Date.now,
-  retryDelayMs = IM_RETRY_DELAY_MS,
+  retryDelayMs = IM_RETRY_DELAY_MS, structuredMinVersion = OPENMAX_STRUCTURED_MIN_VERSION,
 }) {
   const cli = openmaxCommCli(zylosDir);
+  // True when the installed openmax is at least min; false when its version cannot be read.
+  const openmaxAtLeast = (min) => {
+    if (!min) return false;
+    try {
+      return versionAtLeast(JSON.parse(fs.readFileSync(path.join(openmaxDir(zylosDir), 'package.json'), 'utf8')).version, min);
+    } catch { return false; }
+  };
   const activity = path.join(openmaxDir(zylosDir), 'src', 'lib', 'activity');
   const call = (command, params) => new Promise((resolve, reject) => {
     run(process.execPath, [cli, command, JSON.stringify(params)], {
@@ -150,10 +179,11 @@ export function createOpenmaxIm({
     },
     // True when the installed openmax is at least noRunMinVersion.
     supportsNoRun() {
-      if (!noRunMinVersion) return false;
-      try {
-        return versionAtLeast(JSON.parse(fs.readFileSync(path.join(openmaxDir(zylosDir), 'package.json'), 'utf8')).version, noRunMinVersion);
-      } catch { return false; }
+      return openmaxAtLeast(noRunMinVersion);
+    },
+    // True when the installed openmax is at least structuredMinVersion.
+    supportsStructured() {
+      return openmaxAtLeast(structuredMinVersion);
     },
     // True when comm.send into the conversation would be taken as a run's reply: the run comm.send would select, read
     // from openmax's own activity store with its own selection code.
@@ -181,6 +211,10 @@ export function createOpenmaxIm({
     // Plain text, no mentions: the message body is passed whole so the CLI resolves no @name.
     async sendText({ orgId, conversationId, text, clientMsgId, noRun = false }) {
       return call('comm.send', sendParams({ orgId, conversationId, text, clientMsgId, noRun }));
+    },
+    // The starter message as AGENT_STRUCTURED: the same plain text, plus its metadata and fallback text.
+    async sendStructured({ orgId, conversationId, text, clientMsgId, noRun = false, adoptionId, fallbackText }) {
+      return call('comm.send', sendParams({ orgId, conversationId, text, clientMsgId, noRun, structured: { adoptionId, fallbackText } }));
     },
   };
 }

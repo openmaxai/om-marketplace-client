@@ -120,7 +120,7 @@ test('rewriting the config keeps the extra orgs and drops a stale primary entry'
   assert.deepEqual(Object.keys(loadConfig(dataDir).orgs), [VALID_ENV.COCO_ORG_ID, 'org-2']);
 });
 
-test('starter_message.enabled is optional, boolean only', () => {
+test('starter_message.enabled and starter_message.structured are optional, boolean only', () => {
   const dataDir = path.join(tmpHome(), 'd');
   writeConfig({ ...VALID_ENV }, dataDir);
   const file = path.join(dataDir, 'config.json');
@@ -128,10 +128,14 @@ test('starter_message.enabled is optional, boolean only', () => {
   const put = (extra) => fs.writeFileSync(file, JSON.stringify({ ...base, ...extra }), { mode: 0o600 });
   assert.equal(loadConfig(dataDir).starter_message, undefined);
   put({ starter_message: { enabled: false } });
-  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: false });
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: false, structured: true });
   put({ starter_message: {} });
-  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: true });
-  for (const bad of [{ enabled: 'no' }, { enabled: true, other: 1 }, [], 'off']) {
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: true, structured: true });
+  put({ starter_message: { structured: false } });
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: true, structured: false });
+  put({ starter_message: { enabled: true, structured: true } });
+  assert.deepEqual(loadConfig(dataDir).starter_message, { enabled: true, structured: true });
+  for (const bad of [{ enabled: 'no' }, { enabled: true, other: 1 }, { structured: 'no' }, { structured: null, other: 1 }, [], 'off']) {
     put({ starter_message: bad });
     assert.throws(() => loadConfig(dataDir), /starter_message/);
   }

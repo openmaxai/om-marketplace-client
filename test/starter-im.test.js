@@ -4,8 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { tmpHome } from './helpers.js';
 import {
-  ImError, OPENMAX_NORUN_MIN_VERSION, createOpenmaxIm, openmaxCommCli, parseCliOutput, redact, sendParams, versionAtLeast,
+  ImError, OPENMAX_NORUN_MIN_VERSION, OPENMAX_STRUCTURED_MIN_VERSION, STARTER_SCHEMA, createOpenmaxIm, openmaxCommCli, parseCliOutput, redact,
+  sendParams, versionAtLeast,
 } from '../src/starter/im.js';
+import { AGENT, ORG as PULL_ORG, pullHarness } from './fake/pull.js';
+import { createStarter } from '../src/starter.js';
+import { cleanContent, renderStarter } from '../src/starter/render.js';
 
 const ORG = '0b6f4f3e-1111-4c2a-9d1e-cccccccccccc';
 
@@ -290,4 +294,116 @@ test('an ImError keeps what failed and the CLI error text, redacted', async () =
   assert.ok(err.message.length < 260, err.message);
   assert.ok(!redact('x '.repeat(500)).includes('\n'));
   assert.equal(redact('password: hunter2, api_key=k1'), 'password: [redacted], api_key=[redacted]');
+});
+
+const ADOPTION = '0190f000-0000-7000-8000-000000000021';
+const TEXT_BODY = (text) => ({ type: 'AGENT_TEXT', content: { content_type: 'text', body: { text }, attachments: [] } });
+
+test('the structured send is used only from openmax 2.32.0 on; an unreadable version is no support', () => {
+  assert.equal(OPENMAX_STRUCTURED_MIN_VERSION, '2.32.0');
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.32.0' }) }).supportsStructured(), true);
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.33.1' }) }).supportsStructured(), true);
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.31.9' }) }).supportsStructured(), false);
+  assert.equal(createOpenmaxIm({ zylosDir: fakeOpenmax({ version: 'not-a-version' }) }).supportsStructured(), false);
+  assert.equal(createOpenmaxIm({ zylosDir: tmpHome() }).supportsStructured(), false);
+  const bad = fakeOpenmax();
+  fs.writeFileSync(path.join(bad, '.claude', 'skills', 'openmax', 'package.json'), '{not json');
+  assert.equal(createOpenmaxIm({ zylosDir: bad }).supportsStructured(), false);
+});
+
+test('sendStructured: AGENT_STRUCTURED pre-built body with the text, nested metadata and fallback text; noRun kept', async () => {
+  const f = fakeRun({ 'comm.send': { stdout: JSON.stringify({ id: 'm1' }) } });
+  const im = createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.32.0' }), run: f.run });
+  await im.sendStructured({
+    orgId: ORG, conversationId: 'cv-1', text: 'hello', clientMsgId: `mkt-starter-${ADOPTION}`, noRun: true, adoptionId: ADOPTION, fallbackText: 'hello',
+  });
+  const send = JSON.parse(f.calls[0].args[2]);
+  assert.deepEqual(send, {
+    org: ORG,
+    conversationId: 'cv-1',
+    clientMsgId: `mkt-starter-${ADOPTION}`,
+    noRun: true,
+    body: {
+      type: 'AGENT_STRUCTURED',
+      content: { content_type: 'text', body: { text: 'hello' }, attachments: [] },
+      metadata: { market_starter_tasks: { schema: STARTER_SCHEMA, adoption_id: ADOPTION } },
+      fallback_text: 'hello',
+    },
+  });
+  assert.equal(STARTER_SCHEMA, 'market.starter-tasks.v1');
+  assert.ok(!('schema' in send.body.metadata) && !('adoption_id' in send.body.metadata), 'metadata is nested, never flat');
+  assert.ok(!('metadata' in send) && !('fallback_text' in send) && !('type' in send), 'nothing at the top level');
+  assert.equal(`mkt-starter-${ADOPTION}-text`.length <= 64, true);
+});
+
+test('sendStructured without noRun carries no noRun; a fallback text over 8192 bytes is refused before any call', async () => {
+  const f = fakeRun({ 'comm.send': { stdout: '{}' } });
+  const im = createOpenmaxIm({ zylosDir: fakeOpenmax({ version: '2.32.0' }), run: f.run });
+  await im.sendStructured({ orgId: ORG, conversationId: 'c', text: 't', clientMsgId: 'k', adoptionId: ADOPTION, fallbackText: 't' });
+  assert.equal('noRun' in JSON.parse(f.calls[0].args[2]), false);
+  const err = await im.sendStructured({ orgId: ORG, conversationId: 'c', text: 't', clientMsgId: 'k', adoptionId: ADOPTION, fallbackText: 'x'.repeat(8193) })
+    .catch((e) => e);
+  assert.ok(err instanceof ImError && err.definite && err.kind === 'refused');
+  assert.equal(f.calls.length, 1);
+});
+
+// The starter flow through the real openmax IM wrapper, with openmax at the given version (or none readable), answering
+// every CLI call; returns the comm.send parameters.
+async function starterThroughCli(t, { version, structured = true }) {
+  const ADOPTER = '0b6f4f3e-2222-4c2a-9d1e-aaaaaaaaaaaa';
+  const zylosDir = fakeOpenmax({ version });
+  if (version === null) fs.rmSync(path.join(zylosDir, '.claude', 'skills', 'openmax', 'package.json'));
+  fs.mkdirSync(path.dirname(openmaxCommCli(zylosDir)), { recursive: true });
+  fs.writeFileSync(openmaxCommCli(zylosDir), '');
+  const f = fakeRun({
+    'comm.create_dm': { stdout: JSON.stringify({ conversation: { id: 'cv-1' } }) },
+    'comm.get_conversation': { stdout: JSON.stringify({ id: 'cv-1', type: 'DM' }) },
+    'comm.member_list': { stdout: JSON.stringify([{ member_id: AGENT }, { member_id: ADOPTER, display_name: '张三' }]) },
+    'comm.send': { stdout: JSON.stringify({ id: 'm1' }) },
+  });
+  const h = await pullHarness(t);
+  const B = `/api/v1/orgs/${PULL_ORG}/agents/${AGENT}/adoptions/${ADOPTION}`;
+  h.fake.script('POST', `${B}:claim-starter`, { status: 200, json: { adoption_id: ADOPTION, result: 'claimed', starter_state: 'claimed', claimed_at: '2026-10-16T00:00:00Z' } });
+  h.fake.script('POST', `${B}:mark-starter-shown`, { status: 200, json: { adoption_id: ADOPTION, result: 'sent', result_at: '2026-10-16T00:00:01Z', starter_tasks_shown_at: '2026-10-16T00:00:01Z' } });
+  const im = createOpenmaxIm({ zylosDir, run: f.run });
+  const content = { templateName: '周报助手', firstGuide: '先告诉我你的团队有哪些项目。', starterTasks: [{ title: '生成周报', prompt: '写一份周报' }] };
+  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, now: h.now, content: async () => content, structured });
+  starter.enqueue({ orgId: PULL_ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER });
+  await starter.runAll();
+  const sendCalls = f.calls.filter((c) => c.args[1] === 'comm.send').map((c) => JSON.parse(c.args[2]));
+  assert.equal(sendCalls.length, 1);
+  return { send: sendCalls[0], text: renderStarter(cleanContent({ ...content, addressee: '张三' })) };
+}
+
+test('openmax 2.32.0: the starter message goes out as the AGENT_STRUCTURED body with id mkt-starter-<adoption id>', async (t) => {
+  const { send, text } = await starterThroughCli(t, { version: '2.32.0' });
+  assert.deepEqual(send, {
+    org: PULL_ORG,
+    conversationId: 'cv-1',
+    clientMsgId: `mkt-starter-${ADOPTION}`,
+    noRun: true,
+    body: {
+      type: 'AGENT_STRUCTURED',
+      content: { content_type: 'text', body: { text }, attachments: [] },
+      metadata: { market_starter_tasks: { schema: 'market.starter-tasks.v1', adoption_id: ADOPTION } },
+      fallback_text: text,
+    },
+  });
+});
+
+for (const [name, version] of [['openmax 2.31.0', '2.31.0'], ['openmax 2.18.0', '2.18.0'], ['an unreadable openmax version', null]]) {
+  test(`${name}: today's AGENT_TEXT body, no metadata, no fallback text, a cmsg_ id, no noRun`, async (t) => {
+    const { send, text } = await starterThroughCli(t, { version });
+    assert.deepEqual(Object.keys(send).sort(), ['body', 'clientMsgId', 'conversationId', 'org']);
+    assert.deepEqual(send.body, TEXT_BODY(text));
+    assert.match(send.clientMsgId, /^cmsg_[0-9a-f-]{36}$/);
+    assert.ok(!JSON.stringify(send).includes('metadata') && !JSON.stringify(send).includes('fallback_text'));
+  });
+}
+
+test('starter_message.structured false on openmax 2.32.0: today\'s AGENT_TEXT body with noRun', async (t) => {
+  const { send, text } = await starterThroughCli(t, { version: '2.32.0', structured: false });
+  assert.deepEqual(send.body, TEXT_BODY(text));
+  assert.equal(send.noRun, true);
+  assert.match(send.clientMsgId, /^cmsg_/);
 });
