@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cws-core the confirm route answers 404, reported as "not supported yet"
   (send the confirm link instead); an older market answers
   `AGENT_CONFIRM_DISABLED`. The market's minimum client version is not
-  raised for this feature. A confirmed request stays watched so its orders are
+  raised for this feature.
+- `AGENT_CONFIRM_DISABLED` with reason `attested_off` (chat confirmation
+  turned off in the market) says so and points to the confirm link. A confirmed request stays watched so its orders are
   pulled within seconds; a declined one is no longer watched.
 - Messages for `AGENT_ATTESTATION_REFUSED` (`not_owner`, `owner_changed`),
   `INSTALL_PROPOSAL_STALE`, `INSTALL_PROPOSAL_NOT_PENDING` and

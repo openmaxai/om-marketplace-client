@@ -211,6 +211,10 @@ Rules:
   and ask the owner again. On `INSTALL_PROPOSAL_NOT_PENDING`: tell the owner
   it was already decided or has expired. On `AGENT_ATTESTATION_REFUSED`
   `not_owner`: the person is not your current owner; send the confirm link.
+  On `AGENT_CONFIRM_DISABLED` `attested_off`: chat confirmation is turned
+  off in this market; send the owner the confirm link (`confirm_url`) to
+  confirm there instead, and do not retry `confirm-install` or
+  `decline-install`.
   Relay any other refusal the command prints; do not retry it unchanged.
 - One pending request at a time: a new `request-install` replaces your
   pending request (the old one becomes `superseded`). Put every candidate

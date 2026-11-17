@@ -329,6 +329,7 @@ test('confirm-install explains each market refusal', async (t) => {
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*confirm_url/],
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }), /made for a previous owner.*request-install/],
     [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*predates.*do not retry/],
+    [problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }), /^confirm-install refused: chat confirmation is turned off in this market; nothing was changed\. Send the owner the confirm link \(confirm_url\) instead, don't retry$/],
     [{ status: 404, raw: 'not found' }, /does not support confirming install requests in conversation yet \(404 on the confirm route/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'version_changed' }), /a skill version changed since the request \(version_changed\).*request-install.*ask the owner again/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'agent_changed' }), /this Agent changed since the request/],

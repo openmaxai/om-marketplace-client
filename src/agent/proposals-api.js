@@ -212,6 +212,9 @@ export function explainProposalError(err) {
       if (err.reason === 'owner_changed') return `this install request was made for a previous owner; nothing was installed. ${REQUEST_HINT}`;
       return 'refused: only your current owner\'s own reply counts; nothing was installed. Anyone else (an org admin included) confirms on the confirm link (confirm_url)';
     case 'AGENT_CONFIRM_DISABLED':
+      if (err.reason === 'attested_off') {
+        return 'chat confirmation is turned off in this market; nothing was changed. Send the owner the confirm link (confirm_url) instead, don\'t retry';
+      }
       return 'the market refused the confirmation method: a client bug (confirmed_via must be agent_attested), or the market predates '
         + 'confirming in conversation; nothing was changed. Report it; do not retry. Meanwhile send your owner the confirm link (confirm_url)';
     case 'INSTALL_PROPOSAL_STALE':
