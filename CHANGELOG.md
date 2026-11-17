@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0] - 2026-11-17
 
 ### Added
+- `market-client start`: runs the post-install hook (an existing config is
+  kept), starts the `zylos-om-marketplace-client` pm2 service when it is not
+  online (or restarts it when the hook changed the config), runs `pm2 save`,
+  asks the service for a poll round (up to 2 more after a transient failure)
+  and exits 0 only when the service runs and its install order pull succeeded.
+  It fails without starting anything when another process that pm2 does not
+  run holds the state lock. `zylos add --json`, the mode Agents
+  use, returns before the post-install hook and the service start, so an
+  Agent-run install left the service stopped until someone started it and
+  hires failed with `AGENT_NO_CLIENT`. SKILL.md `next-steps` now tells the
+  Agent to run `market-client start` and to report the install as done only
+  when it exits 0.
 - `market-client search`: search the skills listed for the organization.
 - `market-client install-permission`: who may confirm installs on this Agent
   in the workspace (the owner, org admins), with display names when the
@@ -42,6 +54,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`field`, `rule`, `rule_class`, `sentence`, `file`, `skill_md_rule`,
   `expected_slug`, `queue_limit`, ...); they are shown to the Agent, not
   logged. Text the market echoes back is quoted as market data.
+
+### Fixed
+- Starter message: when the Agent is busy at adoption time (not idle for 30
+  seconds, a tool running, or an OpenMax turn open), the message is no longer
+  sent at once. It is held until the template is in a session, as when the
+  starter budget allows no request (24 hours at most, kept across restarts,
+  before the claim). Once the Agent is idle the client asks for a new session
+  on the starter budget. An Agent busy for 24 hours gets the message then,
+  without a new session. Without a readable runtime status or turn state the
+  message is still sent at once.
+- Starter message: a send whose outcome is unknown (timeout, server error,
+  unreadable output, or a restart during the send) is now looked up in the DM
+  by its client message id. Found, it is marked `sent`; surely absent 60
+  seconds after the send, it is marked `send_failed` (reason `send_lost`).
+  When the lookup cannot tell within 10 minutes, the job is dropped unmarked
+  as before. Previously such a send was never marked, so the workbench showed
+  the fallback card 10 minutes after the claim even when the message had
+  arrived.
+- Service: a configuration error at start-up now ends the process with exit
+  code 78 after the error is logged. Under pm2 the process used to stay online
+  with only the exit code set, so pm2 never stopped it and an unconfigured
+  client looked running. Any other start-up error (for example an I/O or
+  permission error on the state directory) now exits with code 1, so pm2
+  restarts the service instead of stopping it. CLI commands keep their exit
+  codes.
 
 ## [0.7.1] - 2026-11-17
 

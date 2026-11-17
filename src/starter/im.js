@@ -16,6 +16,9 @@ export const STARTER_SCHEMA = 'market.starter-tasks.v1';
 const MAX_OUTPUT = 1024 * 1024;
 // Pause before the one retry of a read-only call.
 export const IM_RETRY_DELAY_MS = 1000;
+// Most message pages read back when a message is looked up by its client message id.
+export const MAX_LOOKUP_PAGES = 5;
+const LOOKUP_PAGE_SIZE = 100;
 // Longest CLI error or output excerpt kept in an ImError for the log.
 const DETAIL_MAX = 200;
 
@@ -139,22 +142,22 @@ export function createOpenmaxIm({
     } catch { return false; }
   };
   const activity = path.join(openmaxDir(zylosDir), 'src', 'lib', 'activity');
-  const call = (command, params) => new Promise((resolve, reject) => {
+  const call = (command, params, { raw = false } = {}) => new Promise((resolve, reject) => {
     run(process.execPath, [cli, command, JSON.stringify(params)], {
       cwd: path.dirname(path.dirname(path.dirname(cli))), timeout: timeoutMs, maxBuffer: MAX_OUTPUT, windowsHide: true,
       env: { ...process.env, COCO_RPC_LOG: '0' },
     }, (err, stdout, stderr) => {
       if (err) return reject(errorOf(err, stderr));
-      try { resolve(unwrap(parseCliOutput(stdout))); } catch { reject(unreadable(stdout)); }
+      try { const out = parseCliOutput(stdout); resolve(raw ? out : unwrap(out)); } catch { reject(unreadable(stdout)); }
     });
   });
-  const read = async (command, params) => {
+  const read = async (command, params, opts) => {
     try {
-      return await call(command, params);
+      return await call(command, params, opts);
     } catch (err) {
       if (err.definite) throw err;
       await new Promise((r) => { setTimeout(r, retryDelayMs); });
-      return call(command, params);
+      return call(command, params, opts);
     }
   };
   return {
@@ -207,6 +210,27 @@ export function createOpenmaxIm({
         const r = selectRun({ store, active, convId, now: now() });
         return Boolean(r.run || r.candidate);
       });
+    },
+    // 'found' when the conversation holds a message with this client message id; 'absent' when it does not and the
+    // pages read reach back to `since` (ms) or to the conversation's first message; 'unknown' when MAX_LOOKUP_PAGES
+    // did not get that far.
+    async findMessage({ orgId, conversationId, clientMsgId, since }) {
+      let beforeSeq = null;
+      for (let i = 0; i < MAX_LOOKUP_PAGES; i++) {
+        // Read whole: the answer is {data: [newest first], pagination: {next_cursor}}, and next_cursor is empty at
+        // the conversation's first message.
+        const r = await read('comm.get_messages', { org: orgId, conversationId, limit: LOOKUP_PAGE_SIZE, ...(beforeSeq ? { beforeSeq } : {}) }, { raw: true });
+        const items = Array.isArray(r) ? r : Array.isArray(r?.data) ? r.data : Array.isArray(r?.items) ? r.items : null;
+        if (!items) throw new ImError('get_messages returned no list');
+        if (items.some((m) => m?.client_msg_id === clientMsgId)) return 'found';
+        if (!items.length || (!Array.isArray(r) && !r.pagination?.next_cursor)) return 'absent';
+        const times = items.map((m) => Date.parse(m?.created_at)).filter(Number.isFinite);
+        if (times.length && Math.min(...times) < since) return 'absent';
+        const seqs = items.map((m) => Number(m?.seq)).filter((n) => Number.isSafeInteger(n) && n > 0);
+        if (!seqs.length) return 'unknown';
+        beforeSeq = Math.min(...seqs);
+      }
+      return 'unknown';
     },
     // Plain text, no mentions: the message body is passed whole so the CLI resolves no @name.
     async sendText({ orgId, conversationId, text, clientMsgId, noRun = false }) {
