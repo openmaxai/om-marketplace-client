@@ -6,7 +6,7 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { installers } from '../src/http.js';
+import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
 import fs from 'node:fs';
 
@@ -63,16 +63,22 @@ test('search refuses bad options locally and explains a rate limit', async (t) =
   assert.match(s.text(), /search limit; try again in about 1 minute/);
 });
 
-test('install-permission reports who may confirm', async (t) => {
+test('install-permission reads who may install and who may confirm in chat', async (t) => {
   const s = await setup(t);
-  s.fake.script('GET', `${A}/install-permission`,
-    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [OWNER], owner_can_install: true, caller_can_install: false } },
-    { status: 200, json: { agent_id: AGENT, owner_member_id: OWNER, who_can_install: [{ member_id: U(20), display_name: 'Ana Admin' }], owner_can_install: false, caller_can_install: false } });
-  assert.equal(await s.run('install-permission'), 0);
-  assert.match(s.text(), /the owner may install/);
+  const admins = { role: 'org_admins', member_id: null, display_name: null };
+  const owned = { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'owner', member_id: OWNER, display_name: 'Ana' }, admins], chat_confirm_by: { member_id: OWNER, display_name: 'Ana' }, caller_can_install: false } };
+  s.fake.script('GET', `${A}/install-permission`, owned, owned,
+    { status: 200, json: { agent_id: AGENT, who_can_install: [admins], chat_confirm_by: null, caller_can_install: false } });
+  assert.equal(await s.run('install-permission', [], { json: true }), 0);
+  const j = JSON.parse(s.text());
+  assert.deepEqual(j.chat_confirm_by, { member_id: OWNER, display_name: 'Ana' });
+  assert.equal(j.who_can_install.length, 2);
   s.reset();
   assert.equal(await s.run('install-permission'), 0);
-  assert.match(s.text(), new RegExp(`may not install.*Ana Admin \\(${U(20)}\\).*workspace card`));
+  assert.equal(s.text(), `may install skills on this Agent: the owner Ana (${OWNER}), org admins. Confirmation in chat: only Ana (${OWNER}) (the owner)`);
+  s.reset();
+  assert.equal(await s.run('install-permission'), 0);
+  assert.match(s.text(), /may install skills on this Agent: org admins\. This Agent has no active owner, so nobody can confirm in chat/);
 });
 
 test('request-install proposes up to 3 candidates, resolving slugs, with one reason each', async (t) => {
@@ -95,11 +101,11 @@ test('request-install refusals', async (t) => {
   assert.equal(await s.run('request-install', [U(1), U(2), U(3), U(4)], { reason: ['a'] }), 3);
   assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/install-proposals`,
-    problem(409, { code: 'SKILL_ALREADY_INSTALLED', field: '/candidates/1' }),
+    problem(409, { code: 'SKILL_ALREADY_INSTALLED', detail: 'candidate 1 is already installed' }),
     problem(409, { code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.8.0' }),
     problem(403, { code: 'AGENT_OWNER_REQUIRED' }),
     problem(404, { code: 'NOT_FOUND', field: '/candidates/0' }));
-  for (const re of [/already installed .*\(\/candidates\/1\)/, /0\.8\.0 or later/, /no active human owner/, /not found \(\/candidates\/0\)/]) {
+  for (const re of [/already installed .*\(candidate 1 is already installed\)/, /0\.8\.0 or later/, /no active human owner/, /not found \(\/candidates\/0\)/]) {
     s.reset();
     assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 3);
     assert.match(s.text(), re);
@@ -122,19 +128,19 @@ test('confirm-install sends the chosen skills with confirmed_via chat and pulls 
   assert.equal(j.pulled, 'install orders pulled now');
 });
 
-test('confirm-install: owner without the right gets who can install; not pending; bad input', async (t) => {
+test('confirm-install: refused for the Agent, not pending, bad input', async (t) => {
   const s = await setup(t);
   assert.equal(await s.run('confirm-install', ['nope', '1']), 3);
   assert.equal(await s.run('confirm-install', [U(10), 'x']), 3);
   assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/install-proposals/${U(10)}:confirm`,
-    problem(403, { code: 'NOT_AGENT_OWNER', reason: 'owner_only', who_can_install: [U(20), 'not an id'] }),
+    problem(403, { code: 'NOT_AGENT_OWNER', reason: 'owner_only' }),
     problem(409, { code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' }));
   s.reset();
   assert.equal(await s.run('confirm-install', [U(10), U(1)], { json: true }), 3);
   const j = JSON.parse(s.text());
-  assert.deepEqual(j.who_can_install, [{ member_id: U(20), display_name: null }]);
-  assert.match(j.message, new RegExp(`may not install.*${U(20)}.*confirm the request in the workspace`));
+  assert.equal(j.error, 'NOT_AGENT_OWNER');
+  assert.match(j.message, /install-permission.*install it in the workspace/);
   s.reset();
   assert.equal(await s.run('confirm-install', [U(10), U(1)]), 3);
   assert.match(s.text(), /no longer pending \(expired\); make a new request/);
@@ -154,10 +160,12 @@ test('decline-install and install-requests', async (t) => {
   assert.equal(await s.run('install-requests', [], { state: 'bogus' }), 3);
 });
 
-test('installers takes ids or {member_id, display_name}, cleans names, falls back to ids', () => {
-  assert.deepEqual(installers([U(1), { member_id: U(2), display_name: ' Ana\u0007 ' }, { id: U(3), name: 'Bo' }, { member_id: 'not an id' }, 7]), [
-    { member_id: U(1), display_name: null }, { member_id: U(2), display_name: 'Ana' }, { member_id: U(3), display_name: 'Bo' },
-  ]);
+test('installers keeps role entries, cleans names and drops unreadable ones', () => {
+  assert.deepEqual(installers([
+    { role: 'owner', member_id: U(1), display_name: ' Ana\u0007 ' }, { role: 'org_admins', member_id: null, display_name: null },
+    { role: 'owner', member_id: 'not an id' }, { member_id: U(2) }, U(3), null,
+  ]), [{ role: 'owner', member_id: U(1), display_name: 'Ana' }, { role: 'org_admins', member_id: null, display_name: null }]);
+  assert.equal(installerList(installers([{ role: 'owner', member_id: U(1) }, { role: 'org_admins', member_id: null }])), `the owner ${U(1)}, org admins`);
 });
 
 test('request-install watches a pending request; confirm and decline stop watching it', async (t) => {

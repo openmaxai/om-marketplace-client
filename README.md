@@ -148,10 +148,10 @@ support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
 | Command | Effect |
 |---|---|
 | `search [<words>] [--category-id <id>] [--limit 1-20]` | Skills listed for the org and visible to the Agent's owner, with description, examples, category, latest version and whether installed. |
-| `install-permission` | Who may confirm installs on this Agent (`owner_can_install`, `who_can_install` member ids). |
+| `install-permission` | Who may install on this Agent (`who_can_install`: the owner and org admins) and who may confirm in chat (`chat_confirm_by`: the owner, or nobody without an active owner); names when the market gives them, else member ids. |
 | `request-install <skill> [<skill> <skill>] --reason <text> [--reason <text> ...]` | Creates one install request with 1 to 3 candidates (slug or skill_id; one reason for all or one per skill), `pending_confirmation`, expiring after 24 hours. Nothing is installed. |
 | `install-requests [--state <state>]` | This Agent's install requests, newest first, with the candidates and what was selected. |
-| `confirm-install <request_id> <n or skill_id> ...` | Records that the owner chose these candidates in chat (`confirmed_via: chat`; no confirmer is sent, the market takes the owner and checks the owner's right) and creates the install orders, which are then pulled at once (one poll round, handed to the service when it runs). In the workspace a person confirms on the card instead. A refusal names who may install; that person confirms on the card. |
+| `confirm-install <request_id> <n or skill_id> ...` | Records that the owner chose these candidates in chat (`confirmed_via: chat`; no confirmer is sent, the market takes the owner and checks the owner's right) and creates the install orders, which are then pulled at once (one poll round, handed to the service when it runs). It is used on every channel, the workspace included, after the owner chose in the conversation. |
 | `decline-install <request_id>` | Records that the owner declined in chat. |
 | `submit-skill <dir> [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links refused), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin. |
 | `submit-template <manifest.json> [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review. |
@@ -159,11 +159,9 @@ support for client 0.8.0; an older market answers `CLIENT_VERSION_TOO_OLD`.
 
 While a request from `request-install` is pending, the service checks it every
 15 seconds (±20%; a failed check backs off from 30 seconds up to 5 minutes) and
-runs a poll round as soon as it is confirmed, so a card confirmation installs
-within seconds. It stops when the request is decided, gone, or expired. The
+runs a poll round as soon as it is confirmed, so a confirmation made in the
+workspace installs within seconds. It stops when the request is decided, gone, or expired. The
 pending requests are kept as files in `proposal-watch/` in the data dir.
-`who_can_install` is shown with display names when the market gives them,
-otherwise as member ids.
 
 `submit-skill` does not keep file modes: installs write every file 0600 and
 never execute package content, so a skill runs its scripts through an

@@ -1,7 +1,7 @@
 // Market search and install proposals. The Agent only proposes; an install happens after a person confirms.
 import crypto from 'node:crypto';
-import { MarketError, installerList, installers } from '../http.js';
-import { isCanonicalUuid, isOrgOrMemberId } from '../ids.js';
+import { MarketError, installers, person } from '../http.js';
+import { isCanonicalUuid } from '../ids.js';
 import { explainCommonError, explainOther } from './submit-api.js';
 
 export const MAX_QUERY_CHARS = 100;
@@ -114,9 +114,9 @@ export async function installPermission({ http, orgId, agentId }) {
   const d = (await http.request('GET', orgId, `${agentPath(agentId)}/install-permission`)).data;
   if (!isObject(d)) throw shape('market install permission', 'is not an object');
   return {
-    owner_member_id: isOrgOrMemberId(d.owner_member_id) ? d.owner_member_id : null,
     who_can_install: installers(d.who_can_install),
-    owner_can_install: d.owner_can_install === true,
+    chat_confirm_by: person(d.chat_confirm_by),
+    caller_can_install: d.caller_can_install === true,
   };
 }
 
@@ -124,7 +124,8 @@ export function explainProposalError(err) {
   const common = explainCommonError(err);
   if (common !== null) return common;
   const x = err.extra ?? {};
-  const at = x.field ? ` (${x.field})` : '';
+  const where = x.field ?? x.detail;
+  const at = where ? ` (${where})` : '';
   switch (err.code) {
     case 'SKILL_ALREADY_INSTALLED':
       return `a skill is already installed (or being installed) on this Agent${at}; leave it out`;
@@ -141,10 +142,8 @@ export function explainProposalError(err) {
       return `the skill version can no longer be installed${at} (not listed or not approved now)`;
     case 'VERSION_REVOKED':
       return `the skill version was revoked and cannot be installed${at}`;
-    case 'NOT_AGENT_OWNER': {
-      const who = x.who_can_install?.length ? ` Who can install: ${installerList(x.who_can_install)}.` : '';
-      return `the owner may not install skills on this Agent.${who} That person has to confirm the request in the workspace (the install card)`;
-    }
+    case 'NOT_AGENT_OWNER':
+      return 'the market refused the install for this Agent (it may have no active owner). Run `market-client install-permission` to see who may install, and ask that person to install it in the workspace';
     default:
       return explainOther(err);
   }

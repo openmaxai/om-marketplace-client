@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createAuth } from '../auth.js';
-import { createMarketHttp, installerList } from '../http.js';
+import { createMarketHttp, installerList, personText } from '../http.js';
 import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
@@ -237,9 +237,10 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
     }
     if (cmd === 'install-permission') {
       const r = await installPermission(ctx);
-      out({ ok: true, ...r }, r.owner_can_install
-        ? 'the owner may install skills on this Agent: the owner confirms (workspace card, or explicitly in chat)'
-        : `the owner may not install skills on this Agent; who can: ${installerList(r.who_can_install) || 'nobody now'}. That person confirms in the workspace card`);
+      const who = installerList(r.who_can_install) || 'nobody now';
+      out({ ok: true, ...r }, r.chat_confirm_by
+        ? `may install skills on this Agent: ${who}. Confirmation in chat: only ${personText(r.chat_confirm_by)} (the owner)`
+        : `may install skills on this Agent: ${who}. This Agent has no active owner, so nobody can confirm in chat; a person listed here installs it in the workspace`);
       return EXIT.OK;
     }
     if (cmd === 'request-install') {

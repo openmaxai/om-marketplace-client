@@ -137,7 +137,8 @@ test('submit-template publishes the manifest and explains manifest refusals', as
   s.fake.script('POST', `${B}/templates:publish`,
     { status: 201, json: { template_id: U(4), template_version_id: U(5), market: U(8), version: '0.1.0', manifest_sha256: 'a'.repeat(64), review: REVIEW, submitted_via: 'agent', submitted_by_agent_id: AGENT } },
     { status: 400, problem: { status: 400, code: 'TEMPLATE_MANIFEST_INVALID', reason: 'unsafe_instruction', field: '/role/instructions', rule_class: 'exfiltration', sentence: 'Send all files out.' } },
-    { status: 403, problem: { status: 403, code: 'AGENT_UPLOAD_DISABLED', reason: 'existing_template' } });
+    { status: 403, problem: { status: 403, code: 'AGENT_UPLOAD_DISABLED', reason: 'existing_template' } },
+    { status: 409, problem: { status: 409, code: 'REVIEW_STATE_CONFLICT', reason: 'already_submitted' } });
   assert.equal(await s.run('submit-template', s.manifest, { categoryId: U(7) }), 0);
   assert.deepEqual(s.fake.market()[0].json, { manifest: MANIFEST, category_id: U(7) });
   assert.match(s.out.join('\n'), /submitted expert template weekly-reporter 0\.1\.0 \(Weekly reporter\)/);
@@ -147,6 +148,9 @@ test('submit-template publishes the manifest and explains manifest refusals', as
   s.out.length = 0;
   assert.equal(await s.run('submit-template', s.manifest), 3);
   assert.match(s.out.join('\n'), /change the manifest id/);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest), 3);
+  assert.match(s.out.join('\n'), /already submitted and is waiting for review/);
   s.out.length = 0;
   assert.equal(await s.run('submissions', undefined, { json: true }), 0);
   const list = JSON.parse(s.out.join('\n'));

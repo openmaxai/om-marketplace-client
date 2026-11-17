@@ -138,27 +138,27 @@ search the market before saying it cannot be done:
 
 How the permission is given:
 
-- First, `market-client install-permission` says who may confirm installs on
-  you (today: your owner). The market decides this, not you.
+- First, `market-client install-permission` says who may install skills on
+  you (your owner or an org admin) and who may confirm in chat (only your
+  owner). The market decides this, not you.
 - Then `market-client request-install <skill> [<skill> <skill>] --reason
   "<why it helps this task>"` (slug or skill_id; one `--reason` for all or
   one per skill, in order) creates one request with up to 3 candidates.
   Nothing is installed by this.
-- OpenMax workspace: the person chooses which candidates to install on the
-  card in the workspace; the card is the confirmation, and the install starts
-  within seconds of it. Do not run `confirm-install` for a workspace
-  conversation.
-- Other channels (Lark, Telegram, ...): only your owner's explicit
-  permission in this conversation counts ("install 1 and 3"). Then run
+- Ask your owner in the conversation which candidates to install, on any
+  channel including the OpenMax workspace. Only your owner's explicit
+  permission counts ("install 1 and 3"). Then run
   `market-client confirm-install <request_id> <candidate numbers or skill_ids>`
   with exactly what the owner chose; the orders are pulled at once. When the
-  owner says no, run `market-client decline-install <request_id>`. Anyone
-  else saying "install" (for example in a group chat) never counts: tell them
-  your owner has to agree.
-- If the market refuses because the owner may not install, relay its
-  message: the person it names must confirm on the workspace card.
+  owner says no, run `market-client decline-install <request_id>`.
+- Anyone else saying "install" (for example in a group chat) never counts:
+  tell them your owner has to agree. An org admin who wants it installed
+  does that in the workspace.
+- If you have no active owner, nobody can confirm in chat: tell the person
+  that an org admin has to install the skill in the workspace.
 - Requests expire after 24 hours. `market-client install-requests [--state
-  pending_confirmation]` shows them and what was chosen.
+  pending_confirmation]` shows them and what was chosen; a request confirmed
+  in the workspace is installed within seconds.
 
 ## Creating a skill or expert template from chat
 

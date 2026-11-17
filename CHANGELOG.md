@@ -11,11 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `market-client search`: search the skills listed for the organization.
-- `market-client install-permission`: who may confirm installs on this Agent
-  (display names when the market gives them, otherwise member ids).
+- `market-client install-permission`: who may install on this Agent (the
+  owner, org admins) and who may confirm in chat (the owner), with display
+  names when the market gives them.
 - The service checks each pending install request every ~15 seconds (backing
   off on errors, stopping when it is decided or expires) and pulls the
-  install orders as soon as it is confirmed on the workspace card.
+  install orders as soon as it is confirmed in the workspace.
 - `market-client request-install`: propose 1 to 3 skills for this Agent;
   nothing is installed until a person chooses and confirms. `install-requests`
   lists the requests.
@@ -32,9 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - SKILL.md tells the Agent about the Agent Market: search when a task needs a
   capability it lacks, propose up to 3 skills, install only with a person's
-  confirmation (workspace card, or the owner's explicit permission in chat
-  elsewhere; nobody else's), and say who must confirm when the owner may
-  not; create skills and templates only at the owner's request.
+  confirmation (the owner's explicit permission in the conversation, then
+  `confirm-install`; nobody else's), and say an org admin must install it
+  when the Agent has no owner; create skills and templates only at the
+  owner's request.
 - Market problem responses keep the registered fields that explain a refusal
   (`field`, `rule`, `rule_class`, `sentence`, `file`, `skill_md_rule`,
   `expected_slug`, `queue_limit`, `who_can_install`, ...); they are shown to the Agent, not

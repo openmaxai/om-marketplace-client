@@ -54,23 +54,38 @@ function problemFields(data) {
   };
 }
 
-// who_can_install entries as {member_id, display_name}: a bare member id, or an object with member_id (or id) and an
-// optional display_name (or name). Names are cut and stripped of control characters.
+const cleanName = (raw) => (typeof raw === 'string'
+  ? raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 100) || null : null);
+
+// A {member_id, display_name} person; null when member_id is not an id.
+export function person(v) {
+  if (v === null || typeof v !== 'object' || !isOrgOrMemberId(v.member_id)) return null;
+  return { member_id: v.member_id, display_name: cleanName(v.display_name) };
+}
+
+const ROLE_RE = /^[a-z][a-z0-9_]{0,31}$/;
+
+// who_can_install entries: {role, member_id (null for a group such as org_admins), display_name}. Entries with an
+// unreadable role or member id are dropped.
 export function installers(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
   for (const e of list.slice(0, 50)) {
-    const id = typeof e === 'string' ? e : e?.member_id ?? e?.id;
-    if (!isOrgOrMemberId(id)) continue;
-    const raw = typeof e === 'object' ? e?.display_name ?? e?.name : null;
-    const name = typeof raw === 'string' ? raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 100) : '';
-    out.push({ member_id: id, display_name: name || null });
+    if (e === null || typeof e !== 'object' || typeof e.role !== 'string' || !ROLE_RE.test(e.role)) continue;
+    if (e.member_id != null && !isOrgOrMemberId(e.member_id)) continue;
+    out.push({ role: e.role, member_id: e.member_id ?? null, display_name: cleanName(e.display_name) });
   }
   return out;
 }
 
-// Names when the market gives them, else member ids.
-export const installerList = (list) => list.map((w) => (w.display_name ? `${w.display_name} (${w.member_id})` : w.member_id)).join(', ');
+const ROLE_TEXT = { owner: 'the owner', org_admins: 'org admins' };
+export const personText = (p) => (p.display_name ? `${p.display_name} (${p.member_id})` : p.member_id);
+
+// "the owner Ana (id), org admins": names when the market gives them, else member ids.
+export const installerList = (list) => list.map((w) => {
+  const role = ROLE_TEXT[w.role] ?? w.role.replaceAll('_', ' ');
+  return w.member_id ? `${role} ${personText(w)}` : role;
+}).join(', ');
 
 // Registered problem extension fields that explain a refused submission to its author; never logged.
 const EXTRA_TEXT = { detail: 512, field: 256, rule: 64, rule_class: 64, sentence: 1000, skill_md_rule: 64, file: 512, expected_slug: 64, previous_version: 64 };

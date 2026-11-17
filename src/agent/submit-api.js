@@ -158,6 +158,7 @@ export function explainSubmitError(err) {
     case 'VERSION_REVOKED':
       return 'refused: this exact content was blocked by the market';
     case 'REVIEW_STATE_CONFLICT':
+      if (err.reason === 'already_submitted') return 'this exact manifest was already submitted and is waiting for review; nothing new was submitted';
       return `refused: ${err.reason === 'personal_templates_disabled' ? 'expert templates cannot be submitted in this market now' : `review state conflict (${err.reason ?? 'unknown'})`}`;
     default:
       return err.transient
