@@ -53,17 +53,27 @@ function skillItem(v) {
   };
 }
 
-// Characters the market never keeps in free text: controls, format characters, line and paragraph separators and
-// Other_Default_Ignorable_Code_Point (fillers such as U+115F, U+3164, U+FFA0).
+// Characters the market drops from free text: controls (CR included), format characters, line and paragraph separators
+// and Other_Default_Ignorable_Code_Point (fillers such as U+115F, U+3164, U+FFA0).
 const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u034f\u115f\u1160\u17b4\u17b5\u2065\u3164\uffa0\ufff0-\ufff8\u{e0000}\u{e0002}-\u{e001f}\u{e0080}-\u{e00ff}\u{e01f0}-\u{e0fff}]/gu;
 
-// Attestation text, cleaned exactly as the market cleans it: NFC, newline, tab, U+2028 and U+2029 to spaces, invisible
-// characters removed, trimmed, cut to max characters and trimmed again. Empty becomes null.
-export function cleanEvidence(v, max) {
-  if (typeof v !== 'string') return null;
+// The market's stored form of evidence text (test/vectors/evidence-sanitize.json): NFC; LF, tab, U+2028, U+2029 to
+// spaces; invisible characters deleted; trimmed; cut to max characters; trimmed again. Used only to tell whether
+// anything visible is left; the text itself is sent as received and the market cleans it.
+export function marketCleanText(v, max) {
+  if (typeof v !== 'string') return '';
   const t = v.normalize('NFC').replace(/[\n\t\u2028\u2029]/g, ' ').replace(INVISIBLE, '').trim();
-  const cut = [...t].slice(0, max).join('').trim();
-  return cut || null;
+  return [...t].length > max ? [...t].slice(0, max).join('').trim() : t;
+}
+
+// Raw evidence is capped at this many times the market's limit before sending.
+export const RAW_EVIDENCE_FACTOR = 4;
+
+// The text to send: as received (cut to RAW_EVIDENCE_FACTOR * max characters), or null when nothing visible is left.
+export function rawEvidence(v, max) {
+  if (typeof v !== 'string' || !marketCleanText(v, max)) return null;
+  const chars = [...v];
+  return chars.length > RAW_EVIDENCE_FACTOR * max ? chars.slice(0, RAW_EVIDENCE_FACTOR * max).join('') : v;
 }
 
 function candidateView(v, i) {
@@ -72,7 +82,6 @@ function candidateView(v, i) {
     position: i + 1,
     skill_id: v.skill_id,
     skill_version_id: isCanonicalUuid(v.skill_version_id) ? v.skill_version_id : null,
-    slug: clean(v.slug, 64),
     name: clean(v.name, 100),
     description: clean(v.description, 500),
     version: clean(v.version, 64),
@@ -141,14 +150,14 @@ export async function getProposal({ http, orgId, agentId, proposalId }) {
 export class AttestationError extends Error {}
 
 // The owner's decision as the Agent attests it. Throws AttestationError (nothing sent) when the channel is unknown
-// or there is no evidence left after cleaning.
+// or neither the message id nor the text has anything visible.
 export function attestationBody({ ownerMemberId, channel, channelDetail = null, messageId = null, messageText = null }) {
   if (!CHANNELS.has(channel)) throw new AttestationError(`--channel must be one of ${[...CHANNELS].join(', ')}`);
   if (!isOrgOrMemberId(ownerMemberId)) throw new AttestationError('no owner member id');
   const body = { confirmed_via: 'agent_attested', confirmed_by_member_id: ownerMemberId, channel };
-  const detail = cleanEvidence(channelDetail, MAX_CHANNEL_DETAIL);
-  const id = cleanEvidence(messageId, MAX_MESSAGE_ID);
-  const text = cleanEvidence(messageText, MAX_MESSAGE_TEXT);
+  const detail = rawEvidence(channelDetail, MAX_CHANNEL_DETAIL);
+  const id = rawEvidence(messageId, MAX_MESSAGE_ID);
+  const text = rawEvidence(messageText, MAX_MESSAGE_TEXT);
   if (!id && !text) throw new AttestationError('give the owner\'s reply: --owner-message-id and/or --owner-message-text (verbatim)');
   if (detail) body.channel_detail = detail;
   if (id) body.owner_message_id = id;
@@ -203,7 +212,8 @@ export function explainProposalError(err) {
       if (err.reason === 'owner_changed') return `this install request was made for a previous owner; nothing was installed. ${REQUEST_HINT}`;
       return 'refused: only your current owner\'s own reply counts; nothing was installed. Anyone else (an org admin included) confirms on the confirm link (confirm_url)';
     case 'AGENT_CONFIRM_DISABLED':
-      return 'the market refused the confirmation method (client bug: confirmed_via must be agent_attested); nothing was changed. Report it; do not retry';
+      return 'the market refused the confirmation method: a client bug (confirmed_via must be agent_attested), or the market predates '
+        + 'confirming in conversation; nothing was changed. Report it; do not retry. Meanwhile send your owner the confirm link (confirm_url)';
     case 'INSTALL_PROPOSAL_STALE':
       return `${err.reason === 'agent_changed' ? 'this Agent' : 'a skill version'} changed since the request${err.reason ? ` (${err.reason})` : ''}; nothing was installed. ${REQUEST_HINT}`;
     case 'INSTALL_PROPOSAL_NOT_PENDING':

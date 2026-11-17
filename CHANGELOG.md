@@ -10,23 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.0] - 2026-11-18
 
 ### Added
-- `market-client confirm-install <proposal_id> (all | <n|slug|skill_id> ...)`
+- `market-client confirm-install <proposal_id> (all | <n|skill_id> ...)`
   and `decline-install <proposal_id>`: when the Agent's owner replies to an
   install request in a direct conversation with the Agent (Workspace or a
   channel DM), the Agent confirms or declines it as `agent_attested`, with
   `--channel workspace|lark|telegram|other`, optional `--channel-detail` and
   the owner's reply as `--owner-message-id` and/or `--owner-message-text`
-  (at least one). The selection is matched against the request's candidates
-  only and sent with the versions the request pinned; the owner comes from
-  `install-permission`. Text is cleaned and capped as the market does.
+  or `--owner-message-text-stdin` (at least one). The selection is matched
+  against the request's candidates only (numbers or skill ids) and sent with
+  the versions the request pinned; the owner comes from `install-permission`.
+  Evidence is sent as received; the market cleans and caps it, and the
+  client refuses locally evidence with nothing visible left after the same
+  cleaning (shared vectors in `test/vectors/evidence-sanitize.json`).
   Channel, evidence, selection and a missing owner are checked before
-  anything is sent. A confirmed request stays watched so its orders are
+  anything is sent.
+- Rollout order: market, then cws-core, then this client. Against an older
+  cws-core the confirm route answers 404, reported as "not supported yet"
+  (send the confirm link instead); an older market answers
+  `AGENT_CONFIRM_DISABLED`. The market's minimum client version is not
+  raised for this feature. A confirmed request stays watched so its orders are
   pulled within seconds; a declined one is no longer watched.
 - Messages for `AGENT_ATTESTATION_REFUSED` (`not_owner`, `owner_changed`),
   `INSTALL_PROPOSAL_STALE`, `INSTALL_PROPOSAL_NOT_PENDING` and
   `VALIDATION_FAILED` fields.
 
 ### Changed
+- Local usage errors of the Agent market commands (bad arguments or
+  options) exit 2 as documented, not 3. A repeated option other than
+  `--reason` is a usage error.
 - `request-install` and `install-requests` number the candidates (1 to 3)
   with name and a one-line purpose; `request-install` prints a ready
   proposal for the owner (`owner_prompt` in `--json`).

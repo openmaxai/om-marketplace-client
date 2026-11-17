@@ -201,8 +201,8 @@ function renderProposal(p) {
   for (const c of p.candidates) {
     const mark = c.selected === true ? ' [selected]' : c.selected === false ? ' [not selected]' : '';
     const what = purpose(c);
-    lines.push(`  ${c.position}. ${c.name ?? c.slug ?? c.skill_id}${c.version ? ` ${c.version}` : ''}${what ? ` — ${what}` : ''}${mark}`);
-    lines.push(`     skill_id ${c.skill_id}${c.slug ? `, slug ${c.slug}` : ''}${c.intent_id ? `, install order ${c.intent_id}` : ''}`);
+    lines.push(`  ${c.position}. ${c.name ?? c.skill_id}${c.version ? ` ${c.version}` : ''}${what ? ` — ${what}` : ''}${mark}`);
+    lines.push(`     skill_id ${c.skill_id}${c.intent_id ? `, install order ${c.intent_id}` : ''}`);
     if (c.reason) lines.push(`     reason: ${c.reason.replace(/\n+/g, ' ')}`);
   }
   if (p.confirmed_via) {
@@ -217,13 +217,13 @@ function renderProposal(p) {
 
 // The proposal the Agent puts to its owner, numbered (PRD wording).
 export function ownerPrompt(p) {
-  const list = p.candidates.map((c) => `${CIRCLED[c.position - 1] ?? `${c.position}.`} ${c.name ?? c.slug ?? c.skill_id}${purpose(c) ? ` — ${purpose(c)}` : ''}`).join(' ');
+  const list = p.candidates.map((c) => `${CIRCLED[c.position - 1] ?? `${c.position}.`} ${c.name ?? c.skill_id}${purpose(c) ? ` — ${purpose(c)}` : ''}`).join(' ');
   const n = p.candidates.length;
   const how = n === 1 ? '要装的话回复「装 1」或「装」' : '要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」';
   return `组织市场里有 ${n} 个技能能做：${list} ${how}；不装回复「不装」或「都不装」。安装要我的负责人确认。`;
 }
 
-// Resolves the owner's selection against the request's candidates only: all, 1-based numbers, slugs or skill ids.
+// Resolves the owner's selection against the request's candidates only: all, 1-based numbers or skill ids.
 export function selectCandidates(p, refs) {
   const usage = (m) => { throw new SubmitError('usage', m); };
   const parts = refs.flatMap((r) => String(r).split(',')).map((r) => r.trim()).filter(Boolean);
@@ -234,8 +234,8 @@ export function selectCandidates(p, refs) {
   }
   const picked = parts.map((r) => {
     const c = /^\d+$/.test(r) ? p.candidates.find((x) => x.position === Number(r))
-      : p.candidates.find((x) => x.skill_id === r || (x.slug && x.slug === r));
-    if (!c) usage(`${r} is not a candidate of this request (1 to ${p.candidates.length}, a slug or skill_id from it)`);
+      : p.candidates.find((x) => x.skill_id === r);
+    if (!c) usage(`${r} is not a candidate of this request (1 to ${p.candidates.length}, or a skill_id from it)`);
     return c;
   });
   if (new Set(picked.map((c) => c.skill_id)).size !== picked.length) usage('the same candidate is selected twice');
@@ -252,6 +252,8 @@ async function ownerMemberId(ctx) {
   return owner.member_id;
 }
 
+const ROUTE_MISSING = 'the workspace does not support confirming install requests in conversation yet (404 on the confirm route; '
+  + 'the market or the workspace server is older than this client); nothing was changed. Send your owner the confirm link (confirm_url) instead';
 const ORDER_ERRORS = new Set(['AGENT_NO_CLIENT', 'AGENT_QUEUE_FULL', 'VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED']);
 
 // Resolves a slug to a skill id with one exact-slug search.
@@ -307,7 +309,7 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
   const out = (obj, text) => print(opts.json ? JSON.stringify(obj, null, 2) : text);
   const refuse = (code, message, extra = {}) => {
     out({ ok: false, error: code, message, ...extra }, `${cmd} refused: ${message}`);
-    return EXIT.REFUSED;
+    return code === 'usage' ? EXIT.USAGE : EXIT.REFUSED;
   };
   let orgId;
   let reasons;
@@ -376,6 +378,8 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
           : await declineProposal({ ...ctx, proposalId, ...att });
       } catch (err) {
         if (picked && ORDER_ERRORS.has(err?.code)) err.orderRefused = true;
+        // The request was just read, so a 404 here means the route is missing: market or cws-core predates this.
+        if (err instanceof MarketError && err.status === 404) err.routeMissing = true;
         throw err;
       }
       if (dataDir) {
@@ -390,7 +394,7 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
       let say;
       if (picked) {
         const chosen = new Set(picked.map((c) => c.skill_id));
-        const name = (c) => c.name ?? c.slug ?? c.skill_id;
+        const name = (c) => c.name ?? c.skill_id;
         const left = p.candidates.filter((c) => !chosen.has(c.skill_id)).map(name);
         say = `已确认，正在安装${quoted(picked.map(name))}，我空闲时会自动生效。${left.length ? `${quoted(left)}没选，这次不装。` : ''}`;
       } else {
@@ -422,7 +426,8 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
     throw new SubmitError('usage', `unknown command ${cmd}`);
   } catch (err) {
     if (err instanceof SubmitError) return refuse(err.code, err.message);
-    const message = `${explainProposalError(err)}${err?.orderRefused ? '. The install request is waiting for a decision again' : ''}`;
+    const message = err?.routeMissing ? ROUTE_MISSING
+      : `${explainProposalError(err)}${err?.orderRefused ? '. The install request is waiting for a decision again' : ''}`;
     const extra = {
       status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null, field: err.extra?.field ?? null,
       retry_after_s: err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : null,

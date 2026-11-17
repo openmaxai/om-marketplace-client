@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { FAKE_KEY, VALID_ENV, tmpHome } from './helpers.js';
+import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
+import { spawn } from 'node:child_process';
 import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { cleanEvidence, confirmUrl, proposalView } from '../src/agent/proposals-api.js';
+import { confirmUrl, marketCleanText, proposalView, rawEvidence } from '../src/agent/proposals-api.js';
 import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
 import fs from 'node:fs';
@@ -53,8 +54,8 @@ test('search sends the query, shows market text as data with controls removed', 
 
 test('search refuses bad options locally and explains a rate limit', async (t) => {
   const s = await setup(t);
-  assert.equal(await s.run('search', ['x'], { limit: '21' }), 3);
-  assert.equal(await s.run('search', ['x'.repeat(101)]), 3);
+  assert.equal(await s.run('search', ['x'], { limit: '21' }), 2);
+  assert.equal(await s.run('search', ['x'.repeat(101)]), 2);
   assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/market-skills:search`, problem(429, { code: 'RATE_LIMITED', reason: 'agent_search' }, { 'retry-after': '30' }));
   assert.equal(await s.run('search'), 3);
@@ -85,11 +86,11 @@ test('request-install proposes up to 3 candidates, resolving slugs, with one rea
 
 test('request-install refusals', async (t) => {
   const s = await setup(t);
-  assert.equal(await s.run('request-install', [U(1)], {}), 3);
+  assert.equal(await s.run('request-install', [U(1)], {}), 2);
   assert.match(s.text(), /--reason/);
-  assert.equal(await s.run('request-install', [U(1), U(2)], { reason: ['a', 'b', 'c'] }), 3);
-  assert.equal(await s.run('request-install', [U(1), U(1)], { reason: ['a'] }), 3);
-  assert.equal(await s.run('request-install', [U(1), U(2), U(3), U(4)], { reason: ['a'] }), 3);
+  assert.equal(await s.run('request-install', [U(1), U(2)], { reason: ['a', 'b', 'c'] }), 2);
+  assert.equal(await s.run('request-install', [U(1), U(1)], { reason: ['a'] }), 2);
+  assert.equal(await s.run('request-install', [U(1), U(2), U(3), U(4)], { reason: ['a'] }), 2);
   assert.equal(s.fake.requests.length, 0);
   s.fake.script('POST', `${A}/install-proposals`,
     problem(409, { code: 'SKILL_ALREADY_INSTALLED', detail: 'candidate 1 is already installed' }),
@@ -149,7 +150,7 @@ test('install-requests refreshes the local records one by one, newest first, mar
   out.length = 0;
   assert.equal(await run('install-requests', [], { state: 'superseded', json: true }), 0);
   assert.deepEqual(JSON.parse(out.join('\n')).items.map((p) => p.proposal_id), [U(13), U(10)]);
-  assert.equal(await run('install-requests', [], { state: 'bogus' }), 3);
+  assert.equal(await run('install-requests', [], { state: 'bogus' }), 2);
 });
 
 test('request-install gives the confirm link when the market returns one', async (t) => {
@@ -191,7 +192,7 @@ test('a request refused while the previous one is being confirmed keeps watching
 const PERM = { status: 200, json: { agent_id: AGENT, who_can_install: [{ role: 'owner', member_id: OWNER, display_name: 'Ana' }, { role: 'org_admins', member_id: null }], caller_can_install: false } };
 const P = `${A}/install-proposals/${U(10)}`;
 const EVIDENCE = { channel: 'lark', channelDetail: 'DM', ownerMessageId: 'om_1', ownerMessageText: '装 1 和 3' };
-const three = () => proposal({ candidates: [cand(1, { slug: 'pdf-tables' }), cand(5), cand(6)] });
+const three = () => proposal({ candidates: [cand(1), cand(5), cand(6)] });
 
 async function setupWatched(t) {
   const s = await setup(t);
@@ -217,13 +218,13 @@ test('confirm-install all sends every candidate with its pinned version as attes
   assert.match(s.text(), /「已确认，正在安装「Skill 1」「Skill 5」「Skill 6」，我空闲时会自动生效。」/);
 });
 
-test('confirm-install a subset by number and slug keeps the selection order and names the rest', async (t) => {
+test('confirm-install a subset by number and skill id keeps the selection order and names the rest', async (t) => {
   const s = await setupWatched(t);
   s.fake.script('GET', P, { status: 200, json: three() }, { status: 200, json: three() });
   s.fake.script('GET', `${A}/install-permission`, PERM, PERM);
   const done = proposal({ state: 'confirmed', candidates: [cand(1, { selected: true }), cand(5, { selected: false }), cand(6, { selected: true })] });
   s.fake.script('POST', `${P}:confirm`, { status: 200, json: done }, { status: 200, json: done });
-  assert.equal(await s.run('confirm-install', [U(10), '3', 'pdf-tables'], { channel: 'workspace', ownerMessageId: 'm9' }), 0);
+  assert.equal(await s.run('confirm-install', [U(10), '3', U(1)], { channel: 'workspace', ownerMessageId: 'm9' }), 0);
   let post = s.fake.market().filter((r) => r.method === 'POST')[0];
   assert.deepEqual([post.json.skill_ids, post.json.skill_version_ids], [[U(6), U(1)], [U(56), U(51)]]);
   assert.equal(post.json.channel, 'workspace');
@@ -255,19 +256,19 @@ test('confirm-install and decline-install refuse locally without sending anythin
     ['decline-install', [U(10)], { channel: 'telegram' }, /--owner-message-id/],
   ]) {
     s.reset();
-    assert.equal(await s.run(cmd, args, opts), 3, `${cmd} ${args} ${JSON.stringify(opts)}`);
+    assert.equal(await s.run(cmd, args, opts), 2, `${cmd} ${args} ${JSON.stringify(opts)}`);
     assert.match(s.text(), re);
   }
   assert.equal(s.fake.requests.length, 0);
-  for (const [sel, re] of [[['4'], /4 is not a candidate/], [['1', 'pdf-tables'], /selected twice/], [['all', '2'], /"all" cannot be combined/],
-    [['other-slug'], /not a candidate/], [[U(9)], /not a candidate/], [[','], /use decline-install/]]) {
+  for (const [sel, re] of [[['4'], /4 is not a candidate/], [['1', U(1)], /selected twice/], [['all', '2'], /"all" cannot be combined/],
+    [['weekday-helper'], /not a candidate/], [[U(9)], /not a candidate/], [[','], /use decline-install/]]) {
     s.fake.script('GET', P, { status: 200, json: three() });
     s.reset();
-    assert.equal(await s.run('confirm-install', [U(10), ...sel], EVIDENCE), 3, String(sel));
+    assert.equal(await s.run('confirm-install', [U(10), ...sel], EVIDENCE), 2, String(sel));
     assert.match(s.text(), re);
   }
   s.fake.script('GET', P, { status: 200, json: proposal({ candidates: [cand(1, { skill_version_id: null })] }) });
-  assert.equal(await s.run('confirm-install', [U(10), '1'], EVIDENCE), 3);
+  assert.equal(await s.run('confirm-install', [U(10), '1'], EVIDENCE), 2);
   assert.match(s.text(), /no pinned version for candidate 1/);
   assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
 });
@@ -283,23 +284,27 @@ test('confirm-install refuses locally when the Agent has no owner', async (t) =>
   assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
 });
 
-test('attestation text is cleaned and cut like the market does', async (t) => {
-  assert.equal(cleanEvidence(' a\u202eb\u200bc\u2066d\u0000e\nf\tg\u00ad ', 500), 'abcde f g');
-  assert.equal(cleanEvidence('e\u0301', 10), '\u00e9');
-  assert.equal(cleanEvidence('\u200b', 10), null);
-  assert.equal(cleanEvidence('a\u2028b\u2029c\r\u3164d\u115f\uffa0\u034f\u{e0041}e', 50), 'a b cde');
-  for (const blank of ['\u3164', '\u2028\u2029', '\u3164\u115f\u1160\uffa0\u034f\u17b4\u200b\u2066\u{e0020} \n\t']) assert.equal(cleanEvidence(blank, 500), null);
+const VECTORS = JSON.parse(fs.readFileSync(new URL('./vectors/evidence-sanitize.json', import.meta.url), 'utf8')).vectors;
+
+test('the emptiness check cleans evidence as the market stores it (shared vectors)', () => {
+  assert.ok(VECTORS.length >= 20);
+  for (const v of VECTORS) {
+    assert.equal(marketCleanText(v.input, v.max), v.market, v.name);
+    assert.equal(rawEvidence(v.input, v.max) === null, v.empty, v.name);
+  }
+});
+
+test('evidence is sent as received; only an oversized value is cut', async (t) => {
   const s = await setupWatched(t);
   s.fake.script('GET', P, { status: 200, json: three() });
   s.fake.script('GET', `${A}/install-permission`, PERM);
   s.fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'agent_attested' }) });
-  assert.equal(await s.run('decline-install', [U(10)], {
-    channel: 'other', channelDetail: `${'d'.repeat(100)}`, ownerMessageId: `${'i'.repeat(250)}`, ownerMessageText: `不装\u202e${'x'.repeat(600)}`,
-  }), 0);
+  const text = ` 不装\r\n\u202e"$(x)\` ${'x'.repeat(2500)}`;
+  assert.equal(await s.run('decline-install', [U(10)], { channel: 'other', channelDetail: '\u3164', ownerMessageId: `${'i'.repeat(250)}`, ownerMessageText: text }), 0);
   const post = s.fake.market().find((r) => r.method === 'POST');
-  assert.equal(post.json.channel_detail, 'd'.repeat(64));
-  assert.equal(post.json.owner_message_id, 'i'.repeat(200));
-  assert.equal(post.json.owner_message_text, `不装${'x'.repeat(498)}`);
+  assert.equal('channel_detail' in post.json, false);
+  assert.equal(post.json.owner_message_id, 'i'.repeat(250));
+  assert.equal(post.json.owner_message_text, [...text].slice(0, 4 * 500).join(''));
 });
 
 test('decline-install sends no skills, drops the watch and tells the owner', async (t) => {
@@ -323,7 +328,8 @@ test('confirm-install explains each market refusal', async (t) => {
   const cases = [
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*confirm_url/],
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }), /made for a previous owner.*request-install/],
-    [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*do not retry/],
+    [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*predates.*do not retry/],
+    [{ status: 404, raw: 'not found' }, /does not support confirming install requests in conversation yet \(404 on the confirm route/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'version_changed' }), /a skill version changed since the request \(version_changed\).*request-install.*ask the owner again/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'agent_changed' }), /this Agent changed since the request/],
     [problem(409, { code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' }), /no longer waiting for a decision \(expired\).*already decided or has expired/],
@@ -368,4 +374,34 @@ test('proposal view keeps the attestation as data and install-requests shows how
   s.reset();
   assert.equal(await s.run('install-requests', []), 0);
   assert.match(s.text(), /confirmed via: card/);
+});
+
+const cliRun = (args, { dataDir, input }) => new Promise((resolve) => {
+  const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), ...args], { env: baseEnv(dataDir) });
+  let stdout = '';
+  child.stdout.on('data', (c) => { stdout += c; });
+  child.on('exit', (code) => resolve({ code, stdout }));
+  child.stdin.end(input ?? '');
+});
+
+test('CLI: the owner reply is read verbatim from stdin; repeated options are usage errors', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:confirm`, { status: 200, json: proposal({ state: 'confirmed' }) });
+  const reply = '装 1 "and" `rm -rf` $(id) \'x\'\nsecond line';
+  const r = await cliRun(['confirm-install', U(10), '1', '--channel', 'telegram', '--owner-message-text-stdin', '--json'], { dataDir, input: `${reply}\n` });
+  assert.equal(r.code, 0, r.stdout);
+  assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, reply);
+  const n = fake.requests.length;
+  for (const args of [
+    ['confirm-install', U(10), '1', '--channel', 'lark', '--channel', 'telegram', '--owner-message-text', 'y'],
+    ['confirm-install', U(10), '1', '--channel', 'lark', '--owner-message-text', 'a', '--owner-message-text', 'b'],
+    ['confirm-install', U(10), '1', '--channel', 'lark', '--owner-message-text', 'a', '--owner-message-text-stdin'],
+  ]) assert.equal((await cliRun(args, { dataDir, input: 'z' })).code, 2, args.join(' '));
+  assert.equal((await cliRun(['decline-install', U(10), '--channel', 'lark', '--owner-message-text-stdin'], { dataDir, input: 'ㅤ\n' })).code, 2);
+  assert.equal(fake.requests.length, n);
 });
