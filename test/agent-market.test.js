@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
 import { spawn, spawnSync } from 'node:child_process';
-import { main, readAllStdin, readCapped, readOwnerMessageFile, trustedDirProblem } from '../src/cli.js';
+import { main, readAllStdin, readCapped, readOwnerMessageFile, replyFileProblem, trustedDirProblem } from '../src/cli.js';
 import crypto from 'node:crypto';
 import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
@@ -616,4 +616,49 @@ test('CLI: a FIFO as --owner-message-file is refused at once instead of waiting 
   assert.equal(r.code, 2);
   assert.match(r.stdout, /not a regular file/);
   assert.ok(Date.now() - started < 10_000);
+});
+
+test('a reply file with another hard link is refused; a fresh mktemp file passes', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  const base = ['decline-install', U(10), '--channel', 'lark', '--owner-message-file'];
+  const reg = (nlink) => ({ isFile: () => true, uid: 7, nlink });
+  assert.equal(replyFileProblem(reg(1), 7), null);
+  assert.equal(replyFileProblem(reg(2), 7), 'reply file has other links');
+  const sub = path.join(tmpHome(), 'secret.env');
+  fs.writeFileSync(sub, 'TOKEN=x');
+  const inTmp = tmpReply(t);
+  fs.linkSync(sub, inTmp);
+  let r = await cliRun([...base, inTmp], { dataDir });
+  assert.equal(r.code, 2);
+  assert.match(r.stdout, /reply file has other links/);
+  const outsideDir = fs.mkdtempSync(path.join(ROOT, '.link-test-'));
+  t.after(() => fs.rmSync(outsideDir, { recursive: true, force: true }));
+  const outside = path.join(outsideDir, 'secret.env');
+  fs.writeFileSync(outside, 'TOKEN=x');
+  const linked = tmpReply(t);
+  let crossFs = true;
+  try { fs.linkSync(outside, linked); } catch (err) { if (err.code === 'EXDEV') crossFs = false; else throw err; }
+  if (crossFs) {
+    r = await cliRun([...base, linked], { dataDir });
+    assert.equal(r.code, 2);
+    assert.match(r.stdout, /reply file has other links/);
+  } else {
+    t.diagnostic('/tmp is on another filesystem; cross-directory hard link from outside /tmp not tested');
+  }
+  assert.equal(fake.market().length, 0);
+  const mk = spawnSync('mktemp', ['/tmp/owner-reply.XXXXXXXXXX'], { encoding: 'utf8' });
+  if (mk.status !== 0) return;
+  const file = mk.stdout.trim();
+  t.after(() => fs.rmSync(file, { force: true }));
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  fs.writeFileSync(file, '不装\n');
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  r = await cliRun([...base, file], { dataDir });
+  assert.equal(r.code, 0, r.stdout);
+  assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, '不装');
 });

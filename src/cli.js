@@ -251,6 +251,14 @@ export function trustedDirProblem(st) {
   return null;
 }
 
+// A reply file must be a regular file of this user with no other name (a hard link could expose any file).
+export function replyFileProblem(st, uid) {
+  if (!st.isFile()) return '--owner-message-file is not a regular file';
+  if (uid !== null && st.uid !== uid) return '--owner-message-file is not owned by this user';
+  if (st.nlink !== 1) return 'reply file has other links';
+  return null;
+}
+
 // Real path of an open file: /proc on Linux; elsewhere the name's real path, accepted only if it is the same file.
 function fdRealPath(fd, name, st) {
   try {
@@ -286,8 +294,8 @@ export function readOwnerMessageFile(file, { trustedDir = TRUSTED_TMP, uid = typ
   }
   try {
     const st = fs.fstatSync(fd);
-    if (!st.isFile()) throw new InputError('--owner-message-file is not a regular file');
-    if (uid !== null && st.uid !== uid) throw new InputError('--owner-message-file is not owned by this user');
+    const problem = replyFileProblem(st, uid);
+    if (problem) throw new InputError(problem);
     let real;
     try { real = fdRealPath(fd, file, st); } catch (err) {
       if (err instanceof InputError) throw err;
