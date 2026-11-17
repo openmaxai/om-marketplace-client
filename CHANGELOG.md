@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-17
+
+### Fixed
+- Starter message: a template adopted within 30 minutes of the last
+  new-session request no longer gets its starter message before the template
+  is in the Agent's session. The new-session request for a starter message is
+  no longer subject to the automatic 30-minute cooldown. It has its own budget
+  instead: at least 2 minutes between two and at most 12 per UTC day, counted
+  apart from the 4 automatic requests a day (neither uses the other's). An
+  adoption written while a request is still on its way joins it, so adoptions
+  close together share one request.
+- When no request may be made for it, the starter message is held until the
+  template is in a session (at most 24 hours) instead of being sent at once.
+  The client asks for the session as soon as the 2-minute interval has passed,
+  or by the automatic rules once the 12 are used. The hold is kept in the
+  client state, so it survives a restart. It comes before the claim, so the
+  send deadline and the market's 10-minute grace still count from the claim.
+
 ## [0.7.0] - 2026-11-17
 
 ### Changed
