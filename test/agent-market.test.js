@@ -79,7 +79,7 @@ test('request-install proposes up to 3 candidates, resolving slugs, with one rea
   assert.deepEqual(Object.keys(req.json).sort(), ['candidates', 'request_id']);
   assert.deepEqual(req.json.candidates, [{ skill_id: U(1), reason: 'why 1' }, { skill_id: U(5), reason: 'why 5' }]);
   assert.match(s.text(), /pending_confirmation \(waiting for the owner's reply or a confirmation on the confirm link, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0 — d\n[\s\S]*\n {2}2\. Skill 5 1\.2\.0 — d\n/);
-  assert.match(s.text(), /「组织市场里有 2 个技能能做：① Skill 1 — d ② Skill 5 — d 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」。安装要我的负责人确认。」/);
+  assert.match(s.text(), /「组织市场里有 2 个技能能做：① Skill 1 — d ② Skill 5 — d 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」或「都不装」。安装要我的负责人确认。」/);
   assert.match(s.text(), /Anyone else confirms on the page: 「请到工作台和我的私聊里确认」/);
 });
 
@@ -247,7 +247,8 @@ test('confirm-install and decline-install refuse locally without sending anythin
     ['confirm-install', [U(10), '1'], {}, /--channel must be one of workspace, lark, telegram, other/],
     ['confirm-install', [U(10), '1'], { channel: 'slack', ownerMessageText: 'yes' }, /--channel/],
     ['confirm-install', [U(10), '1'], { channel: 'lark' }, /--owner-message-id and\/or --owner-message-text/],
-    ['confirm-install', [U(10), '1'], { channel: 'lark', ownerMessageText: ' ​‮\n\u0000 ', ownerMessageId: '⁦⁩' }, /--owner-message-text/],
+    ['confirm-install', [U(10), '1'], { channel: 'lark', ownerMessageText: ' \u200b\u202e\n\u0000 ', ownerMessageId: '\u2066\u2069' }, /--owner-message-text/],
+    ['confirm-install', [U(10), '1'], { channel: 'lark', ownerMessageText: '\u3164\u2028\u2029\u115f\uffa0' }, /--owner-message-text/],
     ['confirm-install', [U(10)], EVIDENCE, /use decline-install/],
     ['confirm-install', ['nope', '1'], EVIDENCE, /proposal_id/],
     ['decline-install', [U(10), '1'], EVIDENCE, /only the install request id/],
@@ -283,15 +284,17 @@ test('confirm-install refuses locally when the Agent has no owner', async (t) =>
 });
 
 test('attestation text is cleaned and cut like the market does', async (t) => {
-  assert.equal(cleanEvidence(' a‮b​c⁦d\u0000e\nf\tg­ ', 500), 'abcde f g');
-  assert.equal(cleanEvidence('é', 10), 'é');
-  assert.equal(cleanEvidence('​', 10), null);
+  assert.equal(cleanEvidence(' a\u202eb\u200bc\u2066d\u0000e\nf\tg\u00ad ', 500), 'abcde f g');
+  assert.equal(cleanEvidence('e\u0301', 10), '\u00e9');
+  assert.equal(cleanEvidence('\u200b', 10), null);
+  assert.equal(cleanEvidence('a\u2028b\u2029c\r\u3164d\u115f\uffa0\u034f\u{e0041}e', 50), 'a b cde');
+  for (const blank of ['\u3164', '\u2028\u2029', '\u3164\u115f\u1160\uffa0\u034f\u17b4\u200b\u2066\u{e0020} \n\t']) assert.equal(cleanEvidence(blank, 500), null);
   const s = await setupWatched(t);
   s.fake.script('GET', P, { status: 200, json: three() });
   s.fake.script('GET', `${A}/install-permission`, PERM);
   s.fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined', confirmed_via: 'agent_attested' }) });
   assert.equal(await s.run('decline-install', [U(10)], {
-    channel: 'other', channelDetail: `${'d'.repeat(100)}`, ownerMessageId: `${'i'.repeat(250)}`, ownerMessageText: `不装‮${'x'.repeat(600)}`,
+    channel: 'other', channelDetail: `${'d'.repeat(100)}`, ownerMessageId: `${'i'.repeat(250)}`, ownerMessageText: `不装\u202e${'x'.repeat(600)}`,
   }), 0);
   const post = s.fake.market().find((r) => r.method === 'POST');
   assert.equal(post.json.channel_detail, 'd'.repeat(64));
@@ -347,7 +350,7 @@ test('confirm-install explains each market refusal', async (t) => {
 test('proposal view keeps the attestation as data and install-requests shows how it was confirmed', async (t) => {
   const v = proposalView(proposal({
     state: 'confirmed', confirmed_via: 'agent_attested', confirmed_by_member_id: OWNER,
-    attestation: { agent_id: AGENT, channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1‮' },
+    attestation: { agent_id: AGENT, channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1\u202e' },
   }));
   assert.deepEqual(v.attestation, { agent_id: AGENT, channel: 'lark', channel_detail: 'DM', owner_message_id: 'om_1', owner_message_text: '装 1' });
   assert.deepEqual([v.confirmed_via, v.confirmed_by_member_id], ['agent_attested', OWNER]);

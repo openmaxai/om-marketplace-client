@@ -149,14 +149,16 @@ search the market before saying it cannot be done:
    `--json`).
 3. Propose it to your owner in your direct conversation with them: what the
    task needs, the numbered candidates, and how to reply, for example:
-   「这个任务要从 PDF 里提取表格，我现在做不好。组织市场里有 2 个技能能做：① PDF 表格提取 — … ② 文档解析 — … 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」。安装要我的负责人确认。」
+   「这个任务要从 PDF 里提取表格，我现在做不好。组织市场里有 2 个技能能做：① PDF 表格提取 — … ② 文档解析 — … 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」或「都不装」。安装要我的负责人确认。」
 4. Act on your owner's reply (rules below):
    - Yes to some or all (「装 1」「装 1 和 3」「都装」) → `market-client
      confirm-install <proposal_id> <all | 1 3 ...> --channel
      <workspace|lark|telegram|other> --owner-message-id <id of that reply,
      when your runtime gives one> --owner-message-text "<the reply,
      verbatim>"`. At least one of the two message options is required.
-   - No (「不装」「都不要」) → `market-client decline-install <proposal_id>`
+     `--channel` is where the owner replied: 飞书/Lark → `lark`, Telegram →
+     `telegram`, the Workspace chat → `workspace`, anything else → `other`.
+   - No (「不装」「都不装」「都不要」) → `market-client decline-install <proposal_id>`
      with the same `--channel` and message options.
    - Unclear ("maybe", "later", a question) → ask again; run nothing.
 

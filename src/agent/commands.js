@@ -220,7 +220,7 @@ export function ownerPrompt(p) {
   const list = p.candidates.map((c) => `${CIRCLED[c.position - 1] ?? `${c.position}.`} ${c.name ?? c.slug ?? c.skill_id}${purpose(c) ? ` — ${purpose(c)}` : ''}`).join(' ');
   const n = p.candidates.length;
   const how = n === 1 ? '要装的话回复「装 1」或「装」' : '要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」';
-  return `组织市场里有 ${n} 个技能能做：${list} ${how}；不装回复「不装」。安装要我的负责人确认。`;
+  return `组织市场里有 ${n} 个技能能做：${list} ${how}；不装回复「不装」或「都不装」。安装要我的负责人确认。`;
 }
 
 // Resolves the owner's selection against the request's candidates only: all, 1-based numbers, slugs or skill ids.

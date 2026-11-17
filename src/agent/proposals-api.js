@@ -53,11 +53,15 @@ function skillItem(v) {
   };
 }
 
-// Attestation text, cleaned as the market cleans it: NFC, newlines and tabs to spaces, control and format
-// characters removed, trimmed, cut to max characters (no ellipsis). Empty becomes null.
+// Characters the market never keeps in free text: controls, format characters, line and paragraph separators and
+// Other_Default_Ignorable_Code_Point (fillers such as U+115F, U+3164, U+FFA0).
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u034f\u115f\u1160\u17b4\u17b5\u2065\u3164\uffa0\ufff0-\ufff8\u{e0000}\u{e0002}-\u{e001f}\u{e0080}-\u{e00ff}\u{e01f0}-\u{e0fff}]/gu;
+
+// Attestation text, cleaned exactly as the market cleans it: NFC, newline, tab, U+2028 and U+2029 to spaces, invisible
+// characters removed, trimmed, cut to max characters and trimmed again. Empty becomes null.
 export function cleanEvidence(v, max) {
   if (typeof v !== 'string') return null;
-  const t = v.normalize('NFC').replace(/[\r\n\t]/g, ' ').replace(/[\p{Cc}\p{Cf}]/gu, '').trim();
+  const t = v.normalize('NFC').replace(/[\n\t\u2028\u2029]/g, ' ').replace(INVISIBLE, '').trim();
   const cut = [...t].slice(0, max).join('').trim();
   return cut || null;
 }
