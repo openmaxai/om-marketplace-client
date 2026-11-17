@@ -29,6 +29,12 @@ lifecycle:
 bin:
   market-client: src/cli.js
 
+next-steps: >-
+  Run `market-client start` now. It runs the post-install hook, starts the
+  zylos-om-marketplace-client service under pm2, saves the pm2 process list and
+  waits for the first successful pull from Agent Market. Report the install as
+  done only when it exits 0; otherwise report its output as the failure.
+
 upgrade:
   repo: github:openmaxai/om-marketplace-client
   branch: main
@@ -110,15 +116,21 @@ through the control queue, to start a new session with the new-session skill
 (one queued request at a time, at most every 30 minutes, 4 times a day, 3 times
 per change). A template adopted with a starter message is asked for at once on
 its own budget (Agent idle 30 seconds, at least 2 minutes apart, 12 a day,
-apart from the automatic 4); when that budget does not allow it, the starter
-message waits until the template is in a session. Templates adopted before 0.6.0 are confirmed by the next natural
+apart from the automatic 4); when the Agent is busy or that budget does not
+allow it, the starter message waits until the template is in a session. Templates adopted before 0.6.0 are confirmed by the next natural
 session. The first shard records what the
 session was given in `injected.json`; from that the client reports
 `template_activated` (or `template_inject_missing`) to the market at once.
 
 ## Commands
 
-`market-client status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`.
+`market-client start | status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`.
+`zylos add om-marketplace-client --json` returns before the post-install hook and
+the service start; run `market-client start` after it. `start` runs the
+post-install hook (an existing config is kept), starts the pm2 service when it
+is not online (or restarts it when the config changed), runs `pm2 save`, then
+asks the service for one poll round and exits 0 only when the service runs and
+its install order pull succeeded.
 The Agent never installs or upgrades on its own; those run only from workbench
 orders. Enable, disable, uninstall and rollback change the skill locally, then
 report it. While the service runs, commands are handed to it. Exit codes: 0 done,

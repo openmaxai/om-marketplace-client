@@ -238,18 +238,21 @@ export function createActivation({
   // True when the Agent may be asked for a new session: the runtime status (fresh) shows it healthy and idle for
   // minIdle seconds with no tool running, and no OpenMax turn is open (also one that ended with a reply within the
   // last 10 minutes). The control queue holds requests while the runtime is not healthy.
-  async function idle(minIdle) {
+  // idleState says 'idle', 'busy', or 'unknown' when the runtime status or the turn state cannot be read.
+  async function idleState(minIdle) {
     const s = readRuntimeStatus(statusFile, now());
-    if (!s || s.state !== 'idle' || s.active_tools !== 0 || !(Number(s.idle_seconds) >= minIdle) || (s.health ?? 'ok') !== 'ok') return false;
-    if (!im?.available()) return true;
+    if (!s) return 'unknown';
+    if (s.state !== 'idle' || s.active_tools !== 0 || !(Number(s.idle_seconds) >= minIdle) || (s.health ?? 'ok') !== 'ok') return 'busy';
+    if (!im?.available()) return 'idle';
     try {
-      return !(await im.openTurn());
+      return (await im.openTurn()) ? 'busy' : 'idle';
     } catch (err) {
       if (!turnWarned) logger.warn(`activation: OpenMax turn state unreadable (${err.message}); no new session is requested while it is`);
       turnWarned = true;
-      return false;
+      return 'unknown';
     }
   }
+  const idle = async (minIdle) => (await idleState(minIdle)) === 'idle';
 
   // The interval since the last request of the list has passed and its daily cap is not reached: the automatic budget
   // by default, the starter message budget with welcome.
@@ -547,25 +550,31 @@ export function createActivation({
     // For a starter message of a just written adoption; returns the time the message may wait until, or null to send it
     // as before. A request still in flight is joined (WELCOME_HOLD_MS). Otherwise, when the Agent has been idle
     // QUICK_IDLE_SECONDS with no open turn, a new session is requested at once on the starter budget, not the automatic
-    // one (WELCOME_HOLD_MS). When that budget does not allow it (WELCOME_REQUEST_INTERVAL_MS since the last one, or
-    // DAILY_WELCOME_REQUESTS reached), the message is held until the record is confirmed (WELCOME_MAX_HOLD_MS at most),
-    // and the check asks for the session once a rule allows it.
+    // one (WELCOME_HOLD_MS). When the Agent is busy, or that budget does not allow it (WELCOME_REQUEST_INTERVAL_MS since
+    // the last one, or DAILY_WELCOME_REQUESTS reached), the message is held until the record is confirmed
+    // (WELCOME_MAX_HOLD_MS at most), and the check asks for the session once the Agent is idle and a rule allows it.
+    // When the runtime or turn state cannot be read, no session could be asked for, so the message is not held.
     async welcome(adoptionId) {
       const has = (p) => Boolean(p?.targets.some((x) => x.adoption_id === adoptionId));
       const p = read().pending;
       if (!has(p)) return null;
       if (inFlight(p)) return now() + WELCOME_HOLD_MS;
-      if (!(await idle(QUICK_IDLE_SECONDS))) return null;
-      const r = await request('starter message', true);
-      // Held also when another request won meanwhile.
-      const q = read().pending;
-      if (!has(q)) return null;
-      if (inFlight(q)) return now() + WELCOME_HOLD_MS;
-      if (r === 'enqueue_failed') return null;
+      const st = await idleState(QUICK_IDLE_SECONDS);
+      if (st === 'unknown') return null;
+      if (st === 'idle') {
+        const r = await request('starter message', true);
+        // Held also when another request won meanwhile.
+        const q = read().pending;
+        if (!has(q)) return null;
+        if (inFlight(q)) return now() + WELCOME_HOLD_MS;
+        if (r === 'enqueue_failed') return null;
+      }
       save((d) => {
         if (has(d.pending)) d.pending.welcome = [...new Set([...(isList(d.pending.welcome) ? d.pending.welcome : []), adoptionId])];
       });
-      logger.info(`activation: no new session may be requested now for the starter message of adoption ${adoptionId}; it waits until the template is in a session`);
+      logger.info(st === 'busy'
+        ? `activation: the Agent is busy; the starter message of adoption ${adoptionId} waits until the template is in a session`
+        : `activation: no new session may be requested now for the starter message of adoption ${adoptionId}; it waits until the template is in a session`);
       return now() + WELCOME_MAX_HOLD_MS;
     },
     // Runs every ACTIVATION_CHECK_MS: confirms from the marker, or asks for a new session once the Agent is idle.

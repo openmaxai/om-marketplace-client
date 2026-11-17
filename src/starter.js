@@ -26,6 +26,13 @@ export const STARTER_WAIT_MS = 8 * 60 * 1000;
 // No send starts later than this after the claim: the DM check before the send may take a few CLI calls (each tried
 // twice), and the send itself up to IM_TIMEOUT_MS, all of which must end before the market's 10-minute grace.
 export const STARTER_SEND_BY_MS = 9 * 60 * 1000;
+// A send whose outcome is unknown is looked up in the conversation by its client message id. Not found is taken as not
+// delivered only this long after the send started (the request may still be in flight); after STARTER_VERIFY_MS without
+// an answer the job is dropped unmarked.
+export const STARTER_VERIFY_SETTLE_MS = 60 * 1000;
+export const STARTER_VERIFY_MS = 10 * 60 * 1000;
+// Allowance for clock skew between this host and the IM service when the lookup decides how far back to read.
+export const LOOKUP_SKEW_MS = 5 * 60 * 1000;
 
 // The short reason code of an IM failure: http_<status>, timeout, exit, unreadable_output, refused, bad_answer (a
 // readable answer of the wrong shape) or error (not an IM failure).
@@ -39,7 +46,9 @@ export function imReason(err) {
 // filter and render the content locally, check that the DM is exactly this Agent and the adopter, send it once, then
 // mark the result. Jobs live in state document `starters`, keyed by adoption id, with stage
 // claim -> checking -> waiting -> sending -> mark. After a restart a checking job is marked send_failed (nothing was
-// sent), a waiting job keeps waiting, and a sending job is dropped unmarked (delivery unknown, never sent again).
+// sent) and a waiting job keeps waiting. A send whose outcome is unknown (a timeout, or a restart during the send) is
+// never sent again: the job moves to stage verifying, where the message is looked up by its client message id and the
+// job marked sent when found, send_failed when it is surely absent, or dropped unmarked when the lookup cannot tell.
 // A send_failed or rejected_content job keeps a short reason code (job.reason), logged with the mark; the market's
 // :mark-starter-shown takes only the result, so the reason stays local.
 // A job queued with hold_until (a new session was requested for its template, or none could be requested yet) is not
@@ -216,13 +225,17 @@ export function createStarter({
       logger.warn(`${tag(job)} not sent: the DM check ended ${STARTER_SEND_BY_MS / 60000} minutes or more after the claim`);
       return finish(job, 'send_failed', 'too_late');
     }
-    put(job.adoption_id, { stage: 'sending' });
     const to = { orgId: job.org_id, conversationId: job.conversation_id, text, noRun };
     const id = job.adoption_id;
+    // The id of the send about to start is stored first, so an unknown outcome can be looked up.
+    const sending = (clientMsgId) => {
+      put(id, { stage: 'sending', client_msg_id: clientMsgId, send_started_at: now() });
+      return clientMsgId;
+    };
     try {
       if (structured && im.supportsStructured?.()) {
         try {
-          await im.sendStructured({ ...to, clientMsgId: `mkt-starter-${id}`, adoptionId: id, fallbackText });
+          await im.sendStructured({ ...to, clientMsgId: sending(`mkt-starter-${id}`), adoptionId: id, fallbackText });
         } catch (err) {
           // Only a definite refusal is sure to have sent nothing, so only then is the plain text sent, once. It must
           // start within the same deadline as the first send, so it too ends before the market's grace.
@@ -232,25 +245,68 @@ export function createStarter({
             throw err;
           }
           logger.warn(`${tag(job)}: structured send refused (${err.message}); sending it once as plain text`);
-          await im.sendText({ ...to, clientMsgId: `mkt-starter-${id}-text` });
+          await im.sendText({ ...to, clientMsgId: sending(`mkt-starter-${id}-text`) });
         }
       } else {
-        await im.sendText({ ...to, clientMsgId: `cmsg_${uuidv7(now())}` });
+        await im.sendText({ ...to, clientMsgId: sending(`cmsg_${uuidv7(now())}`) });
       }
     } catch (err) {
       if (err instanceof ImError && err.definite) {
         logger.warn(`${tag(job)}: send refused (${err.message}); not retried`);
         return finish(job, 'send_failed', `send_refused_${imReason(err)}`);
       }
-      logger.warn(`${tag(job)}: send outcome unknown (${err.message}); not retried and not reported`);
-      return drop(job.adoption_id);
+      return outcomeUnknown(jobs()[id], `send outcome unknown (${err.message})`);
     }
     logger.info(`${tag(job)} sent`);
     return finish(job, 'sent');
   }
 
+  const canLookUp = (job) => typeof im.findMessage === 'function' && typeof job?.client_msg_id === 'string'
+    && Number.isFinite(job?.send_started_at) && typeof job?.conversation_id === 'string';
+
+  // The message is never sent again; it is looked up when it can be, else the job is dropped unmarked.
+  function outcomeUnknown(job, why) {
+    if (!canLookUp(job)) {
+      logger.warn(`${tag(job)}: ${why}; not retried and not reported`);
+      return drop(job.adoption_id);
+    }
+    logger.warn(`${tag(job)}: ${why}; not retried, looking it up in the conversation`);
+    put(job.adoption_id, { stage: 'verifying' });
+    return verify(jobs()[job.adoption_id]);
+  }
+
+  async function verify(job) {
+    if (!canLookUp(job)) {
+      logger.warn(`${tag(job)}: delivery cannot be looked up; not reported`);
+      return drop(job.adoption_id);
+    }
+    let found = 'unknown';
+    try {
+      found = await im.findMessage({
+        orgId: job.org_id, conversationId: job.conversation_id, clientMsgId: job.client_msg_id, since: job.send_started_at - LOOKUP_SKEW_MS,
+      });
+    } catch (err) {
+      logger.debug(`${tag(job)}: lookup failed (${err.message})`);
+    }
+    if (found === 'found') {
+      logger.info(`${tag(job)} found in the conversation; marked sent`);
+      return finish(job, 'sent');
+    }
+    const age = now() - job.send_started_at;
+    if (found === 'absent' && age >= STARTER_VERIFY_SETTLE_MS) {
+      logger.warn(`${tag(job)} not found in the conversation; marked send_failed`);
+      return finish(job, 'send_failed', 'send_lost');
+    }
+    if (age >= STARTER_VERIFY_MS) {
+      logger.warn(`${tag(job)}: delivery still unknown ${STARTER_VERIFY_MS / 60000} minutes after the send; not reported`);
+      return drop(job.adoption_id);
+    }
+    return undefined;
+  }
+
   async function step(job) {
     if (job.stage === 'mark') return mark(job);
+    if (job.stage === 'verifying') return verify(job);
     if (job.stage === 'waiting') return sendWhenFree(job);
     return claimAndSend(job);
   }
@@ -276,12 +332,17 @@ export function createStarter({
 
   async function runJobs(onlyWaiting) {
     for (const job of Object.values(jobs())) {
-      if (onlyWaiting && job.stage !== 'waiting' && !(job.stage === 'claim' && job.hold_until)) continue;
+      if (onlyWaiting && job.stage !== 'waiting' && job.stage !== 'verifying' && !(job.stage === 'claim' && job.hold_until)) continue;
       if (held(job)) continue;
       if (job.stage === 'sending') {
-        logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
-        drop(job.adoption_id);
-        continue;
+        if (!canLookUp(job)) {
+          logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
+          drop(job.adoption_id);
+          continue;
+        }
+        logger.warn(`${tag(job)} was interrupted while sending; it is not sent again, looking it up in the conversation`);
+        put(job.adoption_id, { stage: 'verifying' });
+        job.stage = 'verifying';
       }
       if (job.stage === 'checking') {
         logger.warn(`${tag(job)} was interrupted before sending; reported as send_failed`);
@@ -321,7 +382,7 @@ export function createStarter({
     // Runs every queued job once.
     runAll: () => serial(() => runJobs(false)),
 
-    // Checks the jobs waiting for the DM to be free, and those waiting for their template's session.
+    // Checks the jobs waiting for the DM to be free, for their template's session, or for a delivery lookup.
     runWaiting: () => serial(() => runJobs(true)),
   };
 }

@@ -57,8 +57,18 @@ manually with `zylos add openmaxai/om-marketplace-client`.
    (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).
    The PM2 app filters them out and the service removes any it still inherits,
    logging only their names.
-5. Restart the Agent session once.
-6. Check the service: `pm2 logs zylos-om-marketplace-client --lines 20`.
+5. Run `market-client start`. `zylos add --json` (the mode an Agent uses)
+   returns before the post-install hook and the service start, so this step
+   is required there; after a terminal install it only checks. It runs the
+   post-install hook (an existing config.json is kept), starts the PM2 app
+   from `ecosystem.config.cjs` when it is not online (or restarts it when the
+   hook changed config.json), runs `pm2 save`, waits up to 30 seconds for the
+   service to take the state lock, asks it for one poll round and checks that
+   its install order pull succeeded. It exits 0 only then; otherwise it exits
+   1 (78 for a configuration error) and prints the last pull outcome and the
+   alerts. The install is complete only when it exits 0.
+6. Restart the Agent session once.
+7. Check the service: `pm2 logs zylos-om-marketplace-client --lines 20`.
 
 Configuration errors exit with code 78; PM2 does not restart the service on
 that code. Fix the configuration, then `pm2 restart zylos-om-marketplace-client`.
@@ -118,6 +128,7 @@ write into a directory that is accessible by group or other.
 
 | Command | Effect |
 |---|---|
+| `start` | Runs the post-install hook, starts the service under PM2 when it is not online, runs `pm2 save` and checks that the service pulled install orders from the market (see [Steps](#steps)). Waits up to `--wait` seconds (default 300) for the poll round. |
 | `status [--json]` | Service state, each org's validity, client version gate, last pulls and reconcile, installed skills and templates, queue and outbox sizes, alerts. Reads files only. |
 | `sync` | Runs one poll round now: revocations, orders and outbox resend. Reconcile runs in it only when due (every 45 minutes). |
 | `rollback <slug>` | Swaps the version kept by the last upgrade back in (the replaced one is kept instead) and reports `local_rollback` through reconcile. Refused when the kept version is revoked, when the installed version is revoked and quarantined, or while an order or report for the skill is in flight. An interrupted rollback is completed at the next start. |
@@ -281,15 +292,18 @@ session, so the starter tasks run against it:
   way. These requests are not subject to the automatic 30-minute cooldown or
   the 4 automatic requests a day. They have their own budget: at least 2
   minutes between two, at most 12 per UTC day (loop protection).
-- When that budget does not allow a request (within 2 minutes of the last
-  one, or 12 made today), the message is held until the session has the
-  template. The 30-second check asks for the session as soon as the 2 minutes
-  have passed (Agent idle 30 seconds), or by the automatic rules once the 12
-  are used. This hold is ended by the confirmation, by the adoption no longer
-  waiting (removed, revoked, reported as inject missing), or after 24 hours at
-  the latest, and the message is then handled as below.
-- Otherwise (the Agent busy or in an open turn) the message is handled at once,
-  as before.
+- When the Agent is busy (runtime status not idle for 30 seconds, a tool
+  running, health not ok, or an OpenMax turn open), or that budget does not
+  allow a request (within 2 minutes of the last one, or 12 made today), the
+  message is held until the session has the template. The 30-second check
+  asks for the session on the starter budget as soon as the Agent has been
+  idle 30 seconds and the 2 minutes have passed, or by the automatic rules once
+  the 12 are used. This hold is ended by the confirmation, by the adoption no
+  longer waiting (removed, revoked, reported as inject missing), or after 24
+  hours at the latest, and the message is then handled as below.
+- When the runtime status file is missing or stale, or the OpenMax turn state
+  cannot be read, no session can be asked for, so the message is handled at
+  once, as before.
 
 The hold is kept in the client state with the message job, so a restart
 during it neither loses nor repeats the message. The claim always comes right
@@ -358,26 +372,32 @@ The message is still sent at most once (the claim, and the client message id
    unreadable openmax version, it is sent as plain text (`AGENT_TEXT`, id
    `cmsg_<uuidv7>`) exactly as before 0.7.0. No other send is retried. A
    refused send is `send_failed`. A send whose outcome is unknown (timeout,
-   server error, unreadable output) is not reported at all, so it is not
-   counted as failed.
+   server error, unreadable output, or a restart during the send) is never
+   sent again. The client stores the send's client message id before the
+   send and looks the message up in the DM (`comm.get_messages`, newest
+   first, at most 5 pages, back to 5 minutes before the send). Found: the
+   result is `sent`. Not found once the pages reach that time or the start of
+   the DM, and the send started at least 60 seconds ago: `send_failed`
+   (reason `send_lost`). The lookup is repeated every 30 seconds; when it still
+   cannot tell 10 minutes after the send, the job is dropped unreported.
 7. The result is recorded with `:mark-starter-shown`; only the mark is retried.
    A `send_failed` or `rejected_content` result is logged with a short reason
    code (`dm_check_<failure>` such as `dm_check_unreadable_output`,
    `dm_check_timeout` or `dm_check_http_<status>`; `dm_not_one_to_one`,
    `dm_changed`, `dm_busy`, `too_late`, `content_changed`,
    `content_unavailable`, `no_content`, `too_large`, `asks_for_credential`,
-   `send_refused_http_<status>`, `interrupted`, `internal_error`). The market
+   `send_refused_http_<status>`, `send_lost`, `interrupted`, `internal_error`). The market
    takes only `result`, so the reason is not sent.
 
 The content is the `starter_content` the market puts on the write order
 (`{template_name, first_guide, starter_tasks}`). Without it, without the
 openmax component, or when the message does not fit the IM limits, the message
 is not claimed; the workbench shows the starter tasks as a card instead. A
-message interrupted while sending is not sent again.
+message interrupted while sending is not sent again; it is looked up as above.
 
 The workbench shows the card when the market has no result 10 minutes after the
 claim, or the result is `send_failed`. So the adopter may see both the message
-and the card when a send's outcome was unknown, or when the client stopped
+and the card when a send's outcome stayed unknown, or when the client stopped
 between a successful send and recording the stage after it. A claim answer the
 client cannot read (for example a new `result` value) ends the job without a
 send; the card covers it.
