@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-17
+
 ### Fixed
 - Starter message: lines are now separated by a blank line, so a Markdown (GFM)
   chat renderer shows the greeting, the notice, each guide line and each starter
