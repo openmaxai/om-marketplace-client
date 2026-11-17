@@ -42,9 +42,11 @@ export function imReason(err) {
 // sent), a waiting job keeps waiting, and a sending job is dropped unmarked (delivery unknown, never sent again).
 // A send_failed or rejected_content job keeps a short reason code (job.reason), logged with the mark; the market's
 // :mark-starter-shown takes only the result, so the reason stays local.
-// A job queued with hold_until (a new session was requested for its template) is not claimed before that time while
-// activation.isPending(adoption) holds, so the message follows the session that has the template; the claim still
-// happens right before the send.
+// A job queued with hold_until (a new session was requested for its template, or none could be requested yet) is not
+// claimed before that time while activation.isPending(adoption) holds, so the message follows the session that has
+// the template; the claim still happens right before the send, so a hold never shortens STARTER_WAIT_MS or
+// STARTER_SEND_BY_MS, and the market's grace starts only at the claim. The hold is kept in the job, so it survives a
+// restart.
 // content(job) returns {templateName, firstGuide, starterTasks: [{title, prompt}]} or null when it is not available;
 // by default it is the starter_content the market put on the write order.
 // With structured (starter_message.structured, default true) and an openmax that supports it, the message is sent as

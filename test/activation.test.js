@@ -7,10 +7,11 @@ import { AGENT, ORG, U, pullHarness } from './fake/pull.js';
 import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
-  ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, IDLE_MIN_SECONDS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
+  ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, DAILY_WELCOME_REQUESTS, IDLE_MIN_SECONDS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
   CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
+import { createStarter } from '../src/starter.js';
 import { MARKER_FILE, readMarker } from '../src/shard-emitter.js';
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
@@ -728,7 +729,9 @@ test('welcome and tick at the same time give exactly one control', async (t) => 
   assert.ok(['requested', 'waiting', 'sampled'].includes(r), r);
   assert.equal(hold, f.clock.t + WELCOME_HOLD_MS);
   assert.equal(f.pending().request_count, 1);
-  assert.equal(f.state.read('activation', null).requests.length, 1);
+  // Counted once, in the list of whichever made it.
+  const doc = f.state.read('activation', null);
+  assert.equal(doc.requests.length + doc.welcome_requests.length, 1);
 });
 
 test('a refused enqueue does not restore an old request count over the reset of a write merged meanwhile', async (t) => {
@@ -902,4 +905,216 @@ test('confirm withdraws the request recorded at the time of its update, also one
   assert.equal(await f.make(racing).tick(), 'confirmed');
   assert.deepEqual(f.acks, [5]);
   assert.equal(f.statuses.get(5), 'done');
+});
+
+// Starter messages wired to the activation as templates.js does: welcome() decides the hold, the job is queued with it,
+// and the real starter claims and sends once its template is confirmed (or the hold ends). The IM is a fake that
+// records the client message ids sent.
+const ADOPTER = '0b6f4f3e-2222-4c2a-9d1e-aaaaaaaaaaaa';
+const starterPath = (id, op) => `/api/v1/orgs/${ORG}/agents/${AGENT}/adoptions/${id}:${op}`;
+function starterOf(f, a) {
+  const sent = [];
+  const im = {
+    available: () => true,
+    createDm: async () => 'cv-1',
+    getConversation: async () => ({ id: 'cv-1', type: 'DM' }),
+    memberList: async () => [{ member_id: AGENT, display_name: 'Agent' }, { member_id: ADOPTER, display_name: 'Ann' }],
+    supportsNoRun: () => true,
+    supportsStructured: () => true,
+    sendStructured: async (p) => { sent.push(p.clientMsgId); return { id: 'm' }; },
+    sendText: async (p) => { sent.push(p.clientMsgId); return { id: 'm' }; },
+  };
+  const content = async () => ({ templateName: 'Weekly', firstGuide: 'Tell me your projects.', starterTasks: [{ title: 'Report', prompt: 'Write it' }] });
+  const starter = createStarter({ api: f.api, state: f.state, orgs: f.orgs, logger: f.logger, im, now: f.now, content, activation: a });
+  const adopted = async (id, s) => {
+    written(f, a, id, s);
+    f.fake.script('POST', starterPath(id, 'claim-starter'), {
+      status: 200, json: { adoption_id: id, result: 'claimed', starter_state: 'claimed', claimed_at: new Date(f.clock.t).toISOString() },
+    });
+    f.fake.script('POST', starterPath(id, 'mark-starter-shown'), {
+      status: 200, json: { adoption_id: id, result: 'sent', result_at: new Date(f.clock.t).toISOString(), starter_tasks_shown_at: new Date(f.clock.t).toISOString() },
+    });
+    const holdUntil = await a.welcome(id);
+    starter.enqueue({ orgId: ORG, adoptionId: id, adoptedBy: ADOPTER, holdUntil });
+    return holdUntil;
+  };
+  const claims = () => f.fake.requests.filter((r) => r.path.endsWith(':claim-starter')).length;
+  return { starter, sent, adopted, claims };
+}
+
+// A session that shows the adoptions starts now and the check confirms it.
+async function session(f, a, items) {
+  f.advance(1000);
+  f.marker(items.map(([adoption_id, rendered_sha256]) => ({ adoption_id, rendered_sha256 })));
+  f.fake.script('POST', C10, recordAll());
+  assert.equal(await a.tick(), 'confirmed');
+}
+
+test('welcome: 10 minutes after a request, a new adoption is asked for at once, not held back by the 30-minute cooldown', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a, A1, S1);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  await session(f, a, [[A1, S1]]);
+  f.advance(10 * 60 * 1000);
+  written(f, a, A2, S2);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.welcome(A2), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.controls.length, 2);
+  const doc = f.state.read('activation', null);
+  assert.equal(doc.requests.length, 1);
+  assert.equal(doc.welcome_requests.length, 1);
+});
+
+test('welcome: two adoptions within 2 minutes share one new-session request; both messages go out after its session', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_HOLD_MS);
+  f.advance(60 * 1000);
+  f.status({ idle_seconds: 30 });
+  // The first request has not brought its session yet: the second adoption rides on it.
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.controls.length, 1);
+  await s.starter.runAll();
+  assert.deepEqual(s.sent, []);
+  await session(f, a, [[A1, S1], [A2, S2]]);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+  assert.equal(f.controls.length, 1);
+  assert.equal(f.state.read('activation', null).welcome_requests.length, 1);
+});
+
+test('welcome: inside the 2-minute interval with no request to join, the message is held and the session asked for after it', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A1, S1);
+  await session(f, a, [[A1, S1]]);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  // The first session already started, so it cannot carry A2: a new request is needed but the interval holds it.
+  f.advance(30 * 1000);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(f.controls.length, 1);
+  assert.deepEqual(f.pending().welcome, [A2]);
+  const t0 = f.state.read('activation', null).welcome_requests[0];
+  while (f.clock.t - Date.parse(t0) < WELCOME_REQUEST_INTERVAL_MS - ACTIVATION_CHECK_MS) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.tick(), 'busy');
+    await s.starter.runWaiting();
+  }
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.controls.length, 2);
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  await session(f, a, [[A1, S1], [A2, S2]]);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+});
+
+test('welcome: with the daily starter cap reached the message is held past 3 minutes and sent once after the session', async (t) => {
+  const f = await harness(t);
+  f.advance(12 * 60 * 60 * 1000);
+  const today = Array.from({ length: DAILY_WELCOME_REQUESTS }, (_, i) => new Date(f.clock.t - (i + 1) * 10 * 60 * 1000).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, welcome_requests: today }));
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.deepEqual(f.controls, []);
+  // Busy for 10 minutes: no request, no claim, no send.
+  for (let i = 0; i < 20; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ state: 'busy' });
+    assert.equal(await a.tick(), 'busy');
+    await s.starter.runWaiting();
+  }
+  assert.equal(s.claims(), 0);
+  assert.deepEqual(s.sent, []);
+  // The automatic rules still apply: an Agent idle 5 minutes is asked on the automatic budget.
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  const doc = f.state.read('activation', null);
+  assert.equal(doc.requests.length, 1);
+  assert.equal(doc.welcome_requests.length, DAILY_WELCOME_REQUESTS);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, []);
+  await session(f, a, [[A1, S1]]);
+  await s.starter.runWaiting();
+  await s.starter.runAll();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  assert.equal(s.claims(), 1);
+  assert.deepEqual(f.state.read('starters', {}), {});
+});
+
+test('welcome: starter requests leave the automatic budget alone, and the automatic budget does not block them', async (t) => {
+  const f = await harness(t);
+  f.advance(12 * 60 * 60 * 1000);
+  const a = f.make();
+  // Five starter requests, 5 minutes apart, each confirmed.
+  const ids = [A1, A2, A3, U(44), U(45)];
+  for (const [i, id] of ids.entries()) {
+    written(f, a, id, sha(`b${i}`));
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.welcome(id), f.clock.t + WELCOME_HOLD_MS);
+    await session(f, a, [[id, sha(`b${i}`)]]);
+    f.advance(5 * 60 * 1000);
+  }
+  assert.equal(f.controls.length, ids.length);
+  // The automatic request is still allowed at once: no cooldown, nothing used of its 4 a day.
+  written(f, a, U(46), sha('auto'));
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  let doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.welcome_requests.length], [1, ids.length]);
+  await session(f, a, [[U(46), sha('auto')]]);
+  // Vice versa: the automatic budget used up for the day and in its cooldown; a starter request is still made.
+  const used = Array.from({ length: DAILY_REQUESTS }, (_, i) => new Date(f.clock.t - i * 1000).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, requests: used }));
+  f.advance(5 * 60 * 1000);
+  written(f, a, U(47), sha('w'));
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.welcome(U(47)), f.clock.t + WELCOME_HOLD_MS);
+  doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.welcome_requests.length], [DAILY_REQUESTS, ids.length + 1]);
+  await session(f, a, [[U(47), sha('w')]]);
+  written(f, a, U(48), sha('x'));
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'cooldown']);
+});
+
+test('welcome: a restart during the hold keeps the message; it is sent once after the session', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A1, S1);
+  await session(f, a, [[A1, S1]]);
+  await s.starter.runWaiting();
+  f.advance(30 * 1000);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_MAX_HOLD_MS);
+  // Restart: new activation and starter on the same state.
+  const b = f.make();
+  const s2 = starterOf(f, b);
+  await s2.starter.runAll();
+  assert.deepEqual(s2.sent, []);
+  let r;
+  for (let i = 0; i < 10 && r !== 'requested'; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ idle_seconds: 30 });
+    r = await b.tick();
+    await s2.starter.runWaiting();
+  }
+  assert.equal(r, 'requested');
+  assert.deepEqual(s2.sent, []);
+  await session(f, b, [[A1, S1], [A2, S2]]);
+  await s2.starter.runWaiting();
+  const s3 = starterOf(f, f.make());
+  await s3.starter.runAll();
+  assert.deepEqual([...s.sent, ...s2.sent, ...s3.sent], [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+  assert.equal(f.fake.requests.filter((x) => x.path === starterPath(A2, 'claim-starter')).length, 1);
 });
