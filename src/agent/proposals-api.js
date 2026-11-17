@@ -1,5 +1,5 @@
-// Market search and install proposals. A person confirms on the confirm_url page, or the Agent attests that its
-// owner confirmed or declined in a direct conversation with it (agent_attested).
+// Market search and install proposals. The Agent attests that its owner confirmed or declined in a direct
+// conversation with it (agent_attested); anyone else installs manually in the Workspace market.
 import crypto from 'node:crypto';
 import { MarketError, installers, marketQuote } from '../http.js';
 import { isCanonicalUuid, isOrgOrMemberId } from '../ids.js';
@@ -14,19 +14,33 @@ export const CHANNELS = new Set(['workspace', 'lark', 'telegram', 'other']);
 export const MAX_CHANNEL_DETAIL = 64;
 export const MAX_MESSAGE_ID = 200;
 export const MAX_MESSAGE_TEXT = 500;
-// Where the user confirms when the market gives no link.
-export const CONFIRM_HINT = '请到工作台和我的私聊里确认';
-export const confirmPhrase = (url) => (url ? `请点这个链接确认：${url}` : CONFIRM_HINT);
-
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
-// The workspace link to confirm a request: https (http only on loopback), no credentials, at most 2048 characters.
-export function confirmUrl(v) {
+// The Workspace web origin, taken from the proposal's confirm_url (the market builds it from its web origin; the page
+// itself is not linked). https (http only on loopback), no credentials, at most 2048 characters.
+export function workspaceOrigin(v) {
   if (typeof v !== 'string' || v.length > 2048) return null;
   let u;
   try { u = new URL(v); } catch { return null; }
   if (u.username || u.password) return null;
   if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOOPBACK.has(u.hostname))) return null;
-  return u.href;
+  return u.origin;
+}
+
+// Workspace pages where a person installs manually: the market skill detail (/market/skills/{skill_id}) and the
+// Agent detail (/agents?id={agent_id}). Without an origin the pages are named instead.
+export function manualInstallPages({ origin, agentId, candidates }) {
+  const skills = candidates.map((c) => ({
+    name: c.name ?? c.skill_id,
+    url: origin ? `${origin}/market/skills/${encodeURIComponent(c.skill_id)}` : null,
+  }));
+  return { skills, agent_url: origin && agentId ? `${origin}/agents?id=${encodeURIComponent(agentId)}` : null };
+}
+
+export function manualInstallWhere(pages) {
+  if (pages.skills.some((k) => k.url)) {
+    return `${pages.skills.map((k) => `「${k.name}」${k.url}`).join('，')}${pages.agent_url ? `；或在我的详情页里装：${pages.agent_url}` : ''}`;
+  }
+  return `在 Workspace「市场」里打开${pages.skills.map((k) => `「${k.name}」`).join('')}安装`;
 }
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -105,7 +119,7 @@ export function proposalView(v) {
     confirmed_via: v.confirmed_via === 'card' || v.confirmed_via === 'agent_attested' ? v.confirmed_via : null,
     confirmed_by_member_id: isOrgOrMemberId(v.confirmed_by_member_id) ? v.confirmed_by_member_id : null,
     attestation: attestationView(v.attestation),
-    confirm_url: confirmUrl(v.confirm_url),
+    workspace_origin: workspaceOrigin(v.confirm_url),
   };
 }
 
@@ -194,7 +208,7 @@ const REQUEST_HINT = 'propose again with `market-client request-install` and ask
 
 export function explainProposalError(err) {
   if (err?.code === 'AGENT_OWNER_REQUIRED') {
-    return 'refused: this Agent has no active human owner in the organization; only an org admin can install skills on it, on the confirm link (confirm_url)';
+    return 'refused: this Agent has no active human owner in the organization; only an org admin can install skills on it, manually in the Workspace market';
   }
   const common = explainCommonError(err);
   if (common !== null) return common;
@@ -210,13 +224,13 @@ export function explainProposalError(err) {
       return `a person declined this skill for this Agent recently (no new request for it for 7 days by default)${at}; do not propose it again before then`;
     case 'AGENT_ATTESTATION_REFUSED':
       if (err.reason === 'owner_changed') return `this install request was made for a previous owner; nothing was installed. ${REQUEST_HINT}`;
-      return 'refused: only your current owner\'s own reply counts; nothing was installed. Anyone else (an org admin included) confirms on the confirm link (confirm_url)';
+      return 'refused: only your current owner\'s own reply counts; nothing was installed. Your owner confirms in chat; an org admin can install manually in the Workspace market';
     case 'AGENT_CONFIRM_DISABLED':
       if (err.reason === 'attested_off') {
-        return 'chat confirmation is turned off in this market; nothing was changed. Send the owner the confirm link (confirm_url) instead, don\'t retry';
+        return 'chat confirmation is turned off in this market; nothing was changed. Don\'t retry and don\'t decline (the request expires by itself); the owner installs manually in the Workspace market';
       }
       return 'the market refused the confirmation method: a client bug (confirmed_via must be agent_attested), or the market predates '
-        + 'confirming in conversation; nothing was changed. Report it; do not retry. Meanwhile send your owner the confirm link (confirm_url)';
+        + 'confirming in conversation; nothing was changed. Report it; do not retry. Meanwhile the owner can install manually in the Workspace market';
     case 'INSTALL_PROPOSAL_STALE':
       return `${err.reason === 'agent_changed' ? 'this Agent' : 'a skill version'} changed since the request${err.reason ? ` (${err.reason})` : ''}; nothing was installed. ${REQUEST_HINT}`;
     case 'INSTALL_PROPOSAL_NOT_PENDING':

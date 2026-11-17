@@ -7,7 +7,7 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { confirmUrl, marketCleanText, proposalView, rawEvidence } from '../src/agent/proposals-api.js';
+import { marketCleanText, workspaceOrigin, proposalView, rawEvidence } from '../src/agent/proposals-api.js';
 import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
 import fs from 'node:fs';
@@ -79,9 +79,10 @@ test('request-install proposes up to 3 candidates, resolving slugs, with one rea
   const req = s.fake.market()[1];
   assert.deepEqual(Object.keys(req.json).sort(), ['candidates', 'request_id']);
   assert.deepEqual(req.json.candidates, [{ skill_id: U(1), reason: 'why 1' }, { skill_id: U(5), reason: 'why 5' }]);
-  assert.match(s.text(), /pending_confirmation \(waiting for the owner's reply or a confirmation on the confirm link, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0 — d\n[\s\S]*\n {2}2\. Skill 5 1\.2\.0 — d\n/);
+  assert.match(s.text(), /pending_confirmation \(waiting for the owner's reply, expires [^)]+\)\n {2}1\. Skill 1 1\.2\.0 — d\n[\s\S]*\n {2}2\. Skill 5 1\.2\.0 — d\n/);
   assert.match(s.text(), /「组织市场里有 2 个技能能做：① Skill 1 — d ② Skill 5 — d 要装的话回复编号，比如「装 1」「装 1 和 2」或「都装」；不装回复「不装」或「都不装」。安装要我的负责人确认。」/);
-  assert.match(s.text(), /Anyone else confirms on the page: 「请到工作台和我的私聊里确认」/);
+  assert.match(s.text(), /If anyone else wants them installed, do not confirm; tell them: 「安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」安装」/);
+  assert.doesNotMatch(s.text(), /confirm link|请点这个链接确认/);
 });
 
 test('request-install refusals', async (t) => {
@@ -153,24 +154,32 @@ test('install-requests refreshes the local records one by one, newest first, mar
   assert.equal(await run('install-requests', [], { state: 'bogus' }), 2);
 });
 
-test('request-install gives the confirm link when the market returns one', async (t) => {
+test('request-install links the Workspace market pages for anyone else, never the confirm page', async (t) => {
   const s = await setup(t);
-  const url = 'https://workspace.example.test/agents/a/proposals/p';
+  const url = 'https://workspace.example.test/market/install-proposals/p';
   s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal({ confirm_url: url }) }, { status: 201, json: proposal({ confirm_url: 'javascript:alert(1)' }) });
-  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
-  assert.match(s.text(), new RegExp(`confirm link: ${url}`));
-  assert.match(s.text(), new RegExp(`「请点这个链接确认：${url}」`));
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'], json: true }), 0);
+  const j = JSON.parse(s.text());
+  assert.equal('confirm_url' in j || 'confirm_phrase' in j, false);
+  assert.equal(j.workspace_origin, 'https://workspace.example.test');
+  assert.deepEqual(j.manual_install, {
+    skills: [{ name: 'Skill 1', url: `https://workspace.example.test/market/skills/${U(1)}` }, { name: 'Skill 5', url: `https://workspace.example.test/market/skills/${U(5)}` }],
+    agent_url: `https://workspace.example.test/agents?id=${AGENT}`,
+  });
+  assert.match(j.not_owner_reply, new RegExp(`给我装：「Skill 1」https://workspace\\.example\\.test/market/skills/${U(1)}，「Skill 5」.*；或在我的详情页里装：https://workspace\\.example\\.test/agents\\?id=${AGENT}$`));
+  assert.doesNotMatch(s.text(), /install-proposals/);
   s.reset();
   assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
-  assert.match(s.text(), /「请到工作台和我的私聊里确认」/);
-  assert.doesNotMatch(s.text(), /javascript/);
+  assert.match(s.text(), /在 Workspace「市场」里打开「Skill 1」「Skill 5」安装/);
+  assert.doesNotMatch(s.text(), /javascript|https?:/);
 });
 
-test('confirmUrl accepts https and loopback http only, without credentials', () => {
-  assert.equal(confirmUrl('https://w.example/x?y=1'), 'https://w.example/x?y=1');
-  assert.equal(confirmUrl('http://127.0.0.1:3000/x'), 'http://127.0.0.1:3000/x');
-  for (const bad of ['http://w.example/x', 'https://u:p@w.example/', 'ftp://w.example/', 'nope', 7, `https://w.example/${'a'.repeat(2048)}`]) assert.equal(confirmUrl(bad), null);
+test('workspaceOrigin accepts https and loopback http only, without credentials', () => {
+  assert.equal(workspaceOrigin('https://w.example/x?y=1'), 'https://w.example');
+  assert.equal(workspaceOrigin('http://127.0.0.1:3000/x'), 'http://127.0.0.1:3000');
+  for (const bad of ['http://w.example/x', 'https://u:p@w.example/', 'ftp://w.example/', 'nope', 7, `https://w.example/${'a'.repeat(2048)}`]) assert.equal(workspaceOrigin(bad), null);
 });
+
 
 
 test('a request refused while the previous one is being confirmed keeps watching the previous one', async (t) => {
@@ -280,7 +289,8 @@ test('confirm-install refuses locally when the Agent has no owner', async (t) =>
   assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
   const j = JSON.parse(s.text());
   assert.equal(j.error, 'AGENT_OWNER_REQUIRED');
-  assert.match(j.message, /no active human owner.*only an org admin.*confirm_url/);
+  assert.match(j.message, /no active human owner.*only an org admin.*Workspace market.*「我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/);
+  assert.equal(j.say, '我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装');
   assert.equal(s.fake.market().filter((r) => r.method === 'POST').length, 0);
 });
 
@@ -326,11 +336,11 @@ test('decline-install sends no skills, drops the watch and tells the owner', asy
 test('confirm-install explains each market refusal', async (t) => {
   const s = await setupWatched(t);
   const cases = [
-    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*confirm_url/],
+    [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'not_owner' }), /only your current owner's own reply counts.*Tell them: 「安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」/],
     [problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }), /made for a previous owner.*request-install/],
-    [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*predates.*do not retry/],
-    [problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }), /^confirm-install refused: chat confirmation is turned off in this market; nothing was changed\. Send the owner the confirm link \(confirm_url\) instead, don't retry$/],
-    [{ status: 404, raw: 'not found' }, /does not support confirming install requests in conversation yet \(404 on the confirm route/],
+    [problem(403, { code: 'AGENT_CONFIRM_DISABLED' }), /client bug.*predates.*do not retry.*「对话里确认暂时没开放/],
+    [problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }), /^confirm-install refused: chat confirmation is turned off in this market; nothing was changed\. Don't retry and don't decline \(the request expires by itself\); the owner installs manually in the Workspace market\. Tell them: 「对话里确认暂时没开放，请到市场里手动安装：在 Workspace「市场」里打开「Skill 1」「Skill 5」「Skill 6」安装」$/],
+    [{ status: 404, raw: 'not found' }, /does not support confirming install requests in conversation yet \(404 on the confirm route.*Tell them: 「对话里确认暂时没开放，请到市场里手动安装：/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'version_changed' }), /a skill version changed since the request \(version_changed\).*request-install.*ask the owner again/],
     [problem(409, { code: 'INSTALL_PROPOSAL_STALE', reason: 'agent_changed' }), /this Agent changed since the request/],
     [problem(409, { code: 'INSTALL_PROPOSAL_NOT_PENDING', reason: 'expired' }), /no longer waiting for a decision \(expired\).*already decided or has expired/],
@@ -405,4 +415,17 @@ test('CLI: the owner reply is read verbatim from stdin; repeated options are usa
   ]) assert.equal((await cliRun(args, { dataDir, input: 'z' })).code, 2, args.join(' '));
   assert.equal((await cliRun(['decline-install', U(10), '--channel', 'lark', '--owner-message-text-stdin'], { dataDir, input: 'ㅤ\n' })).code, 2);
   assert.equal(fake.requests.length, n);
+});
+
+test('attested_off links the market and Agent pages and never declines', async (t) => {
+  const s = await setupWatched(t);
+  const withOrigin = proposal({ confirm_url: 'https://w.example/market/install-proposals/x' });
+  s.fake.script('GET', P, { status: 200, json: withOrigin });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:confirm`, problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }));
+  assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
+  const j = JSON.parse(s.text());
+  assert.equal(j.say, `对话里确认暂时没开放，请到市场里手动安装：「Skill 1」https://w.example/market/skills/${U(1)}，「Skill 5」https://w.example/market/skills/${U(5)}；或在我的详情页里装：https://w.example/agents?id=${AGENT}`);
+  assert.doesNotMatch(s.text(), /install-proposals/);
+  assert.deepEqual(s.fake.market().filter((r) => r.method === 'POST').map((r) => r.path), [`${P}:confirm`]);
 });

@@ -23,36 +23,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client refuses locally evidence with nothing visible left after the same
   cleaning (shared vectors in `test/vectors/evidence-sanitize.json`).
   Channel, evidence, selection and a missing owner are checked before
-  anything is sent.
-- Rollout order: market, then cws-core, then this client. Against an older
-  cws-core the confirm route answers 404, reported as "not supported yet"
-  (send the confirm link instead); an older market answers
-  `AGENT_CONFIRM_DISABLED`. The market's minimum client version is not
-  raised for this feature.
-- `AGENT_CONFIRM_DISABLED` with reason `attested_off` (chat confirmation
-  turned off in the market) says so and points to the confirm link. A confirmed request stays watched so its orders are
+  anything is sent. A confirmed request stays watched so its orders are
   pulled within seconds; a declined one is no longer watched.
+- Rollout order: market, then cws-core, then this client. Against an older
+  cws-core the confirm route answers 404, reported as "not supported yet";
+  an older market answers `AGENT_CONFIRM_DISABLED`. The market's minimum
+  client version is not raised for this feature.
 - Messages for `AGENT_ATTESTATION_REFUSED` (`not_owner`, `owner_changed`),
-  `INSTALL_PROPOSAL_STALE`, `INSTALL_PROPOSAL_NOT_PENDING` and
-  `VALIDATION_FAILED` fields.
+  `AGENT_CONFIRM_DISABLED` `attested_off` (chat confirmation turned off in
+  the market), `INSTALL_PROPOSAL_STALE`, `INSTALL_PROPOSAL_NOT_PENDING` and
+  `VALIDATION_FAILED` fields. Where a person has to install instead (chat
+  confirmation off or not supported, not the owner, no owner), the command
+  prints what to tell them with links to the Workspace market skill pages
+  (`/market/skills/{skill_id}`) and the Agent's page (`/agents?id=`), or
+  names the pages when the Workspace origin is unknown.
 
 ### Changed
+- The Agent no longer shows a confirm link: `request-install` and
+  `install-requests` print no `confirm_url` (the page does not exist); the
+  proposal view keeps only the Workspace origin taken from it.
 - Local usage errors of the Agent market commands (bad arguments or
   options) exit 2 as documented, not 3. A repeated option other than
   `--reason` is a usage error.
 - `request-install` and `install-requests` number the candidates (1 to 3)
   with name and a one-line purpose; `request-install` prints a ready
-  proposal for the owner (`owner_prompt` in `--json`).
+  proposal for the owner (`owner_prompt` in `--json`) and what to tell
+  anyone else (`not_owner_reply`, `manual_install`).
   `install-requests` shows how a request was confirmed (`card` or
   `agent_attested` with the channel and the owner's message).
-- `AGENT_CONFIRM_DISABLED` now means a client bug (wrong `confirmed_via`):
-  report it, do not retry. `AGENT_OWNER_REQUIRED` on install requests says
-  only an org admin can install, on the confirm link.
+- `AGENT_CONFIRM_DISABLED` without a reason means a client bug or an older
+  market: report it, do not retry. `AGENT_OWNER_REQUIRED` on install
+  requests says only an org admin can install, in the Workspace market.
 - SKILL.md: the Agent proposes in its owner's conversation with numbered
-  candidates and reply options, acts only on its owner's own reply in a
-  direct conversation (never a group chat or another member), quotes that
-  reply verbatim, sends anyone else to the confirm link, and reports what
-  was installed and what was not selected.
+  candidates and reply options, acts only on its owner's own new reply in a
+  direct conversation (never a group chat or another member), passes that
+  reply verbatim on stdin, tells anyone else that the owner confirms in chat
+  and admins can install in the Workspace market, and reports what was
+  installed and what was not selected.
 
 ## [0.8.0] - 2026-11-17
 

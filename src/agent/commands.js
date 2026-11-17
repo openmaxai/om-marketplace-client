@@ -11,7 +11,8 @@ import { readManifest } from './template.js';
 import { explainSubmitError, isRefusal, submitSkill, submitTemplate } from './submit-api.js';
 import {
   AttestationError, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, attestationBody,
-  confirmPhrase, confirmProposal, declineProposal, explainProposalError, getProposal, installPermission, proposeInstall, searchSkills,
+  confirmProposal, declineProposal, explainProposalError, getProposal, installPermission, proposeInstall, searchSkills,
+  manualInstallPages, manualInstallWhere,
 } from './proposals-api.js';
 import { isCanonicalUuid } from '../ids.js';
 import { addWatch, dropWatch, dropWatchesExcept } from './proposal-watch.js';
@@ -179,7 +180,7 @@ function renderSkills(items) {
 }
 
 const STATE_TEXT = {
-  pending_confirmation: 'waiting for the owner\'s reply or a confirmation on the confirm link',
+  pending_confirmation: 'waiting for the owner\'s reply',
   confirming: 'being confirmed now',
   confirmed: 'confirmed; the chosen skills are being installed',
   declined: 'declined',
@@ -211,7 +212,6 @@ function renderProposal(p) {
     if (a?.owner_message_text) lines.push(`  owner's message: ${JSON.stringify(a.owner_message_text)}`);
     if (a?.owner_message_id) lines.push(`  owner's message id: ${a.owner_message_id}`);
   }
-  if (p.confirm_url && p.state === 'pending_confirmation') lines.push(`  confirm link: ${p.confirm_url}`);
   return lines.join('\n');
 }
 
@@ -253,7 +253,17 @@ async function ownerMemberId(ctx) {
 }
 
 const ROUTE_MISSING = 'the workspace does not support confirming install requests in conversation yet (404 on the confirm route; '
-  + 'the market or the workspace server is older than this client); nothing was changed. Send your owner the confirm link (confirm_url) instead';
+  + 'the market or the workspace server is older than this client); nothing was changed. Don\'t retry; the owner installs manually in the Workspace market';
+const NOT_OWNER_SAY = '安装需要我的负责人在对话里确认。管理员也可以直接在 Workspace 市场里给我装';
+// Refusals after which a person installs manually in the Workspace market; the value is what to tell the user.
+const MANUAL_INSTALL = (err) => {
+  if (err?.routeMissing || err?.code === 'AGENT_CONFIRM_DISABLED') return (where) => `对话里确认暂时没开放，请到市场里手动安装：${where}`;
+  if (err?.code === 'AGENT_ATTESTATION_REFUSED' && err.reason !== 'owner_changed') {
+    return (where) => `${NOT_OWNER_SAY}：${where}`;
+  }
+  if (err?.code === 'AGENT_OWNER_REQUIRED') return (where) => `我现在没有负责人，需要组织管理员在 Workspace 市场里给我装：${where}`;
+  return null;
+};
 const ORDER_ERRORS = new Set(['AGENT_NO_CLIENT', 'AGENT_QUEUE_FULL', 'VERSION_NOT_FOUND', 'VERSION_REVOKED', 'NOT_APPROVED']);
 
 // Resolves a slug to a skill id with one exact-slug search.
@@ -321,6 +331,8 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
     throw err;
   }
   const { http, agentId: getAgentId } = connect(config, orgId, { fetchImpl, logger });
+  let manual = null;
+  const extraManual = {};
   try {
     const agentId = await getAgentId();
     const ctx = { http, orgId, agentId };
@@ -356,16 +368,19 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
           logger?.warn?.(`install request not watched (${err.code || 'error'}); a confirmation is pulled at the next poll`);
         }
       }
-      const phrase = confirmPhrase(p.confirm_url);
       const prompt = ownerPrompt(p);
-      out({ ok: true, ...p, owner_prompt: prompt, confirm_phrase: phrase },
+      const pages = manualInstallPages({ origin: p.workspace_origin, agentId, candidates: p.candidates });
+      const others = `${NOT_OWNER_SAY}：${manualInstallWhere(pages)}`;
+      out({ ok: true, ...p, owner_prompt: prompt, manual_install: pages, not_owner_reply: others },
         `${renderProposal(p)}\nNothing is installed yet. Ask your owner in your direct conversation, with the numbers, for example: 「${prompt}」\n`
-        + `Then run confirm-install or decline-install with the owner's reply. Anyone else confirms on the page: 「${phrase}」. Any earlier pending request of this Agent is replaced.`);
+        + 'Then run confirm-install or decline-install with the owner\'s reply. Any earlier pending request of this Agent is replaced.\n'
+        + `If anyone else wants them installed, do not confirm; tell them: 「${others}」`);
       return EXIT.OK;
     }
     if (cmd === 'confirm-install' || cmd === 'decline-install') {
       const proposalId = args[0];
       const before = await getProposal({ ...ctx, proposalId });
+      manual = manualInstallPages({ origin: before.workspace_origin, agentId, candidates: before.candidates });
       const picked = cmd === 'confirm-install' ? selectCandidates(before, args.slice(1)) : null;
       const att = {
         ownerMemberId: await ownerMemberId(ctx), channel: opts.channel, channelDetail: opts.channelDetail ?? null,
@@ -425,10 +440,19 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
     }
     throw new SubmitError('usage', `unknown command ${cmd}`);
   } catch (err) {
-    if (err instanceof SubmitError) return refuse(err.code, err.message);
-    const message = err?.routeMissing ? ROUTE_MISSING
+    const sayManual = manual && MANUAL_INSTALL(err);
+    const withManual = (message) => {
+      if (!sayManual) return message;
+      const say = sayManual(manualInstallWhere(manual));
+      Object.assign(extraManual, { manual_install: manual, say });
+      return `${message}. Tell them: 「${say}」`;
+    };
+    if (err instanceof SubmitError) return refuse(err.code, withManual(err.message), extraManual);
+    let message = err?.routeMissing ? ROUTE_MISSING
       : `${explainProposalError(err)}${err?.orderRefused ? '. The install request is waiting for a decision again' : ''}`;
+    message = withManual(message);
     const extra = {
+      ...extraManual,
       status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null, field: err.extra?.field ?? null,
       retry_after_s: err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : null,
     };

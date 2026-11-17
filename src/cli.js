@@ -26,7 +26,7 @@ const USAGE = `usage: market-client <command>
   submissions [--json]      submissions made from this Agent
   search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
   install-permission        who may confirm installs on this Agent (in the workspace)
-  request-install <skill>...  propose 1-3 skills (slug or id) for a person to confirm in the workspace; --reason <text> once, or per skill
+  request-install <skill>...  propose 1-3 skills (slug or id) for your owner to confirm in chat; --reason <text> once, or per skill
   install-requests          install requests made from this Agent, refreshed from the market [--state <state>]
   confirm-install <proposal_id> (all | <n|skill_id>...)  install what your owner chose in a direct conversation with you
   decline-install <proposal_id>  record that your owner declined
