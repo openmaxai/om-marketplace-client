@@ -120,6 +120,9 @@ export function explainProposalError(err) {
   switch (err.code) {
     case 'SKILL_ALREADY_INSTALLED':
       return `a skill is already installed (or being installed) on this Agent${at}; leave it out`;
+    case 'INSTALL_PROPOSAL_PENDING':
+      return `your previous install request is being confirmed or installed${x.detail ? ` ${marketQuote(x.detail)}` : ''}; nothing new was requested. `
+        + 'Wait for it to finish (`market-client install-requests`), then propose again. Tell the user: 「上一条安装请求正在确认或安装中，请稍后再提新的。」';
     case 'SKILL_RECENTLY_DECLINED':
       return `a person declined this skill for this Agent recently (no new request for it for 7 days by default)${at}; do not propose it again before then`;
     case 'AGENT_CONFIRM_DISABLED':

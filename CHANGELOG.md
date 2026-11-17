@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   install orders as soon as it is confirmed in the workspace.
 - `market-client request-install`: propose 1 to 3 skills for this Agent;
   nothing is installed until a person (owner or org admin) confirms on the
-  card in the workspace. A new request replaces the pending one; a skill
+  card in the workspace. A new request replaces the pending one, but is
+  refused while the previous one is being confirmed or installed; a skill
   declined in the last 7 days is refused. The market's confirm link is shown
   when given. `install-requests` refreshes the requests recorded locally.
 - `market-client submit-skill` and `submit-template`: submit a new skill (a

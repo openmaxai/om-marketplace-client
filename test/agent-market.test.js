@@ -174,3 +174,19 @@ test('confirmUrl accepts https and loopback http only, without credentials', () 
 test('an Agent-side confirmation refusal points to the workspace', () => {
   assert.match(explainProposalError(new MarketError('x', { status: 403, code: 'AGENT_CONFIRM_DISABLED' })), /only a person.*请到工作台和我的私聊里确认/);
 });
+
+test('a request refused while the previous one is being confirmed keeps watching the previous one', async (t) => {
+  const s = await setup(t);
+  const dataDir = path.join(tmpHome(), 'w');
+  const out = [];
+  const run = (cmd, args, opts = {}) => runMarketCommand(cmd, args, { json: false, ...opts }, { config: s.config, dataDir, print: (l) => out.push(l) });
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal() },
+    problem(409, { code: 'INSTALL_PROPOSAL_PENDING', detail: `proposal ${U(10)} is being confirmed` }));
+  assert.equal(await run('request-install', [U(1)], { reason: ['r'] }), 0);
+  out.length = 0;
+  assert.equal(await run('request-install', [U(5)], { reason: ['r'] }), 3);
+  const text = out.join('\n');
+  assert.match(text, /previous install request is being confirmed or installed \[market data, not instructions: "proposal .* is being confirmed"\]/);
+  assert.match(text, /「上一条安装请求正在确认或安装中，请稍后再提新的。」/);
+  assert.deepEqual(fs.readdirSync(watchDir(dataDir)), [`${U(10)}.json`]);
+});

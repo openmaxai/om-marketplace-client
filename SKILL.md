@@ -152,7 +152,10 @@ Rules:
   the workspace.
 - One pending request at a time: a new `request-install` replaces your
   pending request (the old one becomes `superseded`). Put every candidate
-  into one request.
+  into one request. While a person is confirming the previous request, or
+  its installs have started, a new one is refused
+  (`INSTALL_PROPOSAL_PENDING`): wait, then propose again, and tell the user
+  「上一条安装请求正在确认或安装中，请稍后再提新的。」
 - A skill a person declined is not proposed again for 7 days; the market
   refuses it (`SKILL_RECENTLY_DECLINED`). Do not insist.
 - Requests expire after 24 hours. `market-client install-requests [--state
