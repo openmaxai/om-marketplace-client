@@ -153,23 +153,45 @@ search the market before saying it cannot be done:
 4. Act on your owner's reply (rules below):
    - Yes to some or all (「装 1」「装 1 和 3」「都装」) → `confirm-install`
      with the `proposal_id` of the request you showed the owner and the
-     numbers chosen (`all` for every one). Pass the owner's reply on stdin
-     with a quoted heredoc, never inside double quotes on the command line,
-     so quotes, backticks and `$()` in it are never interpreted:
+     numbers chosen (`all` for every one). Never put the owner's words on
+     the command line. Write the reply, verbatim, to a new file with your
+     file-write tool (not with the shell), pass it with
+     `--owner-message-file`, and delete the file afterwards:
 
      ```
      market-client confirm-install <proposal_id> 1 3 --channel lark \
        --owner-message-id <id of that reply, when your runtime gives one> \
-       --owner-message-text-stdin <<'OWNER_REPLY'
-     <the owner's reply, verbatim>
-     OWNER_REPLY
+       --owner-message-file /tmp/owner-reply-<random>.txt
      ```
+
+     Only if you cannot write a file, pipe the reply through a quoted
+     heredoc whose delimiter is new for every command:
+     1. Make 16 random hex digits: `od -An -N8 -tx1 /dev/urandom | tr -d ' \n'`
+        (or `openssl rand -hex 8`); the delimiter is `OWNER_REPLY_` followed
+        by them, for example `OWNER_REPLY_9f3c27d1a4b8e605`.
+     2. Check the owner's reply: if the delimiter appears anywhere in it
+        (on any line, alone or inside other text), do not use it; make a new
+        one (step 1) or use `--owner-message-file`.
+     3. Run, with the delimiter quoted on the first line and alone on the
+        last line:
+
+     ```
+     market-client confirm-install <proposal_id> 1 3 --channel lark \
+       --owner-message-text-stdin <<'OWNER_REPLY_9f3c27d1a4b8e605'
+     <the owner's reply, verbatim>
+     OWNER_REPLY_9f3c27d1a4b8e605
+     ```
+
+     Only one of `--owner-message-file`, `--owner-message-text-stdin` and
+     `--owner-message-text` may be given. A reply over 64 KiB, not UTF-8, a
+     missing or non-regular file, or stdin on a terminal is a usage error
+     (exit 2); nothing is sent.
 
      At least one of `--owner-message-id` and the reply text is required.
      `--channel` is where the owner replied: 飞书/Lark → `lark`, Telegram →
      `telegram`, the Workspace chat → `workspace`, anything else → `other`.
    - No (「不装」「都不装」「都不要」) → `market-client decline-install
-     <proposal_id>` with the same `--channel`, message id and stdin reply.
+     <proposal_id>` with the same `--channel`, message id and reply file.
    - Unclear → ask again, naming the numbers; run nothing. Unclear includes
      "maybe", "later", a question, a bare 「装」「好」「可以」 when there are
      several candidates (with exactly one candidate 「装」 means 「装 1」),
@@ -192,8 +214,8 @@ Rules:
 - Act only on the candidates of this request. If the reply also asks for
   something else (「把 X 也装上」), do not install it; propose it with a new
   `request-install`.
-- Pass the owner's reply exactly as written (on stdin, as above); never
-  paraphrase or invent it. The market keeps it with the install
+- Pass the owner's reply exactly as written (in a file, as above); never
+  paraphrase or invent it. At most 64 KiB. The market keeps it with the install
   record and the audit.
 - When anyone else wants it installed, an org admin included, do not
   confirm; reply, for example:

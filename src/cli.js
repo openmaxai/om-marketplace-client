@@ -31,7 +31,7 @@ const USAGE = `usage: market-client <command>
   confirm-install <proposal_id> (all | <n|skill_id>...)  install what your owner chose in a direct conversation with you
   decline-install <proposal_id>  record that your owner declined
     both: --channel workspace|lark|telegram|other [--channel-detail <text>]
-    --owner-message-id <id> and/or the owner's reply verbatim: --owner-message-text-stdin (reads stdin) or --owner-message-text <text>
+    --owner-message-id <id> and/or the owner's reply verbatim: --owner-message-file <path>, --owner-message-text-stdin or --owner-message-text <text>
 submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
@@ -204,18 +204,62 @@ async function runCommand({ cmd, arg, config, dataDir, logger, waitMs, print }) 
   }
 }
 
-const readAllStdin = async () => {
-  const chunks = [];
-  for await (const c of process.stdin) chunks.push(c);
-  return Buffer.concat(chunks).toString('utf8');
+// Largest owner reply read from stdin or a file.
+export const MAX_OWNER_MESSAGE_BYTES = 64 * 1024;
+class InputError extends Error {}
+
+const utf8 = (buf, what) => {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    throw new InputError(`${what} is not valid UTF-8`);
+  }
 };
 
-export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`), readStdin = readAllStdin } = {}) {
+// Reads stdin, stopping as soon as it passes MAX_OWNER_MESSAGE_BYTES.
+export const readAllStdin = async (stream = process.stdin) => {
+  const chunks = [];
+  let size = 0;
+  for await (const c of stream) {
+    size += c.length;
+    if (size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`the owner's reply on stdin is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    chunks.push(c);
+  }
+  return utf8(Buffer.concat(chunks), 'the owner\'s reply on stdin');
+};
+
+// Reads at most MAX_OWNER_MESSAGE_BYTES + 1 bytes of a regular file.
+function readOwnerMessageFile(file) {
+  const fail = (err) => new InputError(`--owner-message-file cannot be read (${err.code || 'error'})`);
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch (err) { throw fail(err); }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new InputError('--owner-message-file is not a regular file');
+    if (st.size > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    const buf = Buffer.alloc(MAX_OWNER_MESSAGE_BYTES + 1);
+    let n = 0;
+    for (;;) {
+      let r;
+      try { r = fs.readSync(fd, buf, n, buf.length - n, null); } catch (err) { throw fail(err); }
+      if (r === 0) break;
+      n += r;
+      if (n > MAX_OWNER_MESSAGE_BYTES) throw new InputError(`--owner-message-file is over ${MAX_OWNER_MESSAGE_BYTES} bytes`);
+    }
+    return utf8(buf.subarray(0, n), '--owner-message-file');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export async function main(argv = process.argv.slice(2), { env = process.env, print = (l) => process.stdout.write(`${l}\n`), readStdin = readAllStdin, stdinIsTTY = () => process.stdin.isTTY === true,
+} = {}) {
   const [cmd, ...rest] = argv;
   const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
   const VALUE_OPTS = {
     '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
     '--channel': 'channel', '--channel-detail': 'channelDetail', '--owner-message-id': 'ownerMessageId', '--owner-message-text': 'ownerMessageText',
+    '--owner-message-file': 'ownerMessageFile',
   };
   const submit = AGENT_COMMANDS.has(cmd);
   const pos = [];
@@ -242,7 +286,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   const arity = ['status', 'sync', 'start', 'submissions', 'install-requests', 'install-permission'].includes(cmd) ? 0
     : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
-  if (textFromStdin && opts.ownerMessageText != null) badOpt = true;
+  if ([textFromStdin, opts.ownerMessageText != null, opts.ownerMessageFile != null].filter(Boolean).length > 1) badOpt = true;
   if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;
@@ -265,9 +309,18 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
       return EXIT.FAILED;
     }
   }
-  if (textFromStdin) {
-    // A heredoc ends with one newline that is not part of the owner's reply.
-    opts.ownerMessageText = (await readStdin()).replace(/\r?\n$/, '');
+  if (textFromStdin || opts.ownerMessageFile != null) {
+    try {
+      if (textFromStdin && stdinIsTTY()) throw new InputError('--owner-message-text-stdin needs the reply piped in; stdin is a terminal');
+      const raw = textFromStdin ? await readStdin() : readOwnerMessageFile(opts.ownerMessageFile);
+      // One trailing newline (from a heredoc or an editor) is not part of the owner's reply.
+      opts.ownerMessageText = raw.replace(/\r?\n$/, '');
+    } catch (err) {
+      if (!(err instanceof InputError)) throw err;
+      print(opts.json ? JSON.stringify({ ok: false, error: 'usage', message: err.message }, null, 2) : `${cmd} refused: ${err.message}`);
+      return EXIT.USAGE;
+    }
+    delete opts.ownerMessageFile;
   }
   let config;
   try {

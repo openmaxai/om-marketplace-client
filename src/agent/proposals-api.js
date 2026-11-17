@@ -83,11 +83,13 @@ export function marketCleanText(v, max) {
 // Raw evidence is capped at this many times the market's limit before sending.
 export const RAW_EVIDENCE_FACTOR = 4;
 
-// The text to send: as received (cut to RAW_EVIDENCE_FACTOR * max characters), or null when nothing visible is left.
+// The text to send: as received, cut to RAW_EVIDENCE_FACTOR * max characters; null when nothing visible is left in
+// what would be sent.
 export function rawEvidence(v, max) {
-  if (typeof v !== 'string' || !marketCleanText(v, max)) return null;
+  if (typeof v !== 'string') return null;
   const chars = [...v];
-  return chars.length > RAW_EVIDENCE_FACTOR * max ? chars.slice(0, RAW_EVIDENCE_FACTOR * max).join('') : v;
+  const sent = chars.length > RAW_EVIDENCE_FACTOR * max ? chars.slice(0, RAW_EVIDENCE_FACTOR * max).join('') : v;
+  return marketCleanText(sent, max) ? sent : null;
 }
 
 function candidateView(v, i) {

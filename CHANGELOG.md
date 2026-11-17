@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel DM), the Agent confirms or declines it as `agent_attested`, with
   `--channel workspace|lark|telegram|other`, optional `--channel-detail` and
   the owner's reply as `--owner-message-id` and/or `--owner-message-text`
-  or `--owner-message-text-stdin` (at least one). The selection is matched
+  (or `--owner-message-file`, or `--owner-message-text-stdin`; at most
+  64 KiB, a terminal stdin is refused) (at least one). The selection is matched
   against the request's candidates only (numbers or skill ids) and sent with
   the versions the request pinned; the owner comes from `install-permission`.
   Evidence is sent as received; the market cleans and caps it, and the
@@ -57,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SKILL.md: the Agent proposes in its owner's conversation with numbered
   candidates and reply options, acts only on its owner's own new reply in a
   direct conversation (never a group chat or another member), passes that
-  reply verbatim on stdin, tells anyone else that the owner confirms in chat
+  reply verbatim in a file (or a heredoc with a random delimiter), tells anyone else that the owner confirms in chat
   and admins can install in the Workspace market, and reports what was
   installed and what was not selected.
 

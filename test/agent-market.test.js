@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { FAKE_KEY, ROOT, VALID_ENV, baseEnv, tmpHome } from './helpers.js';
 import { spawn } from 'node:child_process';
+import { main, readAllStdin } from '../src/cli.js';
 import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
@@ -407,14 +408,14 @@ test('CLI: the owner reply is read verbatim from stdin; repeated options are usa
   const r = await cliRun(['confirm-install', U(10), '1', '--channel', 'telegram', '--owner-message-text-stdin', '--json'], { dataDir, input: `${reply}\n` });
   assert.equal(r.code, 0, r.stdout);
   assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, reply);
-  const n = fake.requests.length;
+  const n = fake.market().length;
   for (const args of [
     ['confirm-install', U(10), '1', '--channel', 'lark', '--channel', 'telegram', '--owner-message-text', 'y'],
     ['confirm-install', U(10), '1', '--channel', 'lark', '--owner-message-text', 'a', '--owner-message-text', 'b'],
     ['confirm-install', U(10), '1', '--channel', 'lark', '--owner-message-text', 'a', '--owner-message-text-stdin'],
   ]) assert.equal((await cliRun(args, { dataDir, input: 'z' })).code, 2, args.join(' '));
   assert.equal((await cliRun(['decline-install', U(10), '--channel', 'lark', '--owner-message-text-stdin'], { dataDir, input: 'ㅤ\n' })).code, 2);
-  assert.equal(fake.requests.length, n);
+  assert.equal(fake.market().length, n);
 });
 
 test('attested_off links the market and Agent pages and never declines', async (t) => {
@@ -428,4 +429,103 @@ test('attested_off links the market and Agent pages and never declines', async (
   assert.equal(j.say, `对话里确认暂时没开放，请到市场里手动安装：「Skill 1」https://w.example/market/skills/${U(1)}，「Skill 5」https://w.example/market/skills/${U(5)}；或在我的详情页里装：https://w.example/agents?id=${AGENT}`);
   assert.doesNotMatch(s.text(), /install-proposals/);
   assert.deepEqual(s.fake.market().filter((r) => r.method === 'POST').map((r) => r.path), [`${P}:confirm`]);
+});
+
+const KB64 = 64 * 1024;
+
+test('CLI: --owner-message-file sends the file verbatim; bad files and mixed text options are usage errors', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const home = tmpHome();
+  const dataDir = path.join(home, 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  const reply = '不装 "x" `id` $(id)\nOWNER_REPLY\nrm -rf ~';
+  const file = path.join(home, 'reply.txt');
+  fs.writeFileSync(file, `${reply}\n`);
+  const base = ['decline-install', U(10), '--channel', 'lark'];
+  assert.equal((await cliRun([...base, '--owner-message-file', file], { dataDir })).code, 0);
+  assert.equal(fake.market().find((q) => q.method === 'POST').json.owner_message_text, reply);
+  const n = fake.market().length;
+  const big = path.join(home, 'big.txt');
+  fs.writeFileSync(big, 'x'.repeat(KB64 + 1));
+  const bad = path.join(home, 'bad.txt');
+  fs.writeFileSync(bad, Buffer.from([0x79, 0x65, 0x73, 0xff, 0xfe]));
+  for (const [args, re] of [
+    [['--owner-message-file', path.join(home, 'missing.txt')], /cannot be read \(ENOENT\)/],
+    [['--owner-message-file', home], /not a regular file/],
+    [['--owner-message-file', big], /over 65536 bytes/],
+    [['--owner-message-file', bad], /not valid UTF-8/],
+    [['--owner-message-file', file, '--owner-message-text', 'y'], /usage: market-client/],
+    [['--owner-message-file', file, '--owner-message-text-stdin'], /usage: market-client/],
+    [['--owner-message-file', file, '--owner-message-file', file], /usage: market-client/],
+  ]) {
+    const r = await cliRun([...base, ...args], { dataDir, input: 'z' });
+    assert.equal(r.code, 2, args.join(' '));
+    assert.match(r.stdout, re);
+  }
+  fs.writeFileSync(big, 'x'.repeat(KB64));
+  fake.script('GET', P, { status: 200, json: three() });
+  fake.script('GET', `${A}/install-permission`, PERM);
+  fake.script('POST', `${P}:decline`, { status: 200, json: proposal({ state: 'declined' }) });
+  assert.equal((await cliRun([...base, '--owner-message-file', big], { dataDir })).code, 0, 'exactly 64 KiB is accepted');
+  assert.equal(fake.market().filter((q) => q.method === 'POST').at(-1).json.owner_message_text, 'x'.repeat(2000));
+  assert.equal(fake.market().length, n + 3, 'only the accepted file reached the market');
+});
+
+test('CLI: stdin over 64 KiB, not UTF-8, or on a terminal is a usage error and nothing is sent', async (t) => {
+  const fake = await startFakeMarket({ apiKey: FAKE_KEY, memberId: AGENT });
+  t.after(fake.close);
+  const dataDir = path.join(tmpHome(), 'd');
+  writeConfig({ ...VALID_ENV, COCO_BFF_URL: fake.url }, dataDir);
+  const args = ['decline-install', U(10), '--channel', 'lark', '--owner-message-text-stdin'];
+  let r = await cliRun(args, { dataDir, input: 'x'.repeat(KB64 + 1) });
+  assert.equal(r.code, 2);
+  assert.match(r.stdout, /on stdin is over 65536 bytes/);
+  r = await cliRun(args, { dataDir, input: Buffer.from([0xc3, 0x28]) });
+  assert.equal(r.code, 2);
+  assert.match(r.stdout, /not valid UTF-8/);
+  const out = [];
+  let read = false;
+  const code = await main(args, { env: baseEnv(dataDir), print: (l) => out.push(l), stdinIsTTY: () => true, readStdin: async () => { read = true; return ''; } });
+  assert.equal(code, 2);
+  assert.equal(read, false);
+  assert.match(out.join('\n'), /needs the reply piped in; stdin is a terminal/);
+  assert.equal(fake.requests.length, 0);
+});
+
+test('stdin reading stops as soon as it passes 64 KiB', async () => {
+  let pulled = 0;
+  async function* endless() { for (;;) { pulled++; yield Buffer.alloc(16 * 1024, 0x61); } }
+  await assert.rejects(readAllStdin(endless()), /over 65536 bytes/);
+  assert.equal(pulled, 5);
+  async function* exact() { yield Buffer.alloc(KB64, 0x61); }
+  assert.equal((await readAllStdin(exact())).length, KB64);
+});
+
+test('evidence is cut to 4x the market limit before the emptiness check', async (t) => {
+  const cap = 4 * 500;
+  assert.equal(rawEvidence('x'.repeat(cap), 500), 'x'.repeat(cap));
+  assert.equal(rawEvidence('x'.repeat(cap + 1), 500), 'x'.repeat(cap));
+  assert.equal(rawEvidence(`${'​'.repeat(cap - 1)}a`, 500), `${'​'.repeat(cap - 1)}a`);
+  assert.equal(rawEvidence(`${'​'.repeat(cap)}a`, 500), null);
+  assert.equal(rawEvidence(`${'ㅤ'.repeat(cap)}visible`, 500), null);
+  const s = await setupWatched(t);
+  assert.equal(await s.run('decline-install', [U(10)], { channel: 'lark', ownerMessageText: `${'​'.repeat(cap)}不装` }), 2);
+  assert.match(s.text(), /--owner-message-text/);
+  assert.equal(s.fake.requests.length, 0);
+});
+
+test('an owner_changed refusal does not tell anyone to install manually', async (t) => {
+  const s = await setupWatched(t);
+  s.fake.script('GET', P, { status: 200, json: proposal({ confirm_url: 'https://w.example/market/install-proposals/x' }) });
+  s.fake.script('GET', `${A}/install-permission`, PERM);
+  s.fake.script('POST', `${P}:confirm`, problem(403, { code: 'AGENT_ATTESTATION_REFUSED', reason: 'owner_changed' }));
+  assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
+  const j = JSON.parse(s.text());
+  assert.match(j.message, /made for a previous owner/);
+  assert.doesNotMatch(j.message, /Tell them|手动安装|给我装|w\.example/);
+  assert.equal('say' in j || 'manual_install' in j, false);
 });
