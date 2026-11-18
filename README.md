@@ -274,12 +274,17 @@ chance. It is always on; there is no setting to turn it off.
    conversation has an open turn, nor one closed by a reply within the last 10
    minutes (openmax's own activity store); the last automatic request was 30
    minutes ago or more; fewer than 4 were made this UTC day. A missing or stale
-   status file means no request. Requests for a starter message (see
+   status file means no request. The 30-minute cooldown applies only after a
+   request that brought a session: a retry after an unconfirmed request (step
+   5) is exempt from the 30 minutes and the 4, so automatic requests are at
+   most 4 a day plus up to 12 retries a day. Requests for a starter message (see
    [Starter message](#starter-message) below) follow their own rules and are
    counted apart: they neither use the 4 automatic requests nor wait for the
    30-minute cooldown, and automatic requests do not use theirs.
 3. The request goes to the zylos control queue: "Agent Market templates were
-   updated; please use the new-session skill to start a new session.", held
+   updated and the market client has verified, from the injected template
+   hashes, that the current session does not match them. Start a new session
+   now with the new-session skill. Do not check whether one is needed.", held
    until the Agent is idle, without an ack suffix, with a 6-hour ack deadline
    (the control queue gives up a request not delivered by then; a delivered
    one is marked done at once). The Agent starts the session through its
@@ -299,10 +304,17 @@ chance. It is always on; there is no setting to turn it off.
    reports `template_activated` for each target through the reconcile report,
    at once. A target missing from the session or listed with another sha256 is
    reported as `template_inject_missing` instead and not retried.
-5. A request not followed by a session within 15 minutes of its delivery is
-   made again, at most 3 times per change. Then the alert
-   `template_activation_stuck` is raised; the record stays pending and a later
-   session still confirms it. A record pending for 24 hours raises
+5. Only a session start shown in `injected.json` confirms a request; the
+   Agent's own view of whether it has the template is never relied on. A
+   request not followed by a session within 5 minutes of its delivery is made
+   again (a retry) as soon as the Agent is idle as in step 2, without the
+   30-minute cooldown and apart from the 4 automatic requests, at most 12
+   retries per UTC day. A change merged while no session followed the last
+   request (for example a hire right after a removal) gets the same retry.
+   At most 3 requests per change. Then the alert
+   `template_activation_stuck` is raised and starter messages held for the
+   change are released at once (see [Starter message](#starter-message)); the
+   record stays pending and a later session still confirms it. A record pending for 24 hours raises
    `template_activation_pending_24h`.
 6. A rewrite of the bundle the current session already shows needs no session;
    it is reported as activated at once.
@@ -338,9 +350,10 @@ The message should reach the adopter after the template is in the Agent's
 session, so the starter tasks run against it:
 
 - A new-session request still on its way (in the control queue, or delivered
-  less than 15 minutes ago with no session started since) is joined: the
-  message is held until the session has the template, or for at most 3
-  minutes. So adoptions close together share one request.
+  less than 5 minutes ago with no session started since) is joined: the
+  message is held until the session has the template. So adoptions close
+  together share one request. When that request brings no session, the
+  session is asked for again as below.
 - Otherwise, when the Agent has been idle for 30 seconds with no open OpenMax
   turn at that moment, the client asks for a new session at once (see
   [Template activation](#template-activation)) and holds the message the same
@@ -354,8 +367,8 @@ session, so the starter tasks run against it:
   asks for the session on the starter budget as soon as the Agent has been
   idle 30 seconds and the 2 minutes have passed, or by the automatic rules once
   the 12 are used. This hold is ended by the confirmation, by the adoption no
-  longer waiting (removed, revoked, reported as inject missing), or after 24
-  hours at the latest, and the message is then handled as below.
+  longer waiting (removed, revoked, reported as inject missing), by the
+  change raising `template_activation_stuck`, or after 24 hours at the latest, and the message is then handled as below.
   An Agent that stays busy the whole time therefore gets the message up to 24
   hours late; it is then sent without a new session.
 - When the runtime status file is missing or stale, or the OpenMax turn state

@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.10.0
+version: 0.10.1
 description: >-
   Agent Market client. Use it when a task needs a capability this Agent lacks:
   search the organization's Agent Market for skills (market-client search) and
@@ -116,8 +116,12 @@ Template activation (0.6.0, always on): a template write, upgrade or uninstall
 reaches the Agent at its next session start. Once the Agent has been idle for 5
 minutes with no open OpenMax turn and runtime health ok, the client asks it,
 through the control queue, to start a new session with the new-session skill
-(one queued request at a time, at most every 30 minutes, 4 times a day, 3 times
-per change). A template adopted with a starter message is asked for at once on
+(one queued request at a time, 3 times per change; at most every 30 minutes and
+4 times a day after a request that brought a session; a request not followed by
+a session within 5 minutes is retried without the 30-minute wait, up to 12
+retries a day). The client has already compared the injected
+template hashes when it asks: always start the new session, and never decide
+yourself that the current session already matches the templates. A template adopted with a starter message is asked for at once on
 its own budget (Agent idle 30 seconds, at least 2 minutes apart, 12 a day,
 apart from the automatic 4); when the Agent is busy or that budget does not
 allow it, the starter message waits until the template is in a session, at most

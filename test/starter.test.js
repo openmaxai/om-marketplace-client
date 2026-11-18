@@ -7,7 +7,7 @@ import {
 import { ImError } from '../src/starter/im.js';
 import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
-import { WELCOME_HOLD_MS, WELCOME_MAX_HOLD_MS } from '../src/activation.js';
+import { WELCOME_MAX_HOLD_MS } from '../src/activation.js';
 
 const ADOPTION = U(21);
 const ADOPTER = '0b6f4f3e-2222-4c2a-9d1e-aaaaaaaaaaaa';
@@ -592,8 +592,8 @@ test('the reason code is kept with a mark retried later; sent has none', async (
 });
 
 // A starter message whose template waits for a new session: not claimed while the activation is pending, at most
-// WELCOME_HOLD_MS; the claim stays right before the send.
-async function heldSetup(t, pending, holdMs = WELCOME_HOLD_MS) {
+// WELCOME_MAX_HOLD_MS; the claim stays right before the send.
+async function heldSetup(t, pending, holdMs = WELCOME_MAX_HOLD_MS) {
   const h = await pullHarness(t);
   h.fake.script('POST', CLAIM, claimed());
   h.fake.script('POST', MARK, marked('sent'));
@@ -621,20 +621,7 @@ test('a held starter message is sent once the template is confirmed in a session
   assert.deepEqual(s.jobs(), {});
 });
 
-test('a held starter message is sent after at most 3 minutes without a confirmation', async (t) => {
-  const s = await heldSetup(t, { value: true });
-  for (let i = 0; i < 5; i++) {
-    s.clock.t += STARTER_CHECK_MS;
-    await s.starter.runWaiting();
-  }
-  assert.deepEqual(s.market(), []);
-  s.clock.t = Date.parse('2026-10-16T00:00:00Z') + WELCOME_HOLD_MS;
-  await s.starter.runWaiting();
-  assert.deepEqual(s.market(), [':claim-starter', ':mark-starter-shown']);
-  assert.equal(sends(s.im).length, 1);
-});
-
-test('a message held until its session (no request could be made) waits past 3 minutes; the send deadline counts from the later claim', async (t) => {
+test('a message held until its session waits for hours unclaimed; the send deadline counts from the later claim', async (t) => {
   const pending = { value: true };
   const s = await heldSetup(t, pending, WELCOME_MAX_HOLD_MS);
   // Two hours, far past STARTER_SEND_BY_MS: not claimed, so the market's grace has not started.
