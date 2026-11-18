@@ -9,7 +9,7 @@ import { assertMarketHeaders, startFakeMarket } from './fake/market.js';
 import { AGENT, ORG, U } from './fake/pull.js';
 import { loadConfig, writeConfig } from '../src/config.js';
 import { runMarketCommand } from '../src/agent/commands.js';
-import { marketCleanText, workspaceOrigin, proposalView, rawEvidence } from '../src/agent/proposals-api.js';
+import { marketCleanText, workspaceBase, workspaceOrigin, proposalView, rawEvidence } from '../src/agent/proposals-api.js';
 import { installerList, installers } from '../src/http.js';
 import { watchDir } from '../src/agent/proposal-watch.js';
 import fs from 'node:fs';
@@ -156,6 +156,19 @@ test('install-requests refreshes the local records one by one, newest first, mar
   assert.equal(await run('install-requests', [], { state: 'bogus' }), 2);
 });
 
+test('request-install links the Workspace pages under the market\'s workspace_url, path kept', async (t) => {
+  const s = await setup(t);
+  const base = 'https://ws.example.test/workspace';
+  s.fake.script('POST', `${A}/install-proposals`, { status: 201, json: proposal({ workspace_url: `${base}/`, confirm_url: null }) });
+  assert.equal(await s.run('request-install', [U(1)], { reason: ['r'], json: true }), 0);
+  const j = JSON.parse(s.text());
+  assert.equal(j.workspace_url, base);
+  assert.deepEqual(j.manual_install, {
+    skills: [{ name: 'Skill 1', url: `${base}/market/skills/${U(1)}` }, { name: 'Skill 5', url: `${base}/market/skills/${U(5)}` }],
+    agent_url: `${base}/agents?id=${AGENT}`,
+  });
+});
+
 test('request-install links the Workspace market pages for anyone else, never the confirm page', async (t) => {
   const s = await setup(t);
   const url = 'https://workspace.example.test/market/install-proposals/p';
@@ -163,7 +176,7 @@ test('request-install links the Workspace market pages for anyone else, never th
   assert.equal(await s.run('request-install', [U(1)], { reason: ['r'], json: true }), 0);
   const j = JSON.parse(s.text());
   assert.equal('confirm_url' in j || 'confirm_phrase' in j, false);
-  assert.equal(j.workspace_origin, 'https://workspace.example.test');
+  assert.equal(j.workspace_url, 'https://workspace.example.test');
   assert.deepEqual(j.manual_install, {
     skills: [{ name: 'Skill 1', url: `https://workspace.example.test/market/skills/${U(1)}` }, { name: 'Skill 5', url: `https://workspace.example.test/market/skills/${U(5)}` }],
     agent_url: `https://workspace.example.test/agents?id=${AGENT}`,
@@ -174,6 +187,16 @@ test('request-install links the Workspace market pages for anyone else, never th
   assert.equal(await s.run('request-install', [U(1)], { reason: ['r'] }), 0);
   assert.match(s.text(), /在 Workspace「市场」里打开「Skill 1」「Skill 5」安装/);
   assert.doesNotMatch(s.text(), /javascript|https?:/);
+});
+
+test('workspaceBase keeps the path without trailing /, refuses query, fragment and what workspaceOrigin refuses', () => {
+  assert.equal(workspaceBase('https://w.example/workspace/'), 'https://w.example/workspace');
+  assert.equal(workspaceBase('https://W.example'), 'https://w.example');
+  assert.equal(workspaceBase('http://localhost:3000/a/b'), 'http://localhost:3000/a/b');
+  for (const bad of ['https://w.example/x?y=1', 'https://w.example/x?', 'https://w.example/x#f', 'http://w.example/x', 'https://u:p@w.example/', 'nope', null]) assert.equal(workspaceBase(bad), null);
+  assert.equal(proposalView(proposal({ workspace_url: 'https://w.example/workspace', confirm_url: 'https://x.example/c' })).workspace_url, 'https://w.example/workspace');
+  assert.equal(proposalView(proposal({ workspace_url: 'ftp://w.example/', confirm_url: 'https://x.example/c' })).workspace_url, 'https://x.example');
+  assert.equal(proposalView(proposal({ workspace_url: null, confirm_url: null })).workspace_url, null);
 });
 
 test('workspaceOrigin accepts https and loopback http only, without credentials', () => {
@@ -421,13 +444,12 @@ test('CLI: the owner reply is read verbatim from stdin; repeated options are usa
 
 test('attested_off links the market and Agent pages and never declines', async (t) => {
   const s = await setupWatched(t);
-  const withOrigin = proposal({ confirm_url: 'https://w.example/market/install-proposals/x' });
-  s.fake.script('GET', P, { status: 200, json: withOrigin });
+  s.fake.script('GET', P, { status: 200, json: proposal({ workspace_url: 'https://w.example/ws', confirm_url: null }) });
   s.fake.script('GET', `${A}/install-permission`, PERM);
   s.fake.script('POST', `${P}:confirm`, problem(403, { code: 'AGENT_CONFIRM_DISABLED', reason: 'attested_off' }));
   assert.equal(await s.run('confirm-install', [U(10), 'all'], { ...EVIDENCE, json: true }), 3);
   const j = JSON.parse(s.text());
-  assert.equal(j.say, `对话里确认暂时没开放，请到市场里手动安装：「Skill 1」https://w.example/market/skills/${U(1)}，「Skill 5」https://w.example/market/skills/${U(5)}；或在我的详情页里装：https://w.example/agents?id=${AGENT}`);
+  assert.equal(j.say, `对话里确认暂时没开放，请到市场里手动安装：「Skill 1」https://w.example/ws/market/skills/${U(1)}，「Skill 5」https://w.example/ws/market/skills/${U(5)}；或在我的详情页里装：https://w.example/ws/agents?id=${AGENT}`);
   assert.doesNotMatch(s.text(), /install-proposals/);
   assert.deepEqual(s.fake.market().filter((r) => r.method === 'POST').map((r) => r.path), [`${P}:confirm`]);
 });

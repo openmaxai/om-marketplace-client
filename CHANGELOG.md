@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-18
+
+### Fixed
+- Manual install links (market skill pages and the Agent's page) are built
+  on the market's `workspace_url`, the Workspace web base with its path
+  (for example `https://host/workspace`), instead of the bare origin, which
+  led to 404 pages. The proposal view field `workspace_origin` is renamed
+  `workspace_url` (also in `--json`). A market that does not send
+  `workspace_url` still gives only the origin of its `confirm_url`, so its
+  links keep missing the Workspace path until that market is upgraded;
+  with neither, the pages are named instead.
+
 ## [0.9.0] - 2026-11-18
 
 ### Added
