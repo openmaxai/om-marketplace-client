@@ -70,6 +70,8 @@ function parseIntent(raw, p) {
     // Absent from markets without the starter message.
     it.starter_message = raw.starter_message == null ? false : bool(raw.starter_message, `${p}.starter_message`);
     it.adopted_by_member_id = nullable(memberId)(raw.adopted_by_member_id, `${p}.adopted_by_member_id`);
+    // Who the starter message is for; absent from older markets (then the adopter).
+    it.starter_recipient_member_id = nullable(memberId)(raw.starter_recipient_member_id, `${p}.starter_recipient_member_id`);
     it.starter_content = parseStarterContent(raw.starter_content);
   } else {
     if (raw.bundle_sha256 != null) fail(`${p}.bundle_sha256`, `must be absent for ${it.op}`);

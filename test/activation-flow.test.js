@@ -137,7 +137,7 @@ test('starter message: an Agent idle 30 s is asked for a new session at once and
   f.status({ idle_seconds: 45 });
   assert.equal(await f.templates.runNext(), 'succeeded');
   assert.equal(f.controls().length, 1);
-  assert.deepEqual(f.starts, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: null, holdUntil: f.clock.t + WELCOME_MAX_HOLD_MS }]);
+  assert.deepEqual(f.starts, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient: null, content: null, holdUntil: f.clock.t + WELCOME_MAX_HOLD_MS }]);
   assert.equal(f.activation.isPending(ADOPTION), true);
   f.clock.t += 1000;
   f.session();

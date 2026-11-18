@@ -818,10 +818,13 @@ test('a sha_block hitting a record still in writing quarantines it', async (t) =
 // A write order with starter_message queues the adoption's starter message only once the market applied the write.
 test('the starter message is queued after an applied first write, never after a stale, failed or plain write', async (t) => {
   const ADOPTER = U(30);
+  const OWNER = U(31);
   const cases = [
-    ['applied', { starter_message: true, adopted_by_member_id: ADOPTER }, applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: null, holdUntil: null }]],
+    ['applied', { starter_message: true, adopted_by_member_id: ADOPTER }, applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient: null, content: null, holdUntil: null }]],
+    ['applied for the owner', { starter_message: true, adopted_by_member_id: ADOPTER, starter_recipient_member_id: OWNER }, applied,
+      [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient: OWNER, content: null, holdUntil: null }]],
     ['applied with content', { starter_message: true, adopted_by_member_id: ADOPTER, starter_content: { template_name: 't', first_guide: 'g', starter_tasks: [] } },
-      applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: { templateName: 't', firstGuide: 'g', starterTasks: [] }, holdUntil: null }]],
+      applied, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient: null, content: { templateName: 't', firstGuide: 'g', starterTasks: [] }, holdUntil: null }]],
     ['no starter message', { starter_message: false, adopted_by_member_id: ADOPTER }, applied, []],
     ['no adopter', { starter_message: true, adopted_by_member_id: null }, applied, []],
     ['stale', { starter_message: true, adopted_by_member_id: ADOPTER }, stale('active'), []],

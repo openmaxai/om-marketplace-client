@@ -340,8 +340,12 @@ still waiting is dropped.
 ## Starter message
 
 After the market accepted the first write of an adopted expert template whose
-order carries `starter_message`, the client sends the adopter one welcome
-message from this Agent's own OpenMax IM account. The template text never
+order carries `starter_message`, the client sends the recipient one welcome
+message from this Agent's own OpenMax IM account. The recipient is the
+order's `starter_recipient_member_id` (the Agent's owner, recorded by the
+market when the expert was hired); a market that does not send it means the
+adopter (`adopted_by_member_id`), as before. In the steps below, "the
+recipient" is that member. The template text never
 reaches the model. With openmax 2.32.0 or later it is sent as the welcome card
 (see step 6); the web chat draws the card from the template, and the message
 text is shown wherever the card is not.
@@ -403,9 +407,9 @@ The message is still sent at most once (the claim, and the client message id
    not recognised, so warnings such as "never share your password" are refused
    too, and so is a copy of the safety notice), nothing is sent and the result
    is `rejected_content`. Authors leave reminders to the platform notice.
-4. The client opens the DM with the adopter (`comm.create_dm`) and checks with
+4. The client opens the DM with the recipient (`comm.create_dm`) and checks with
    `comm.get_conversation` and `comm.member_list` that it is a DM with exactly
-   this Agent and the adopter; otherwise nothing is sent (`send_failed`).
+   this Agent and the recipient; otherwise nothing is sent (`send_failed`).
    Each of these read-only calls is tried once more after a failure that is
    not a refusal (unreadable output, timeout, server error). Trace lines the
    openmax CLI prints to stdout (`[rpc] ...`, `[token] ...`, any `[name] `
@@ -420,9 +424,11 @@ The message is still sent at most once (the claim, and the client message id
    takes `noRun`, the client skips the wait and sends with `noRun: true`.
    While waiting, the client keeps only ids, the `starter_content` and its
    sha256 (canonical JSON, recorded at the claim); never the rendered text or
-   the adopter's name. Right before the send it checks the DM again and renders
+   the recipient's name. When a confirmation to the adopter follows (step 8),
+   the recipient's cleaned display name is kept in the job from the final
+   render until the confirmation is sent, and is deleted with the job. Right before the send it checks the DM again and renders
    the message again through the whole pipeline (filter, size fit, credential
-   check including the adopter's name, byte limit). A changed content hash, a
+   check including the recipient's name, byte limit). A changed content hash, a
    changed DM or any failing step means no send and `send_failed`, and so does
    a check that ends 9 minutes or more after the claim (`too_late`), so no send
    can still run when the market's 10-minute grace ends.
@@ -460,6 +466,16 @@ The message is still sent at most once (the claim, and the client message id
    `content_unavailable`, `no_content`, `too_large`, `asks_for_credential`,
    `send_refused_http_<status>`, `send_lost`, `interrupted`, `internal_error`). The market
    takes only `result`, so the reason is not sent.
+8. When the recipient is not the adopter (an org admin hired the expert on
+   someone else's Agent) and the result is `sent`, the adopter gets one short
+   plain-text confirmation in their own DM with this Agent, after the same DM
+   check: `已为 {owner} 的 Agent 聘用「{expert}」` and, on a second line,
+   `Hired “{expert}” for {owner}'s Agent` (`renderHired` in
+   `src/starter/render.js`; the owner's name is the cleaned name used in the
+   greeting). It is sent as `AGENT_TEXT` with client message id
+   `mkt-hired-<adoption_id>`, at most once: it waits like step 5 while the
+   adopter's DM has a run (up to 8 minutes), and any failure, an unknown
+   outcome or a restart during the send ends it without another try.
 
 The content is the `starter_content` the market puts on the write order
 (`{template_name, first_guide, starter_tasks}`). Without it, without the

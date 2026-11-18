@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-18
+
+### Changed
+- Starter message: the welcome message goes to the Agent's owner, the
+  `starter_recipient_member_id` the market now puts on the write order,
+  instead of always the adopter. When an org admin hired the expert on
+  someone else's Agent, the admin gets one short plain-text confirmation in
+  their own DM with the Agent instead (`已为 {owner} 的 Agent 聘用「{expert}」`
+  / `Hired “{expert}” for {owner}'s Agent`, client message id
+  `mkt-hired-<adoption_id>`, at most once). A market that does not send the
+  field keeps the old behaviour: the message goes to the adopter and no
+  confirmation is sent.
+
 ## [0.10.1] - 2026-11-18
 
 ### Fixed

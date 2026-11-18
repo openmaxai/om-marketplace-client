@@ -5,7 +5,7 @@ import {
   LOOKUP_SKEW_MS, STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_VERIFY_MS, STARTER_VERIFY_SETTLE_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
 } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
-import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderStarter } from '../src/starter/render.js';
+import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderHired, renderStarter } from '../src/starter/render.js';
 import { MAX_BODY_BYTES, MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 import { WELCOME_MAX_HOLD_MS } from '../src/activation.js';
 
@@ -858,4 +858,116 @@ test('the plain-text resend with an unknown outcome is looked up by its own clie
   await s.starter.runAll();
   assert.deepEqual(finds(s.im).map((p) => p.clientMsgId), [`mkt-starter-${ADOPTION}-text`]);
   assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+});
+
+// The Agent's owner as recipient, an org admin as adopter: each peer has its own DM.
+const OWNER = '0b6f4f3e-3333-4c2a-9d1e-aaaaaaaaaaaa';
+const HIRED = `mkt-hired-${ADOPTION}`;
+function twoDmIm({ busyAdopter = () => false, confirmError = null, noRun = false } = {}) {
+  const im = fakeIm({ noRun });
+  const names = { [OWNER]: '李四', [ADOPTER]: '张三' };
+  im.createDm = async (p) => { im.calls.push(['create_dm', p]); return `cv-${p.peerMemberId}`; };
+  im.getConversation = async (p) => { im.calls.push(['get_conversation', p]); return { id: p.conversationId, type: 'dm' }; };
+  im.memberList = async (p) => {
+    im.calls.push(['member_list', p]);
+    const peer = p.conversationId.slice(3);
+    return [{ member_id: AGENT, display_name: 'Agent' }, { member_id: peer, display_name: names[peer] }];
+  };
+  im.runInProgress = async (p) => { im.calls.push(['run_check', p]); return p.conversationId === `cv-${ADOPTER}` ? busyAdopter() : false; };
+  const sendText = im.sendText;
+  im.sendText = async (p) => {
+    if (p.clientMsgId === HIRED && confirmError) { im.calls.push(['send', p]); throw confirmError; }
+    return sendText(p);
+  };
+  return im;
+}
+
+async function ownerSetup(t, { im = twoDmIm(), recipient = OWNER, mark = [marked('sent')] } = {}) {
+  const h = await pullHarness(t);
+  h.fake.script('POST', CLAIM, claimed());
+  if (mark.length) h.fake.script('POST', MARK, ...mark);
+  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, now: h.now, content: async () => CONTENT });
+  assert.equal(starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient }), true);
+  const market = () => h.fake.market().map((r) => [r.path.slice(B.length), r.json]);
+  return { ...h, im, starter, market, jobs: () => h.state.read('starters', {}) };
+}
+
+test('recipient not the adopter: the welcome goes to the owner, then one plain confirmation to the adopter', async (t) => {
+  const s = await ownerSetup(t);
+  await s.starter.runAll();
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+  const out = sends(s.im).map(([, p]) => p);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].conversationId, `cv-${OWNER}`);
+  assert.equal(out[0].text, renderStarter({ ...cleanContent({ ...CONTENT, addressee: '李四' }) }));
+  assert.equal(out[1].conversationId, `cv-${ADOPTER}`);
+  assert.equal(out[1].clientMsgId, HIRED);
+  assert.equal(out[1].text, '已为 李四 的 Agent 聘用「周报助手」\nHired “周报助手” for 李四\'s Agent');
+  assert.equal(out[1].text, renderHired({ owner: '李四', expert: '周报助手' }));
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('recipient equal to the adopter, or absent: only the welcome, no confirmation', async (t) => {
+  for (const recipient of [ADOPTER, null]) {
+    const s = await ownerSetup(t, { recipient });
+    await s.starter.runAll();
+    const out = sends(s.im).map(([, p]) => p);
+    assert.equal(out.length, 1, String(recipient));
+    assert.equal(out[0].conversationId, `cv-${ADOPTER}`);
+    assert.ok(!out.some((p) => p.clientMsgId === HIRED));
+  }
+});
+
+test('a malformed recipient is not queued', async (t) => {
+  const h = await pullHarness(t);
+  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im: twoDmIm(), now: h.now });
+  assert.equal(starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient: '../x' }), false);
+  assert.deepEqual(h.state.read('starters', {}), {});
+});
+
+test('welcome not sent: no confirmation', async (t) => {
+  const im = twoDmIm();
+  im.sendText = async (p) => { im.calls.push(['send', p]); throw new ImError('HTTP 403', { status: 403, definite: true, kind: 'http' }); };
+  const s = await ownerSetup(t, { im, mark: [marked('send_failed')] });
+  await s.starter.runAll();
+  assert.deepEqual(s.market().map(([p, b]) => [p, b.result]), [[':claim-starter', undefined], [':mark-starter-shown', 'send_failed']]);
+  assert.equal(sends(s.im).length, 1);
+  assert.ok(!s.im.calls.some(([c, p]) => c === 'create_dm' && p.peerMemberId === ADOPTER));
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('a failed confirmation is not tried again', async (t) => {
+  const s = await ownerSetup(t, { im: twoDmIm({ confirmError: new ImError('timed out', { kind: 'timeout' }) }) });
+  await s.starter.runAll();
+  await s.starter.runAll();
+  assert.equal(sends(s.im).filter(([, p]) => p.clientMsgId === HIRED).length, 1);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('a confirmation interrupted while sending is not sent again', async (t) => {
+  const s = await ownerSetup(t);
+  s.state.update('starters', {}, (d) => { d[ADOPTION] = { ...d[ADOPTION], stage: 'confirming', result: 'sent', recipient_name: '李四' }; });
+  await s.starter.runAll();
+  assert.deepEqual(s.im.calls, []);
+  assert.deepEqual(s.jobs(), {});
+});
+
+test('the confirmation waits while the adopter DM has a run, and gives up after the wait', async (t) => {
+  for (const clear of [true, false]) {
+    let busy = true;
+    const s = await ownerSetup(t, { im: twoDmIm({ busyAdopter: () => busy }) });
+    await s.starter.runAll();
+    assert.equal(s.jobs()[ADOPTION].stage, 'confirm');
+    assert.equal(sends(s.im).length, 1);
+    if (clear) {
+      busy = false;
+      s.clock.t += STARTER_CHECK_MS;
+    } else {
+      s.clock.t += STARTER_WAIT_MS;
+    }
+    await s.starter.runWaiting();
+    const confirmations = sends(s.im).filter(([, p]) => p.clientMsgId === HIRED);
+    assert.equal(confirmations.length, clear ? 1 : 0);
+    assert.deepEqual(s.jobs(), {});
+  }
 });
