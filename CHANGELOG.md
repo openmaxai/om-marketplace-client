@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Template activation: the new-session request is now an instruction. It
   tells the Agent that the client has verified from the injected template
-  hashes that the current session lacks the templates, to start a new
+  hashes that the current session does not match the templates, to start a new
   session now with the new-session skill and not to check whether one is
   needed. SKILL.md says the same. An Agent that judged the template already
   loaded and started no session used to delay the change by 30 minutes or
@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Template activation: a request not followed by a session (no newer
   `injected.json`) is made again 5 minutes after its delivery instead of 15,
   once the Agent is idle, and such a retry no longer waits for the 30-minute
-  cooldown or uses the 4 automatic requests a day. Retries have their own
-  cap of 12 per UTC day; at most 3 requests per change as before. A change
+  cooldown or uses the 4 automatic requests a day: the cooldown applies only
+  after a request that brought a session. Automatic requests are thus at most
+  4 a day plus up to 12 retries a day; at most 3 requests per change as before. A change
   merged while no session followed the last request (for example a hire
   right after a removal) is asked for by the same retry, so it no longer
   waits for the cooldown. Only a session start in `injected.json` confirms a
@@ -31,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that hold used to end after 3 minutes, so the welcome card could arrive long
   before the template took effect (for example a hire right after a
   removal). When the joined request brings no session, the client asks again
-  on the starter budget. The 24-hour hold limit, and sending at once when no
+  on the starter budget. When the change raises `template_activation_stuck`
+  (3 requests without a session), its held messages are released at once
+  instead of waiting for the 24-hour limit. The 24-hour hold limit, and sending at once when no
   session can be asked for (runtime status or turn state unreadable, enqueue
   refused), are unchanged.
 

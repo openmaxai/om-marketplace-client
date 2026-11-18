@@ -38,7 +38,7 @@ export const PENDING_ALERT_MS = 24 * 60 * 60 * 1000;
 export const STUCK_ALERT = 'template_activation_stuck';
 export const PENDING_ALERT = 'template_activation_pending_24h';
 export const NEW_SESSION_TEXT = 'Agent Market templates were updated and the market client has verified, from the injected template hashes, '
-  + 'that the current session does not have them. Start a new session now with the new-session skill. Do not check whether one is needed.';
+  + 'that the current session does not match them. Start a new session now with the new-session skill. Do not check whether one is needed.';
 export const CONTROL_TIMEOUT_MS = 15_000;
 // The control queue gives up a request not delivered (or left running) after this; passed as its ack deadline. With
 // --no-ack-suffix the runtime marks a submitted request done itself, so the deadline only ends one that is stuck.
@@ -127,11 +127,12 @@ const isList = Array.isArray;
 
 // State document `activation`: {pending, passive, requests, welcome_requests, retry_requests, backfilled}.
 // pending is the one record of this Agent, {pending_since, written_at, targets: [{adoption_id, rendered_sha256}],
-// removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id]} or
+// removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id], stuck_at} or
 // null. written_at is the last change merged in; control_id the control queue item of the last request (null once it
 // left the queue or when the enqueue's outcome is unknown); delivered_at when it was first seen delivered; seen_at the
 // last marker that did not confirm the record; welcome the adoptions whose starter message is held until the record is
-// confirmed (the check keeps asking on the starter budget while no request is in flight).
+// confirmed (the check keeps asking on the starter budget while no request is in flight); stuck_at when MAX_REQUESTS
+// requests brought no session, which releases those messages.
 // passive holds the adoptions written before 0.6.0 ({targets, seen_at}); they are confirmed by the next session that
 // shows them but never cause a request. requests lists the times of automatic new-session requests, welcome_requests
 // those made for starter messages, retry_requests automatic ones made while no session followed the last request;
@@ -234,6 +235,7 @@ export function createActivation({
       if (Date.parse(t) > Date.parse(p.written_at)) p.written_at = t;
       // A new change gets its own requests.
       p.request_count = 0;
+      delete p.stuck_at;
       d.pending = p;
       changed = true;
     });
@@ -493,6 +495,8 @@ export function createActivation({
     if (cur.request_count >= MAX_REQUESTS) {
       const msg = `template activation not confirmed after ${MAX_REQUESTS} new-session requests; waiting for the next session`;
       if (state.setAlert(STUCK_ALERT, msg)) logger.warn(`activation: ${msg}`);
+      // Held starter messages are released: no more sessions are asked for this change.
+      if (!cur.stuck_at) save((d) => { if (d.pending && d.pending.written_at === cur.written_at) d.pending.stuck_at = iso(); });
       return 'stuck';
     }
     if (!(await idle(IDLE_MIN_SECONDS))) {
@@ -568,8 +572,11 @@ export function createActivation({
       }
       logger.info(`activation: adoption ${adoptionId} was reported as inject missing; its activation is no longer awaited`);
     },
-    // True while a write of the adoption waits for a session.
-    isPending: (adoptionId) => Boolean(read().pending?.targets.some((x) => x.adoption_id === adoptionId)),
+    // True while a write of the adoption waits for a session that is still being asked for (not stuck).
+    isPending: (adoptionId) => {
+      const p = read().pending;
+      return Boolean(p?.targets.some((x) => x.adoption_id === adoptionId) && !p.stuck_at);
+    },
     // For a starter message of a just written adoption; returns the time the message may wait until, or null to send it
     // as before. The message is held until the record is confirmed (WELCOME_MAX_HOLD_MS at most), so it never comes
     // before the template is in a session. A request still in flight is joined. Otherwise, when the Agent has been idle

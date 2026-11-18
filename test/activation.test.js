@@ -1318,3 +1318,101 @@ test('remove then hire with a starter message: the message is held until the ses
   await s.starter.runWaiting();
   assert.deepEqual(s.sent, [`mkt-starter-${A2}`]);
 });
+
+// Ticks the check and the starter every interval with the Agent idle and no session, until fn() holds or maxMs passed;
+// the tick results seen.
+async function declineUntil(f, a, s, fn, maxMs = 2 * 60 * 60 * 1000) {
+  const seen = [];
+  for (const from = f.clock.t; f.clock.t - from <= maxMs && !fn(seen); f.advance(ACTIVATION_CHECK_MS)) {
+    f.status();
+    seen.push(await a.tick());
+    await s.starter.runWaiting();
+  }
+  return seen;
+}
+
+test('stuck: a held starter message is released when the change goes stuck, not before, and sent once', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(f.controls.length, 1);
+  // Requests remain: held while each of them goes unanswered. The first send comes in the interval of the stuck tick.
+  const before = await declineUntil(f, a, s, () => s.sent.length > 0);
+  assert.equal(before.at(-1), 'stuck');
+  assert.equal(f.controls.length, MAX_REQUESTS);
+  assert.equal(before.filter((r) => r === 'stuck').length, 1);
+  assert.equal(f.alert(), true);
+  // Until the stuck tick nothing was claimed; the starter run of that same interval sent it.
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  assert.equal(s.claims(), 1);
+  assert.equal(a.isPending(A1), false);
+  assert.notEqual(f.pending(), null);
+  for (let i = 0; i < 10; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status();
+    assert.equal(await a.tick(), 'stuck');
+    await s.starter.runWaiting();
+  }
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+});
+
+test('stuck: held while requests remain, even past the confirm waits', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A1, S1);
+  const seen = await declineUntil(f, a, s, () => f.controls.length === MAX_REQUESTS);
+  assert.ok(!seen.includes('stuck'));
+  // The last request is still given its confirm wait.
+  for (let i = 0; i < CONFIRM_WAIT_MS / ACTIVATION_CHECK_MS - 1; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status();
+    assert.equal(await a.tick(), 'waiting');
+    await s.starter.runWaiting();
+  }
+  assert.equal(a.isPending(A1), true);
+  assert.equal(s.claims(), 0);
+  assert.deepEqual(s.sent, []);
+});
+
+test('stuck: a new change after stuck is held again until confirmed; the released message is not sent again', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A1, S1);
+  await declineUntil(f, a, s, (seen) => seen.at(-1) === 'stuck');
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  // A new adoption merges into the stuck record: it gets its own requests and its message is held.
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(f.pending().request_count, 1);
+  assert.equal(f.pending().stuck_at, undefined);
+  assert.equal(a.isPending(A2), true);
+  await declineUntil(f, a, s, () => f.controls.length === MAX_REQUESTS + 2);
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`]);
+  await session(f, a, [[A1, S1], [A2, S2]]);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+  assert.equal(s.claims(), 2);
+});
+
+test('stuck: a new change after stuck that goes stuck itself releases its own message', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A1, S1);
+  await declineUntil(f, a, s, (seen) => seen.at(-1) === 'stuck');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  await s.adopted(A2, S2);
+  const seen = await declineUntil(f, a, s, (r) => r.at(-1) === 'stuck');
+  assert.equal(seen.at(-1), 'stuck');
+  assert.equal(f.controls.length, 2 * MAX_REQUESTS);
+  assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+});
