@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+
+### Added
+- `submit-skill` and `submit-template` take `--personal`: the skill or
+  template goes to the owner's personal shelf only (usable by the owner at
+  once, no review, not submitted to the organization), as when the owner
+  uploads it as personal in the workbench. Without it nothing changes: it is
+  submitted to the organization for review (and is on the owner's personal
+  shelf meanwhile). Needs a market that supports Agent personal submissions.
+  An older market is recognised only by its unknown-field refusal (400
+  `VALIDATION_FAILED`, field `body`) on the first call (skill prepare,
+  template publish): reported as `PERSONAL_UNSUPPORTED`, nothing submitted,
+  not retried, with a suggested owner reply; any other 400 is reported as
+  usual. A personal request not answered as personal with no review is
+  reported as `PERSONAL_NOT_CONFIRMED` (something may already be submitted;
+  not retried; the owner checks 「我的 › 我创建的」).
+- The submit commands end with a suggested reply to the owner;
+  `--json` adds `owner_reply` and `scope` (`personal` / `org`). For
+  templates `template_id` / `template_version_id` name the personal copy
+  with `--personal` and the organization's copy otherwise;
+  `personal_template_id` / `personal_template_version_id` are recorded too.
+  `submissions` shows personal ones as `personal shelf only`.
+- SKILL.md: before submitting, the Agent maps what the owner said to
+  `--personal` (个人, 仅自己可见) or the default (组织), and asks the owner
+  when it is not stated.
+
 ## [0.9.1] - 2026-11-18
 
 ### Fixed

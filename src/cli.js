@@ -21,8 +21,8 @@ const USAGE = `usage: market-client <command>
   enable <slug>             move a disabled skill back into the skills directory
   disable <slug>            move a skill out of the skills directory
   uninstall <slug>          remove a skill and its kept versions
-  submit-skill <dir>        package a directory with SKILL.md and submit it as a new skill (pending review)
-  submit-template <file>    submit an expert template manifest (JSON) as a new template (pending review)
+  submit-skill <dir>        package a directory with SKILL.md and submit it as a new skill (org review; --personal: owner only)
+  submit-template <file>    submit an expert template manifest (JSON) as a new template (org review; --personal: owner only)
   submissions [--json]      submissions made from this Agent
   search [<words>]          search skills listed for the organization [--category-id <id>] [--limit 1-20]
   install-permission        who may confirm installs on this Agent (in the workspace)
@@ -32,7 +32,7 @@ const USAGE = `usage: market-client <command>
   decline-install <proposal_id>  record that your owner declined
     both: --channel workspace|lark|telegram|other [--channel-detail <text>]
     --owner-message-id <id> and/or the owner's reply verbatim: --owner-message-file <path>, --owner-message-text-stdin or --owner-message-text <text>
-submit options: --dry-run (local checks only), --changelog <text>, --category-id <id>,
+submit options: --dry-run (local checks only), --personal (owner's personal shelf only, no review), --changelog <text>, --category-id <id>,
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
 start, sync, rollback, enable, disable and uninstall wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
@@ -337,6 +337,10 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
     }
     else if (rest[i] === '--wait') opts.wait = Number(rest[++i]);
     else if (SUBMIT_COMMANDS.has(cmd) && rest[i] === '--dry-run') opts.dryRun = true;
+    else if ((cmd === 'submit-skill' || cmd === 'submit-template') && rest[i] === '--personal') {
+      if (opts.personal) badOpt = true;
+      opts.personal = true;
+    }
     else if (submit && VALUE_OPTS[rest[i]]) {
       if (i + 1 >= rest.length) badOpt = true;
       const k = VALUE_OPTS[rest[i]];
