@@ -1,4 +1,5 @@
-// Market calls for an Agent submitting a new skill or expert template. Every submission lands as pending review.
+// Market calls for an Agent submitting a new skill or expert template: to the org shelf (pending review; also on the
+// owner's personal shelf) or, with scope personal, to the owner's personal shelf only (no review).
 import crypto from 'node:crypto';
 import { MarketError, backoffMs, marketQuote } from '../http.js';
 import { downloadUrlAllowed } from '../download.js';
@@ -33,6 +34,34 @@ function reviewOf(v) {
   return { review_id: str(v.review_id), state: str(v.state), market: str(v.market) };
 }
 
+export const SCOPE_PERSONAL = 'personal';
+export const SCOPE_ORG = 'org';
+export const PERSONAL_UNSUPPORTED = 'PERSONAL_UNSUPPORTED';
+
+// A market without scope refuses the unknown body field as a whole body (400 VALIDATION_FAILED, field "body").
+function personalUnsupported(err) {
+  return err instanceof MarketError && err.status === 400 && err.code === 'VALIDATION_FAILED'
+    && Array.isArray(err.errors) && err.errors.some((e) => e?.field === 'body');
+}
+
+async function scoped(scope, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (scope === SCOPE_PERSONAL && personalUnsupported(err)) {
+      throw new MarketError('the market does not support personal-only submissions', { status: 400, code: PERSONAL_UNSUPPORTED, transient: false });
+    }
+    throw err;
+  }
+}
+
+// The scope the market answered; a personal request must be answered as personal with no review.
+function answeredScope(label, scope, d) {
+  if (scope !== SCOPE_PERSONAL) return str(d.scope) ?? SCOPE_ORG;
+  if (d.scope !== SCOPE_PERSONAL || d.review != null) throw shape(label, 'does not confirm a personal-only submission');
+  return SCOPE_PERSONAL;
+}
+
 // PUT of the package to the signed storage URL with exactly the headers the market gave.
 export async function putPackage({ fetchImpl = globalThis.fetch, url, headers, body, emulatorOrigin = null, timeoutMs = UPLOAD_TIMEOUT_MS }) {
   const label = 'package upload';
@@ -53,12 +82,15 @@ export async function putPackage({ fetchImpl = globalThis.fetch, url, headers, b
   throw new MarketError(`${label}: HTTP ${res.status}`, { status: res.status, code: res.status === 403 ? 'UPLOAD_URL_EXPIRED' : 'UPLOAD_FAILED' });
 }
 
-// prepare -> PUT -> finalize. Returns the created draft with its review.
+// prepare -> PUT -> finalize. Returns the created version with its review (null for scope personal). scope null sends
+// none (the market's default, org).
 export async function submitSkill({
-  http, orgId, zip, finalize = {}, emulatorOrigin = null, fetchImpl, requestId = crypto.randomUUID(), sleep = realSleep,
+  http, orgId, zip, finalize = {}, scope = null, emulatorOrigin = null, fetchImpl, requestId = crypto.randomUUID(), sleep = realSleep,
 }) {
   const sha256 = crypto.createHash('sha256').update(zip).digest('hex');
-  const prep = (await retrying(() => http.request('POST', orgId, '/skill-uploads', { request_id: requestId, size_bytes: zip.length, sha256 }), sleep)).data;
+  const prepBody = { request_id: requestId, size_bytes: zip.length, sha256 };
+  if (scope != null) prepBody.scope = scope;
+  const prep = (await scoped(scope, () => retrying(() => http.request('POST', orgId, '/skill-uploads', prepBody), sleep))).data;
   if (!isObject(prep) || typeof prep.upload_id !== 'string' || !/^[A-Za-z0-9._~-]{1,128}$/.test(prep.upload_id)
     || typeof prep.upload_url !== 'string' || (prep.upload_headers != null && !isObject(prep.upload_headers))) {
     throw shape('market POST /skill-uploads', 'is not an upload session');
@@ -66,28 +98,31 @@ export async function submitSkill({
   await retrying(() => putPackage({ fetchImpl, url: prep.upload_url, headers: prep.upload_headers, body: zip, emulatorOrigin }), sleep);
   const body = {};
   for (const k of ['name', 'description', 'changelog', 'category_id', 'examples']) if (finalize[k] != null) body[k] = finalize[k];
-  const d = (await retrying(() => http.request('POST', orgId, `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`, body), sleep)).data;
+  if (scope != null) body.scope = scope;
+  const d = (await scoped(scope, () => retrying(() => http.request('POST', orgId, `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`, body), sleep))).data;
   if (!isObject(d) || !isCanonicalUuid(d.skill_id) || !isCanonicalUuid(d.skill_version_id)) {
     throw shape('market POST /skill-uploads:finalize', 'has no skill version');
   }
   return {
     kind: 'skill', skill_id: d.skill_id, skill_version_id: d.skill_version_id, slug: str(d.slug), name: str(d.name),
-    version: str(d.version) ?? str(d.version_label), package_sha256: sha256, review: reviewOf(d.review), submitted_via: str(d.submitted_via),
+    version: str(d.version) ?? str(d.version_label), package_sha256: sha256, scope: answeredScope('market POST /skill-uploads:finalize', scope, d),
+    review: reviewOf(d.review), submitted_via: str(d.submitted_via),
   };
 }
 
-export async function submitTemplate({ http, orgId, manifest, changelog = null, categoryId = null, sleep = realSleep }) {
+export async function submitTemplate({ http, orgId, manifest, changelog = null, categoryId = null, scope = null, sleep = realSleep }) {
   const body = { manifest };
   if (changelog != null) body.changelog = changelog;
   if (categoryId != null) body.category_id = categoryId;
-  const d = (await retrying(() => http.request('POST', orgId, '/templates:publish', body), sleep)).data;
+  if (scope != null) body.scope = scope;
+  const d = (await scoped(scope, () => retrying(() => http.request('POST', orgId, '/templates:publish', body), sleep))).data;
   if (!isObject(d) || !isCanonicalUuid(d.template_id) || !isCanonicalUuid(d.template_version_id)) {
     throw shape('market POST /templates:publish', 'has no template version');
   }
   return {
     kind: 'template', template_id: d.template_id, template_version_id: d.template_version_id, slug: str(manifest.id),
-    name: str(manifest.role?.name), version: str(d.version), manifest_sha256: str(d.manifest_sha256), review: reviewOf(d.review),
-    submitted_via: str(d.submitted_via),
+    name: str(manifest.role?.name), version: str(d.version), manifest_sha256: str(d.manifest_sha256),
+    scope: answeredScope('market POST /templates:publish', scope, d), review: reviewOf(d.review), submitted_via: str(d.submitted_via),
   };
 }
 
@@ -130,6 +165,9 @@ export function explainSubmitError(err) {
   const x = err.extra ?? {};
   const at = x.field ? ` at ${x.field}` : '';
   switch (err.code) {
+    case PERSONAL_UNSUPPORTED:
+      return 'refused: this market is too old for --personal (personal-shelf-only submissions); nothing was submitted. Do not retry. '
+        + 'Tell the owner it can only be submitted to the organization (pending review) for now, or that they can upload it in the workbench and keep it personal';
     case 'AGENT_UPLOAD_DISABLED':
       if (err.reason === 'agent_owner_required') return 'refused: this Agent has no active human owner in the organization';
       if (err.reason === 'existing_skill') return 'refused: a skill with this name already exists in the organization. An Agent can only create new skills: rename it (SKILL.md name) or ask a person to upload a new version in the workbench';

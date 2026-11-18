@@ -8,7 +8,7 @@ import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
 import { readManifest } from './template.js';
-import { explainSubmitError, isRefusal, submitSkill, submitTemplate } from './submit-api.js';
+import { SCOPE_PERSONAL, explainSubmitError, isRefusal, submitSkill, submitTemplate } from './submit-api.js';
 import {
   AttestationError, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, attestationBody,
   confirmProposal, declineProposal, explainProposalError, getProposal, installPermission, proposeInstall, searchSkills,
@@ -78,11 +78,27 @@ function pickOrg(config, org) {
   return org;
 }
 
+// What the Agent tells its owner after a submission.
+export function ownerReply(r) {
+  return r.scope === SCOPE_PERSONAL
+    ? '已放进你的个人货架，仅你自己可用，不需要审核。'
+    : '已提交到组织货架，组织管理员审核通过后组织里的其他人才能用；在这之前它也在你的个人货架上，你自己可以先用。';
+}
+
 function render(r) {
   const what = r.kind === 'skill' ? 'skill' : 'expert template';
-  const lines = [`submitted ${what} ${r.slug ?? ''}${r.version ? ` ${r.version}` : ''}${r.name ? ` (${r.name})` : ''}`.trim()];
-  lines.push(`review: ${r.review?.state ?? 'pending_review'}; an org admin reviews it before anyone can install it`);
+  const label = `${what} ${r.slug ?? ''}${r.version ? ` ${r.version}` : ''}${r.name ? ` (${r.name})` : ''}`.trim();
+  const lines = [];
+  if (r.scope === SCOPE_PERSONAL) {
+    lines.push(`saved ${label} to your owner's personal shelf`);
+    lines.push('only the owner can use it; no review is needed and it was not submitted to the organization');
+  } else {
+    lines.push(`submitted ${label}`);
+    lines.push(`review: ${r.review?.state ?? 'pending_review'}; an org admin reviews it before anyone else in the organization can install it`);
+    lines.push("it is also on the owner's personal shelf, so the owner can use it now");
+  }
   lines.push(r.kind === 'skill' ? `skill_id ${r.skill_id}, skill_version_id ${r.skill_version_id}` : `template_id ${r.template_id}, template_version_id ${r.template_version_id}`);
+  lines.push(`Tell the owner, for example: 「${ownerReply(r)}」`);
   return lines.join('\n');
 }
 
@@ -90,13 +106,14 @@ function renderList(list) {
   if (!list.length) return 'no submissions from this Agent yet';
   const out = [`submissions (${list.length}, newest last; review state as of submission):`];
   for (const s of list) {
-    out.push(`  ${s.submitted_at} ${s.kind} ${s.slug ?? '?'}${s.version ? ` ${s.version}` : ''} ${s.review?.state ?? 'pending_review'} (org ${s.org_id})`);
+    const state = s.scope === SCOPE_PERSONAL ? 'personal shelf only' : (s.review?.state ?? 'pending_review');
+    out.push(`  ${s.submitted_at} ${s.kind} ${s.slug ?? '?'}${s.version ? ` ${s.version}` : ''} ${state} (org ${s.org_id})`);
   }
   out.push('The current review result is shown to the owner in the Agent Market workbench.');
   return out.join('\n');
 }
 
-// opts: {json, dryRun, changelog, categoryId, examples, org}. deps lets tests inject fetch, clock and sleep.
+// opts: {json, dryRun, personal, changelog, categoryId, examples, org}. deps lets tests inject fetch, clock and sleep.
 export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print, fetchImpl = globalThis.fetch, now = () => new Date(), sleep, logger }) {
   if (cmd === 'submissions') {
     const list = readSubmissions(dataDir);
@@ -131,14 +148,15 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
     return EXIT.OK;
   }
   const { http } = connect(config, orgId, { fetchImpl, logger });
+  const scope = opts.personal ? SCOPE_PERSONAL : null;
   let r;
   try {
     r = local.kind === 'skill'
       ? await submitSkill({
-        http, orgId, zip: local.zip, fetchImpl, emulatorOrigin: config.storage_emulator_origin ?? null, sleep,
+        http, orgId, zip: local.zip, fetchImpl, emulatorOrigin: config.storage_emulator_origin ?? null, sleep, scope,
         finalize: { changelog: opts.changelog, category_id: opts.categoryId, examples: local.examples },
       })
-      : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, sleep });
+      : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, scope, sleep });
   } catch (err) {
     const message = explainSubmitError(err);
     const extra = { status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null, retry_after_s: err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : null };
@@ -152,7 +170,7 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
   } catch (err) {
     logger?.warn?.(`submission log not written (${err.code || 'error'})`);
   }
-  print(opts.json ? JSON.stringify({ ok: true, ...entry }, null, 2) : render(entry));
+  print(opts.json ? JSON.stringify({ ok: true, ...entry, owner_reply: ownerReply(entry) }, null, 2) : render(entry));
   return EXIT.OK;
 }
 

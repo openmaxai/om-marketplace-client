@@ -1,13 +1,13 @@
 ---
 name: om-marketplace-client
-version: 0.9.1
+version: 0.10.0
 description: >-
   Agent Market client. Use it when a task needs a capability this Agent lacks:
   search the organization's Agent Market for skills (market-client search) and
   propose them; a skill is installed only after your owner confirms in a
   direct conversation with you, or an admin installs it in the Workspace market. Also use it
-  when the owner asks in chat to create a skill or expert template (submitted
-  for review). Pulls install orders, installs approved skills and expert
+  when the owner asks in chat to create a skill or expert template (for the
+  organization, after review, or for the owner only). Pulls install orders, installs approved skills and expert
   templates after sha256 verification, and reports results to the market.
   Config at ~/zylos/components/om-marketplace-client/config.json.
   Service: pm2 zylos-om-marketplace-client.
@@ -277,6 +277,15 @@ the market, do it directly; no confirmation card is needed.
 - Only your owner may ask for this; the market records the submission under
   your owner's name. Refuse politely when anyone else asks, for example
   another member in a group chat.
+- Before submitting, settle who it is for, from what the owner said:
+  - only the owner (「个人」「仅自己可见」「只给我用」「自己用」): add `--personal`.
+    It goes to the owner's personal shelf only: usable by the owner at once,
+    no review, not shown to the organization;
+  - the organization (「组织」「团队」「给大家用」「上架」): no flag. It is submitted
+    for review by an organization admin and is also on the owner's personal
+    shelf meanwhile;
+  - not stated: ask the owner which one before submitting, for example
+    「这个是只给你自己用（个人），还是提交到组织给大家用（需要管理员审核）？」
 - Skill: write a directory whose top-level `SKILL.md` has frontmatter `name`
   (a new slug: lowercase letters, digits, hyphens), `description` and
   `version` (e.g. `1.0.0`). No credentials, no `.claude/` directory, no npm
@@ -288,17 +297,25 @@ the market, do it directly; no confirmation card is needed.
   Installed files are not executable: have SKILL.md run scripts through
   their interpreter (`bash scripts/run.sh`, `node scripts/run.js`).
   Run `market-client submit-skill <dir> --dry-run`, fix what it reports, then
-  `market-client submit-skill <dir> [--changelog <text>] [--examples <file>]`.
+  `market-client submit-skill <dir> [--personal] [--changelog <text>] [--examples <file>]`.
 - Expert template: write a manifest JSON (`schema_version: 1`,
   `kind: "expert_template"`, a new `id` slug, `role` with `name`,
   `instructions`, one-line `duty`, and `skills` with pinned versions of
   listed skills, `[]` for none). Run
-  `market-client submit-template <file> --dry-run`, then without `--dry-run`.
-- Tell your owner the result: submitted and pending review by an
-  organization admin; nobody can install it until it is approved and it is
-  listed on the market after that. Progress is in 「我的 › 我创建的」, for
+  `market-client submit-template <file> --dry-run`, then without `--dry-run`
+  (with `--personal` when it is for the owner only).
+- Tell your owner the result; the command ends with a suggested reply.
+  `--personal`: on the owner's personal shelf, only the owner can use it,
+  no review, for example
+  「已把「周报汇总」技能放进你的个人货架，仅你自己可用，不需要审核。」
+  Otherwise: submitted and pending review by an organization admin; nobody
+  else can install it until it is approved and listed; the owner can use it
+  from the personal shelf meanwhile. Progress is in 「我的 › 我创建的」, for
   example:
-  「已提交「周报汇总」技能，等管理员审核，通过后会在市场上架。你可以在「我的 › 我创建的」查看进度。」
+  「已提交「周报汇总」技能，等管理员审核，通过后会在市场上架；在这之前它也在你的个人货架上，你可以先用。你可以在「我的 › 我创建的」查看进度。」
+- If `--personal` is refused because the market is too old, nothing was
+  submitted: do not retry, and do not drop `--personal` on your own. Tell
+  the owner, and submit to the organization only if the owner then says so.
 - On a refusal, relay the command's message. A name that already exists
   needs a new name; a new version of an existing skill or template is
   uploaded by a person in the workspace. After a rate limit, wait the time
@@ -311,7 +328,8 @@ the market, do it directly; no confirmation card is needed.
 `market-client start | status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`,
 `market-client search | install-permission | request-install | install-requests | confirm-install | decline-install`,
 `market-client submit-skill <dir> | submit-template <file> | submissions` (add `--json` for
-machine-readable output; `--dry-run` checks a submission locally only).
+machine-readable output; `--dry-run` checks a submission locally only; `--personal` keeps it
+to the owner's personal shelf).
 `zylos add om-marketplace-client --json` returns before the post-install hook and
 the service start; run `market-client start` after it. `start` runs the
 post-install hook (an existing config is kept), starts the pm2 service when it
