@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.9.0
+version: 0.9.1
 description: >-
   Agent Market client. Use it when a task needs a capability this Agent lacks:
   search the organization's Agent Market for skills (market-client search) and

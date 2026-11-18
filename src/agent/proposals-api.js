@@ -15,25 +15,36 @@ export const MAX_CHANNEL_DETAIL = 64;
 export const MAX_MESSAGE_ID = 200;
 export const MAX_MESSAGE_TEXT = 500;
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
-// The Workspace web origin, taken from the proposal's confirm_url (the market builds it from its web origin; the page
-// itself is not linked). https (http only on loopback), no credentials, at most 2048 characters.
-export function workspaceOrigin(v) {
+// https (http only on loopback), no credentials, at most 2048 characters.
+function workspaceUrlOf(v) {
   if (typeof v !== 'string' || v.length > 2048) return null;
   let u;
   try { u = new URL(v); } catch { return null; }
   if (u.username || u.password) return null;
   if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOOPBACK.has(u.hostname))) return null;
-  return u.origin;
+  return u;
 }
 
-// Workspace pages where a person installs manually: the market skill detail (/market/skills/{skill_id}) and the
-// Agent detail (/agents?id={agent_id}). Without an origin the pages are named instead.
-export function manualInstallPages({ origin, agentId, candidates }) {
+// The Workspace web origin of a URL (used for the confirm_url of markets that send no workspace_url).
+export function workspaceOrigin(v) {
+  return workspaceUrlOf(v)?.origin ?? null;
+}
+
+// The Workspace web base the market reports (workspace_url): origin plus path, without trailing /; no query or fragment.
+export function workspaceBase(v) {
+  const u = workspaceUrlOf(v);
+  if (!u || u.search || u.hash || v.includes('?') || v.includes('#')) return null;
+  return u.origin + u.pathname.replace(/\/+$/, '');
+}
+
+// Workspace pages where a person installs manually, under the Workspace web base: the market skill detail
+// (/market/skills/{skill_id}) and the Agent detail (/agents?id={agent_id}). Without a base the pages are named instead.
+export function manualInstallPages({ base, agentId, candidates }) {
   const skills = candidates.map((c) => ({
     name: c.name ?? c.skill_id,
-    url: origin ? `${origin}/market/skills/${encodeURIComponent(c.skill_id)}` : null,
+    url: base ? `${base}/market/skills/${encodeURIComponent(c.skill_id)}` : null,
   }));
-  return { skills, agent_url: origin && agentId ? `${origin}/agents?id=${encodeURIComponent(agentId)}` : null };
+  return { skills, agent_url: base && agentId ? `${base}/agents?id=${encodeURIComponent(agentId)}` : null };
 }
 
 export function manualInstallWhere(pages) {
@@ -121,7 +132,8 @@ export function proposalView(v) {
     confirmed_via: v.confirmed_via === 'card' || v.confirmed_via === 'agent_attested' ? v.confirmed_via : null,
     confirmed_by_member_id: isOrgOrMemberId(v.confirmed_by_member_id) ? v.confirmed_by_member_id : null,
     attestation: attestationView(v.attestation),
-    workspace_origin: workspaceOrigin(v.confirm_url),
+    // A market without workspace_url gives only its origin, through confirm_url.
+    workspace_url: workspaceBase(v.workspace_url) ?? workspaceOrigin(v.confirm_url),
   };
 }
 

@@ -369,7 +369,7 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
         }
       }
       const prompt = ownerPrompt(p);
-      const pages = manualInstallPages({ origin: p.workspace_origin, agentId, candidates: p.candidates });
+      const pages = manualInstallPages({ base: p.workspace_url, agentId, candidates: p.candidates });
       const others = `${NOT_OWNER_SAY}：${manualInstallWhere(pages)}`;
       out({ ok: true, ...p, owner_prompt: prompt, manual_install: pages, not_owner_reply: others },
         `${renderProposal(p)}\nNothing is installed yet. Ask your owner in your direct conversation, with the numbers, for example: 「${prompt}」\n`
@@ -380,7 +380,7 @@ export async function runMarketCommand(cmd, args, opts, { config, dataDir = null
     if (cmd === 'confirm-install' || cmd === 'decline-install') {
       const proposalId = args[0];
       const before = await getProposal({ ...ctx, proposalId });
-      manual = manualInstallPages({ origin: before.workspace_origin, agentId, candidates: before.candidates });
+      manual = manualInstallPages({ base: before.workspace_url, agentId, candidates: before.candidates });
       const picked = cmd === 'confirm-install' ? selectCandidates(before, args.slice(1)) : null;
       const att = {
         ownerMemberId: await ownerMemberId(ctx), channel: opts.channel, channelDetail: opts.channelDetail ?? null,
