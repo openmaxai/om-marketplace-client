@@ -424,7 +424,9 @@ The message is still sent at most once (the claim, and the client message id
    takes `noRun`, the client skips the wait and sends with `noRun: true`.
    While waiting, the client keeps only ids, the `starter_content` and its
    sha256 (canonical JSON, recorded at the claim); never the rendered text or
-   the recipient's name. Right before the send it checks the DM again and renders
+   the recipient's name. When a confirmation to the adopter follows (step 8),
+   the recipient's cleaned display name is kept in the job from the final
+   render until the confirmation is sent, and is deleted with the job. Right before the send it checks the DM again and renders
    the message again through the whole pipeline (filter, size fit, credential
    check including the recipient's name, byte limit). A changed content hash, a
    changed DM or any failing step means no send and `send_failed`, and so does
