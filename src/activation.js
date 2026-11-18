@@ -26,17 +26,19 @@ export const WELCOME_REQUEST_INTERVAL_MS = 2 * 60 * 1000;
 // ... and at most this many per UTC day (loop protection).
 export const DAILY_WELCOME_REQUESTS = 12;
 // How long a delivered request is given to show up as a new session before it is made again.
-export const CONFIRM_WAIT_MS = 15 * 60 * 1000;
+export const CONFIRM_WAIT_MS = 5 * 60 * 1000;
+// A request made while no session followed the last one (a retry) does not wait REQUEST_COOLDOWN_MS; at most this
+// many per UTC day, counted apart from DAILY_REQUESTS.
+export const DAILY_RETRY_REQUESTS = 12;
 export const MAX_REQUESTS = 3;
-// Longest time a starter message waits for the session it asked for.
-export const WELCOME_HOLD_MS = 3 * 60 * 1000;
-// Longest time a starter message waits for its session when no request could be made for it. The hold comes before
-// the claim, so it never shortens the send window after the claim (STARTER_SEND_BY_MS) or the market's grace.
+// Longest time a starter message waits for its template to be in a session. The hold comes before the claim, so it
+// never shortens the send window after the claim (STARTER_SEND_BY_MS) or the market's grace.
 export const WELCOME_MAX_HOLD_MS = 24 * 60 * 60 * 1000;
 export const PENDING_ALERT_MS = 24 * 60 * 60 * 1000;
 export const STUCK_ALERT = 'template_activation_stuck';
 export const PENDING_ALERT = 'template_activation_pending_24h';
-export const NEW_SESSION_TEXT = 'Agent Market templates were updated; please use the new-session skill to start a new session.';
+export const NEW_SESSION_TEXT = 'Agent Market templates were updated and the market client has verified, from the injected template hashes, '
+  + 'that the current session does not have them. Start a new session now with the new-session skill. Do not check whether one is needed.';
 export const CONTROL_TIMEOUT_MS = 15_000;
 // The control queue gives up a request not delivered (or left running) after this; passed as its ack deadline. With
 // --no-ack-suffix the runtime marks a submitted request done itself, so the deadline only ends one that is stuck.
@@ -48,7 +50,7 @@ const HISTORY_KEEP_MS = 2 * 24 * 60 * 60 * 1000;
 // Control queue states in which the request may still be delivered.
 const OUTSTANDING = new Set(['pending', 'running']);
 const EPOCH = new Date(0).toISOString();
-const EMPTY = Object.freeze({ pending: null, passive: null, requests: [], welcome_requests: [], backfilled: false });
+const EMPTY = Object.freeze({ pending: null, passive: null, requests: [], welcome_requests: [], retry_requests: [], backfilled: false });
 
 export const defaultStatusFile = (zylosDir) => path.join(zylosDir, 'activity-monitor', 'agent-status.json');
 export const controlScript = (zylosDir) => path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
@@ -123,22 +125,24 @@ const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
 const validTarget = (x) => x && isCanonicalUuid(x.adoption_id) && isSha256Hex(x.rendered_sha256);
 const isList = Array.isArray;
 
-// State document `activation`: {pending, passive, requests, welcome_requests, backfilled}.
+// State document `activation`: {pending, passive, requests, welcome_requests, retry_requests, backfilled}.
 // pending is the one record of this Agent, {pending_since, written_at, targets: [{adoption_id, rendered_sha256}],
 // removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id]} or
 // null. written_at is the last change merged in; control_id the control queue item of the last request (null once it
 // left the queue or when the enqueue's outcome is unknown); delivered_at when it was first seen delivered; seen_at the
 // last marker that did not confirm the record; welcome the adoptions whose starter message is held until the record is
-// confirmed because no request could be made for it at once (the check then keeps trying on the starter budget).
+// confirmed (the check keeps asking on the starter budget while no request is in flight).
 // passive holds the adoptions written before 0.6.0 ({targets, seen_at}); they are confirmed by the next session that
 // shows them but never cause a request. requests lists the times of automatic new-session requests, welcome_requests
-// those made for starter messages; each has its own budget and neither counts against the other.
+// those made for starter messages, retry_requests automatic ones made while no session followed the last request;
+// each has its own budget and none counts against another.
 // im: the openmax IM (available(), openTurn()); flush(): sends the urgent reconcile queue; control: the control queue.
 export function createActivation({
   state, dataDir, zylosDir, logger, im = null, flush = async () => null, now = Date.now,
   statusFile = defaultStatusFile(zylosDir), control = createControl(zylosDir),
 }) {
   const iso = () => new Date(now()).toISOString();
+  const times = (x) => (isList(x) ? x.filter((t) => Number.isFinite(Date.parse(t))) : []);
   const normalize = (d) => {
     const p = d?.pending;
     const pending = p && typeof p === 'object' && isList(p.targets) && isList(p.removed) && Number.isFinite(Date.parse(p.written_at)) ? p : null;
@@ -146,8 +150,9 @@ export function createActivation({
     return {
       pending,
       passive: q && typeof q === 'object' && isList(q.targets) && q.targets.length ? q : null,
-      requests: isList(d?.requests) ? d.requests.filter((x) => Number.isFinite(Date.parse(x))) : [],
-      welcome_requests: isList(d?.welcome_requests) ? d.welcome_requests.filter((x) => Number.isFinite(Date.parse(x))) : [],
+      requests: times(d?.requests),
+      welcome_requests: times(d?.welcome_requests),
+      retry_requests: times(d?.retry_requests),
       backfilled: d?.backfilled === true,
     };
   };
@@ -254,10 +259,15 @@ export function createActivation({
   }
   const idle = async (minIdle) => (await idleState(minIdle)) === 'idle';
 
-  // The interval since the last request of the list has passed and its daily cap is not reached: the automatic budget
-  // by default, the starter message budget with welcome.
-  function allowed(requests, welcome = false) {
-    const [gap, cap] = welcome ? [WELCOME_REQUEST_INTERVAL_MS, DAILY_WELCOME_REQUESTS] : [REQUEST_COOLDOWN_MS, DAILY_REQUESTS];
+  // The interval since the last request of the list has passed and its daily cap is not reached.
+  const BUDGETS = {
+    requests: [REQUEST_COOLDOWN_MS, DAILY_REQUESTS],
+    welcome_requests: [WELCOME_REQUEST_INTERVAL_MS, DAILY_WELCOME_REQUESTS],
+    retry_requests: [0, DAILY_RETRY_REQUESTS],
+  };
+  function allowed(d, list) {
+    const requests = d[list];
+    const [gap, cap] = BUDGETS[list];
     const t = now();
     const last = Math.max(-Infinity, ...requests.map((x) => Date.parse(x)).filter((x) => x <= t));
     return t - last >= gap && requests.filter((x) => utcDay(Date.parse(x)) === utcDay(t)).length < cap;
@@ -272,6 +282,16 @@ export function createActivation({
     if (marker && Number.isFinite(asked) && marker.at > asked) return false;
     return Number.isSafeInteger(p.control_id) || now() - Math.max(asked, Date.parse(p.delivered_at ?? '') || 0) < CONFIRM_WAIT_MS;
   }
+
+  // True when the record has had a request and no session started after it.
+  function unconfirmed(p, marker = readMarker(dataDir)) {
+    const asked = Date.parse(p?.requested_at);
+    return Number.isFinite(asked) && !(marker && marker.at > asked);
+  }
+
+  // The budget an automatic request of the record is counted in: a retry when no session followed the last request,
+  // so none was used since.
+  const autoList = (p) => (unconfirmed(p) ? 'retry_requests' : 'requests');
 
   // True while a starter message is held until the record is confirmed.
   const welcomeWaits = (p) => isList(p?.welcome) && p.welcome.some((id) => p.targets.some((x) => x.adoption_id === id));
@@ -308,8 +328,8 @@ export function createActivation({
   function mayRequest(d, welcome = false) {
     const p = d.pending;
     if (!p || Number.isSafeInteger(p.control_id) || p.request_count >= MAX_REQUESTS) return false;
-    if (welcome) return allowed(d.welcome_requests, true) && !inFlight(p);
-    if (!allowed(d.requests)) return false;
+    if (welcome) return allowed(d, 'welcome_requests') && !inFlight(p);
+    if (!allowed(d, autoList(p))) return false;
     return !(p.requested_at && now() - Math.max(Date.parse(p.requested_at), Date.parse(p.delivered_at ?? '') || 0) < CONFIRM_WAIT_MS);
   }
 
@@ -317,16 +337,18 @@ export function createActivation({
   // that checks it may be made, so a request that lost to another one is skipped. It is counted before it is enqueued
   // (a crash in between loses it rather than enqueueing it twice). A refused enqueue is taken back unless a newer
   // change reset the count meanwhile; one whose outcome is unknown (timeout) stays counted and is waited for.
-  // welcome: the request is for a starter message and counted in welcome_requests instead of requests.
+  // welcome: the request is for a starter message and counted in welcome_requests; otherwise in requests, or in
+  // retry_requests when no session followed the last request.
   let chain = Promise.resolve();
   function request(why, welcome = false) {
-    const list = welcome ? 'welcome_requests' : 'requests';
+    let list = null;
     const run = async () => {
       if ((await followControl(read().pending)) === 'outstanding') return 'waiting';
       const at = iso();
       let taken = null;
       save((d) => {
         if (!mayRequest(d, welcome)) return;
+        list = welcome ? 'welcome_requests' : autoList(d.pending);
         taken = { requested_at: d.pending.requested_at, delivered_at: d.pending.delivered_at ?? null, count: d.pending.request_count + 1 };
         Object.assign(d.pending, { requested_at: at, request_count: taken.count, control_id: null, delivered_at: null });
         d[list] = [...d[list].filter((x) => now() - Date.parse(x) < HISTORY_KEEP_MS), at];
@@ -480,8 +502,9 @@ export function createActivation({
     const agreed = sampledAt !== null && t - sampledAt <= MAX_SAMPLE_GAP_MS;
     sampledAt = t;
     if (!agreed) return 'sampled';
-    if (!allowed(read().requests)) return 'cooldown';
-    const r = await request('idle');
+    const retry = unconfirmed(read().pending);
+    if (!mayRequest(read())) return 'cooldown';
+    const r = await request(retry ? 'retry, no session followed the last request' : 'idle');
     return r === 'skipped' ? 'waiting' : r;
   }
 
@@ -548,33 +571,38 @@ export function createActivation({
     // True while a write of the adoption waits for a session.
     isPending: (adoptionId) => Boolean(read().pending?.targets.some((x) => x.adoption_id === adoptionId)),
     // For a starter message of a just written adoption; returns the time the message may wait until, or null to send it
-    // as before. A request still in flight is joined (WELCOME_HOLD_MS). Otherwise, when the Agent has been idle
+    // as before. The message is held until the record is confirmed (WELCOME_MAX_HOLD_MS at most), so it never comes
+    // before the template is in a session. A request still in flight is joined. Otherwise, when the Agent has been idle
     // QUICK_IDLE_SECONDS with no open turn, a new session is requested at once on the starter budget, not the automatic
-    // one (WELCOME_HOLD_MS). When the Agent is busy, or that budget does not allow it (WELCOME_REQUEST_INTERVAL_MS since
-    // the last one, or DAILY_WELCOME_REQUESTS reached), the message is held until the record is confirmed
-    // (WELCOME_MAX_HOLD_MS at most), and the check asks for the session once the Agent is idle and a rule allows it.
-    // When the runtime or turn state cannot be read, no session could be asked for, so the message is not held.
+    // one. When the Agent is busy, the budget does not allow it (WELCOME_REQUEST_INTERVAL_MS since the last one, or
+    // DAILY_WELCOME_REQUESTS reached), or a joined request brings no session within CONFIRM_WAIT_MS, the check asks for
+    // the session once the Agent is idle and a rule allows it. When the runtime or turn state cannot be read, or the
+    // enqueue was refused, no session could be asked for, so the message is not held.
     async welcome(adoptionId) {
       const has = (p) => Boolean(p?.targets.some((x) => x.adoption_id === adoptionId));
       const p = read().pending;
       if (!has(p)) return null;
-      if (inFlight(p)) return now() + WELCOME_HOLD_MS;
-      const st = await idleState(QUICK_IDLE_SECONDS);
-      if (st === 'unknown') return null;
-      if (st === 'idle') {
-        const r = await request('starter message', true);
-        // Held also when another request won meanwhile.
-        const q = read().pending;
-        if (!has(q)) return null;
-        if (inFlight(q)) return now() + WELCOME_HOLD_MS;
-        if (r === 'enqueue_failed') return null;
+      let st = 'joined';
+      if (!inFlight(p)) {
+        st = await idleState(QUICK_IDLE_SECONDS);
+        if (st === 'unknown') return null;
+        if (st === 'idle') {
+          const r = await request('starter message', true);
+          // Held also when another request won meanwhile.
+          const q = read().pending;
+          if (!has(q)) return null;
+          st = inFlight(q) ? 'joined' : st;
+          if (r === 'enqueue_failed' && st !== 'joined') return null;
+        }
       }
       save((d) => {
         if (has(d.pending)) d.pending.welcome = [...new Set([...(isList(d.pending.welcome) ? d.pending.welcome : []), adoptionId])];
       });
-      logger.info(st === 'busy'
-        ? `activation: the Agent is busy; the starter message of adoption ${adoptionId} waits until the template is in a session`
-        : `activation: no new session may be requested now for the starter message of adoption ${adoptionId}; it waits until the template is in a session`);
+      logger.info(st === 'joined'
+        ? `activation: a new session is on its way; the starter message of adoption ${adoptionId} waits until the template is in a session`
+        : st === 'busy'
+          ? `activation: the Agent is busy; the starter message of adoption ${adoptionId} waits until the template is in a session`
+          : `activation: no new session may be requested now for the starter message of adoption ${adoptionId}; it waits until the template is in a session`);
       return now() + WELCOME_MAX_HOLD_MS;
     },
     // Runs every ACTIVATION_CHECK_MS: confirms from the marker, or asks for a new session once the Agent is idle.

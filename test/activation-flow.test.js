@@ -12,7 +12,7 @@ import { createIntentPuller } from '../src/intents.js';
 import { createTemplates } from '../src/templates.js';
 import { createReconciler } from '../src/reconcile.js';
 import {
-  ACTIVATION_CHECK_MS, DAILY_WELCOME_REQUESTS, NEW_SESSION_TEXT, WELCOME_HOLD_MS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, createActivation,
+  ACTIVATION_CHECK_MS, DAILY_WELCOME_REQUESTS, NEW_SESSION_TEXT, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, createActivation,
 } from '../src/activation.js';
 import { ensureDeclarations, readSlots } from '../src/shards.js';
 import { MARKER_FILE, emitSlot } from '../src/shard-emitter.js';
@@ -131,13 +131,13 @@ test('a template write is activated: idle Agent asked through the control queue,
   assert.equal(f.reports().length, 1);
 });
 
-test('starter message: an Agent idle 30 s is asked for a new session at once and the message is held 3 minutes', async (t) => {
+test('starter message: an Agent idle 30 s is asked for a new session at once and the message is held until the session', async (t) => {
   const f = await flow(t, { starterMessage: true });
   await f.order('write_template');
   f.status({ idle_seconds: 45 });
   assert.equal(await f.templates.runNext(), 'succeeded');
   assert.equal(f.controls().length, 1);
-  assert.deepEqual(f.starts, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: null, holdUntil: f.clock.t + WELCOME_HOLD_MS }]);
+  assert.deepEqual(f.starts, [{ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, content: null, holdUntil: f.clock.t + WELCOME_MAX_HOLD_MS }]);
   assert.equal(f.activation.isPending(ADOPTION), true);
   f.clock.t += 1000;
   f.session();
@@ -153,7 +153,7 @@ test('starter message: 10 minutes after an automatic request, the Agent is still
   f.status({ idle_seconds: 45 });
   assert.equal(await f.templates.runNext(), 'succeeded');
   assert.equal(f.controls().length, 1);
-  assert.equal(f.starts[0].holdUntil, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(f.starts[0].holdUntil, f.clock.t + WELCOME_MAX_HOLD_MS);
 });
 
 test('starter message: with the starter requests of the day used up, the message is held until the session', async (t) => {

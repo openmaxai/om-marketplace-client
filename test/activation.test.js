@@ -8,7 +8,7 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, DAILY_WELCOME_REQUESTS, IDLE_MIN_SECONDS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
-  CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, WELCOME_HOLD_MS, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
+  DAILY_RETRY_REQUESTS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { createStarter } from '../src/starter.js';
@@ -190,12 +190,20 @@ test('writes and uninstalls merge into one pending record (debounce) and share o
   assert.equal(JSON.stringify(f.pending()), before);
 });
 
-test('cooldown: 30 minutes between requests; daily cap: at most 4 a day', async (t) => {
+test('cooldown: 30 minutes between requests followed by a session; daily cap: at most 4 a day', async (t) => {
   const f = await harness(t);
   const a = f.make();
+  f.fake.script('POST', C10, ...Array.from({ length: DAILY_REQUESTS + 2 }, () => recordAll()));
   f.clock.t = Date.parse('2026-10-16T00:10:00Z');
   const times = [];
   for (let n = 0; n < DAILY_REQUESTS + 2; n++) {
+    if (n > 0) {
+      // The last request brought its session.
+      f.advance(1000);
+      f.marker([{ adoption_id: U(100 + n - 1), rendered_sha256: sha(n - 1) }]);
+      assert.equal(await a.tick(), 'confirmed');
+      f.advance(1000);
+    }
     written(f, a, U(100 + n), sha(n));
     let r;
     for (let i = 0; i < 4000 && r !== 'requested'; i++) {
@@ -246,7 +254,7 @@ test('3 requests without a new session raise template_activation_stuck; a natura
     }
     assert.equal(r, 'requested');
     assert.equal(f.pending().request_count, n);
-    // No session within 15 minutes.
+    // No session within the confirm wait.
     f.status();
     assert.equal(await a.tick(), 'waiting');
     f.advance(CONFIRM_WAIT_MS);
@@ -389,7 +397,7 @@ test('restart: the pending record, its request and the history survive; the next
   assert.equal(await f.make().tick(), 'sampled');
   const a = f.make();
   assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
-  // A new process within the 15 minutes waits instead of asking again.
+  // A new process within the confirm wait waits instead of asking again.
   f.advance(ACTIVATION_CHECK_MS);
   f.status();
   assert.equal(await f.make().tick(), 'waiting');
@@ -447,15 +455,15 @@ test('immediate report: a refused batch is not resent', async (t) => {
   assert.deepEqual(f.state.read('reconcile_urgent', null).items, []);
 });
 
-test('welcome: an Agent idle 30 s with no open turn is asked at once and the message may wait 3 minutes', async (t) => {
+test('welcome: an Agent idle 30 s with no open turn is asked at once and the message is held until the session', async (t) => {
   const f = await harness(t);
   const a = f.make();
   written(f, a);
   f.status({ idle_seconds: 30 });
-  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.controls.length, 1);
   // Asked again (a resent report) while the request is on its way: no second request, same kind of hold.
-  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.controls.length, 1);
   assert.equal(a.isPending(A1), true);
   assert.equal(a.isPending(A2), false);
@@ -513,7 +521,8 @@ test('the control queue: enqueue (new-session text, held until idle, no ack suff
   ]);
   assert.equal(CONTROL_ACK_DEADLINE_S, 6 * 60 * 60);
   assert.equal(calls[0].opts.timeout, CONTROL_TIMEOUT_MS);
-  assert.equal(NEW_SESSION_TEXT, 'Agent Market templates were updated; please use the new-session skill to start a new session.');
+  assert.match(NEW_SESSION_TEXT, /^Agent Market templates were updated .* Start a new session now with the new-session skill\. Do not check whether one is needed\.$/);
+  assert.doesNotMatch(NEW_SESSION_TEXT, /please|\?/);
   assert.ok(!calls[0].args.includes('--bypass-state'));
   assert.equal(await c.get(7), 'pending');
   assert.deepEqual(calls[1].args.slice(1), ['get', '--id', '7']);
@@ -591,7 +600,7 @@ for (const [name, when, controlsAfterCrash] of [
   ['before the request is enqueued', 'before', 0],
   ['after the request is enqueued', 'after', 1],
 ]) {
-  test(`crash ${name}: no second request within 15 minutes, and one more only after the wait and cooldown`, async (t) => {
+  test(`crash ${name}: no second request within the confirm wait, and one more only after it`, async (t) => {
     const f = await harness(t);
     written(f, f.make());
     // 'before': killed right after the request was counted; 'after': killed once the control queue took it.
@@ -612,14 +621,14 @@ for (const [name, when, controlsAfterCrash] of [
     assert.equal(f.controls.length, controlsAfterCrash);
     assert.equal(f.pending().request_count, 1);
     const b = f.make();
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < CONFIRM_WAIT_MS / ACTIVATION_CHECK_MS - 1; i++) {
       f.advance(ACTIVATION_CHECK_MS);
       f.status();
       await b.tick();
     }
     assert.equal(f.controls.length, controlsAfterCrash);
-    // The counted request also holds the cooldown.
-    f.advance(REQUEST_COOLDOWN_MS);
+    // No session followed the counted request: one more after the confirm wait, without the cooldown.
+    f.advance(ACTIVATION_CHECK_MS);
     assert.deepEqual(await f.twoTicks(b), ['sampled', 'requested']);
     assert.equal(f.controls.length, controlsAfterCrash + 1);
     assert.equal(f.pending().request_count, 2);
@@ -665,7 +674,7 @@ test('a request still queued is never stacked: no new request until it left the 
     f.status();
     assert.equal(await a.tick(), 'waiting');
   }
-  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.controls.length, 1);
   // Delivered: given CONFIRM_WAIT_MS from then.
   f.statuses.set(1, 'done');
@@ -676,8 +685,10 @@ test('a request still queued is never stacked: no new request until it left the 
   f.status();
   assert.equal(await a.tick(), 'waiting');
   f.advance(2 * ACTIVATION_CHECK_MS);
-  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  // The held starter message asks at once on its own budget.
+  assert.deepEqual(await f.twoTicks(a), ['requested', 'waiting']);
   assert.equal(f.controls.length, 2);
+  assert.equal(f.state.read('activation', null).welcome_requests.length, 1);
 });
 
 test('a control state that cannot be read counts as still queued', async (t) => {
@@ -715,7 +726,7 @@ test('a timed-out enqueue stays counted and is not repeated before the confirm w
   assert.equal(p.request_count, 1);
   assert.equal(p.control_id, null);
   assert.equal(f.state.read('activation', null).requests.length, 1);
-  for (let i = 0; i < 25; i++) {
+  for (let i = 0; i < CONFIRM_WAIT_MS / ACTIVATION_CHECK_MS - 1; i++) {
     f.advance(ACTIVATION_CHECK_MS);
     f.status();
     assert.notEqual(await a.tick(), 'requested');
@@ -745,7 +756,7 @@ test('welcome and tick at the same time give exactly one control', async (t) => 
   assert.equal(f.controls.length, 1);
   // Whichever came first made the request; the other one saw it.
   assert.ok(['requested', 'waiting', 'sampled'].includes(r), r);
-  assert.equal(hold, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(hold, f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.pending().request_count, 1);
   // Counted once, in the list of whichever made it.
   const doc = f.state.read('activation', null);
@@ -845,8 +856,8 @@ test('requests are one at a time: two starter messages and an idle check at once
   release();
   const [h1, h2] = await all;
   assert.equal(f.controls.length, 1);
-  assert.equal(h1, f.clock.t + WELCOME_HOLD_MS);
-  assert.equal(h2, f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(h1, f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(h2, f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.pending().request_count, 1);
 });
 
@@ -977,7 +988,7 @@ test('welcome: 10 minutes after a request, a new adoption is asked for at once, 
   f.advance(10 * 60 * 1000);
   written(f, a, A2, S2);
   f.status({ idle_seconds: 30 });
-  assert.equal(await a.welcome(A2), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await a.welcome(A2), f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.controls.length, 2);
   const doc = f.state.read('activation', null);
   assert.equal(doc.requests.length, 1);
@@ -989,11 +1000,11 @@ test('welcome: two adoptions within 2 minutes share one new-session request; bot
   const a = f.make();
   const s = starterOf(f, a);
   f.status({ idle_seconds: 30 });
-  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await s.adopted(A1, S1), f.clock.t + WELCOME_MAX_HOLD_MS);
   f.advance(60 * 1000);
   f.status({ idle_seconds: 30 });
   // The first request has not brought its session yet: the second adoption rides on it.
-  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_MAX_HOLD_MS);
   assert.equal(f.controls.length, 1);
   await s.starter.runAll();
   assert.deepEqual(s.sent, []);
@@ -1036,7 +1047,7 @@ test('welcome: inside the 2-minute interval with no request to join, the message
   assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
 });
 
-test('welcome: with the daily starter cap reached the message is held past 3 minutes and sent once after the session', async (t) => {
+test('welcome: with the daily starter cap reached the message is held and sent once after the session', async (t) => {
   const f = await harness(t);
   f.advance(12 * 60 * 60 * 1000);
   const today = Array.from({ length: DAILY_WELCOME_REQUESTS }, (_, i) => new Date(f.clock.t - (i + 1) * 10 * 60 * 1000).toISOString());
@@ -1079,7 +1090,7 @@ test('welcome: starter requests leave the automatic budget alone, and the automa
   for (const [i, id] of ids.entries()) {
     written(f, a, id, sha(`b${i}`));
     f.status({ idle_seconds: 30 });
-    assert.equal(await a.welcome(id), f.clock.t + WELCOME_HOLD_MS);
+    assert.equal(await a.welcome(id), f.clock.t + WELCOME_MAX_HOLD_MS);
     await session(f, a, [[id, sha(`b${i}`)]]);
     f.advance(5 * 60 * 1000);
   }
@@ -1096,7 +1107,7 @@ test('welcome: starter requests leave the automatic budget alone, and the automa
   f.advance(5 * 60 * 1000);
   written(f, a, U(47), sha('w'));
   f.status({ idle_seconds: 30 });
-  assert.equal(await a.welcome(U(47)), f.clock.t + WELCOME_HOLD_MS);
+  assert.equal(await a.welcome(U(47)), f.clock.t + WELCOME_MAX_HOLD_MS);
   doc = f.state.read('activation', null);
   assert.deepEqual([doc.requests.length, doc.welcome_requests.length], [DAILY_REQUESTS, ids.length + 1]);
   await session(f, a, [[U(47), sha('w')]]);
@@ -1191,4 +1202,119 @@ test('welcome: busy at adoption and a restart during the hold; the message is se
   assert.deepEqual([...s.sent, ...s2.sent, ...s3.sent], [`mkt-starter-${A1}`]);
   assert.equal(f.fake.requests.filter((x) => x.path === starterPath(A1, 'claim-starter')).length, 1);
   assert.equal(f.controls.length, 1);
+});
+
+// Ticks every check interval with the Agent idle until a request is made or maxMs passed; the time it took.
+async function untilRequested(f, a, maxMs, over = {}) {
+  const from = f.clock.t;
+  while (f.clock.t - from <= maxMs) {
+    f.status(over);
+    if ((await a.tick()) === 'requested') return f.clock.t - from;
+    f.advance(ACTIVATION_CHECK_MS);
+  }
+  return null;
+}
+
+test('retry: a delivered request with no session after it is made again after the confirm wait, not the 30-minute cooldown', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  // The Agent took the request but started no session (no newer marker).
+  const took = await untilRequested(f, a, REQUEST_COOLDOWN_MS);
+  assert.ok(took >= CONFIRM_WAIT_MS && took <= CONFIRM_WAIT_MS + 2 * ACTIVATION_CHECK_MS, `took ${took}`);
+  const doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.retry_requests.length, doc.pending.request_count], [1, 1, 2]);
+  await session(f, a, [[A1, S1]]);
+  assert.equal(f.pending(), null);
+});
+
+test('retry: an unconfirmed request is never treated as done; a session older than the request does not confirm a later change', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  f.marker([{ adoption_id: A1, rendered_sha256: S2 }]);
+  f.advance(1000);
+  written(f, a, A1, S1);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  for (let i = 0; i < CONFIRM_WAIT_MS / ACTIVATION_CHECK_MS - 1; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status();
+    assert.equal(await a.tick(), 'waiting');
+  }
+  assert.equal(a.isPending(A1), true);
+  assert.deepEqual(f.reports(), []);
+});
+
+test('retry: retries have their own daily cap', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  f.advance(60 * 60 * 1000);
+  const today = Array.from({ length: DAILY_RETRY_REQUESTS }, (_, i) => new Date(f.clock.t - (i + 1) * 60 * 1000).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, retry_requests: today }));
+  written(f, a);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status();
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONFIRM_WAIT_MS);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'cooldown']);
+  assert.equal(f.controls.length, 1);
+  // The next UTC day allows it again.
+  f.clock.t = Date.parse('2026-10-17T00:00:00Z');
+  assert.equal(await untilRequested(f, a, 2 * ACTIVATION_CHECK_MS) !== null, true);
+  assert.equal(f.controls.length, 2);
+});
+
+test('remove then hire: the change written after an unconfirmed request is asked for again within minutes', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  f.adopt(A1, S1);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.advance(1000);
+  f.adopt(A1, S1, 'removed');
+  a.recordRemove({ adoptionId: A1, at: new Date(f.clock.t).toISOString() });
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  // Delivered at the next check; hired two minutes later, and no session follows the removal's request.
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status();
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(2 * 60 * 1000);
+  written(f, a, A2, S2);
+  const took = await untilRequested(f, a, REQUEST_COOLDOWN_MS);
+  assert.ok(took !== null && took <= CONFIRM_WAIT_MS - 2 * 60 * 1000 + 2 * ACTIVATION_CHECK_MS, `took ${took}`);
+  assert.equal(f.controls.length, 2);
+  await session(f, a, [[A2, S2]]);
+  assert.deepEqual(f.reports(), [[{ kind: 'template_activated', adoption_id: A2, rendered_sha256: S2 }]]);
+});
+
+test('remove then hire with a starter message: the message is held until the session, never released early', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  const s = starterOf(f, a);
+  f.adopt(A1, S1);
+  f.marker([{ adoption_id: A1, rendered_sha256: S1 }]);
+  f.advance(1000);
+  f.adopt(A1, S1, 'removed');
+  a.recordRemove({ adoptionId: A1, at: new Date(f.clock.t).toISOString() });
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  f.advance(60 * 1000);
+  // The removal's request is still in flight: joined, held until the session.
+  assert.equal(await s.adopted(A2, S2), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(f.controls.length, 1);
+  assert.deepEqual(f.pending().welcome, [A2]);
+  // No session for a while: nothing claimed or sent, and the session is asked for again on the starter budget.
+  for (let i = 0; i < 40; i++) {
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ idle_seconds: 30 });
+    await a.tick();
+    await s.starter.runWaiting();
+  }
+  assert.equal(s.claims(), 0);
+  assert.deepEqual(s.sent, []);
+  assert.ok(f.controls.length >= 2);
+  assert.ok(f.controls[1] - f.controls[0] <= CONFIRM_WAIT_MS + 2 * 60 * 1000, JSON.stringify(f.controls));
+  assert.ok(f.state.read('activation', null).welcome_requests.length >= 1);
+  await session(f, a, [[A2, S2]]);
+  await s.starter.runWaiting();
+  assert.deepEqual(s.sent, [`mkt-starter-${A2}`]);
 });
