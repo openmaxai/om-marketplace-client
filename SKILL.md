@@ -315,7 +315,14 @@ the market, do it directly; no confirmation card is needed.
   「已提交「周报汇总」技能，等管理员审核，通过后会在市场上架；在这之前它也在你的个人货架上，你可以先用。你可以在「我的 › 我创建的」查看进度。」
 - If `--personal` is refused because the market is too old, nothing was
   submitted: do not retry, and do not drop `--personal` on your own. Tell
-  the owner, and submit to the organization only if the owner then says so.
+  the owner (the command gives a reply), and submit to the organization only
+  if the owner then says so. If the market answers without confirming
+  personal-only, something may already be submitted: do not retry; the
+  owner checks 「我的 › 我创建的」.
+- In `--json` output, `scope` is `personal` or `org`; for templates
+  `template_id` / `template_version_id` name the personal copy with
+  `--personal` and the organization's copy otherwise
+  (`personal_template_*` is always the personal one).
 - On a refusal, relay the command's message. A name that already exists
   needs a new name; a new version of an existing skill or template is
   uploaded by a person in the workspace. After a rate limit, wait the time

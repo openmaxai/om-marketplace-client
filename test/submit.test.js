@@ -220,7 +220,7 @@ test('--personal on a market without it: refused as too old, not retried, nothin
   const s = await setup(t);
   s.fake.script('POST', `${B}/skill-uploads`, VALIDATION_BODY);
   assert.equal(await s.run('submit-skill', s.skill, { personal: true }), 3);
-  assert.match(s.out.join('\n'), /market is too old for --personal[\s\S]*nothing was submitted[\s\S]*Do not retry/);
+  assert.match(s.out.join('\n'), /market is too old for --personal[\s\S]*nothing was submitted[\s\S]*Do not retry[\s\S]*「市场版本还不支持只放个人货架，这次没有提交。/);
   assert.equal(s.fake.market().length, 1);
   assert.equal(s.fake.requests.filter((r) => r.method === 'PUT').length, 0);
   s.out.length = 0;
@@ -229,12 +229,50 @@ test('--personal on a market without it: refused as too old, not retried, nothin
   const j = JSON.parse(s.out.join('\n'));
   assert.equal(j.error, 'PERSONAL_UNSUPPORTED');
   assert.match(j.message, /too old for --personal/);
+  assert.match(j.owner_reply, /^市场版本还不支持只放个人货架，这次没有提交。/);
   assert.deepEqual(readSubmissions(s.dataDir), []);
   // Without --personal the same answer is an ordinary validation refusal.
   s.out.length = 0;
   s.fake.script('POST', `${B}/templates:publish`, VALIDATION_BODY);
   assert.equal(await s.run('submit-template', s.manifest), 3);
   assert.match(s.out.join('\n'), /validation failed \(body:/);
+});
+
+test('--personal: only a whole-body unknown-field 400 on prepare or publish means an old market', async (t) => {
+  const s = await setup(t);
+  const v400 = (errors) => ({ status: 400, problem: { status: 400, code: 'VALIDATION_FAILED', errors } });
+  s.fake.script('POST', `${B}/templates:publish`,
+    v400([{ field: 'scope', message: 'invalid' }]),
+    v400([{ field: 'changelog', message: 'invalid' }]),
+    v400([{ field: 'body', message: 'request body unreadable or too large' }]));
+  for (let i = 0; i < 3; i++) {
+    s.out.length = 0;
+    assert.equal(await s.run('submit-template', s.manifest, { personal: true, json: true }), 3);
+    const j = JSON.parse(s.out.join('\n'));
+    assert.equal(j.error, 'VALIDATION_FAILED', `case ${i}`);
+    assert.doesNotMatch(j.message, /too old/);
+    assert.equal(j.owner_reply, undefined);
+  }
+  // At finalize the market already took scope at prepare: even the unknown-field shape is an ordinary refusal.
+  s.out.length = 0;
+  s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
+  s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
+  s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, VALIDATION_BODY);
+  assert.equal(await s.run('submit-skill', s.skill, { personal: true, json: true }), 3);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.error, 'VALIDATION_FAILED');
+  assert.match(j.message, /validation failed \(body:/);
+  assert.deepEqual(readSubmissions(s.dataDir), []);
+});
+
+test('submit-template --personal records the personal copy ids', async (t) => {
+  const s = await setup(t);
+  s.fake.script('POST', `${B}/templates:publish`,
+    { status: 201, json: { template_id: U(4), template_version_id: U(5), market: U(6), version: '0.1.0', review: null, scope: 'personal', personal_template_id: U(4), personal_template_version_id: U(5) } });
+  assert.equal(await s.run('submit-template', s.manifest, { personal: true }), 0);
+  const [rec] = readSubmissions(s.dataDir);
+  assert.equal(rec.personal_template_id, U(4));
+  assert.equal(rec.personal_template_version_id, U(5));
 });
 
 test('--personal answered without scope personal or with a review is not reported as personal', async (t) => {
@@ -245,8 +283,9 @@ test('--personal answered without scope personal or with a review is not reporte
   for (let i = 0; i < 2; i++) {
     s.out.length = 0;
     assert.equal(await s.run('submit-template', s.manifest, { personal: true }), 1);
-    assert.match(s.out.join('\n'), /does not confirm a personal-only submission/);
-    assert.doesNotMatch(s.out.join('\n'), /个人货架/);
+    const text = s.out.join('\n');
+    assert.match(text, /did not confirm a personal-only submission: something may already have been submitted, possibly to the organization[\s\S]*Do not retry[\s\S]*我的 › 我创建的/);
+    assert.doesNotMatch(text, /仅你自己可用/);
   }
   assert.deepEqual(readSubmissions(s.dataDir), []);
 });

@@ -8,7 +8,9 @@ import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
 import { readManifest } from './template.js';
-import { SCOPE_PERSONAL, explainSubmitError, isRefusal, submitSkill, submitTemplate } from './submit-api.js';
+import {
+  PERSONAL_NOT_CONFIRMED, PERSONAL_UNSUPPORTED, SCOPE_PERSONAL, explainSubmitError, isRefusal, submitSkill, submitTemplate,
+} from './submit-api.js';
 import {
   AttestationError, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, attestationBody,
   confirmProposal, declineProposal, explainProposalError, getProposal, installPermission, proposeInstall, searchSkills,
@@ -77,6 +79,12 @@ function pickOrg(config, org) {
   if (!Object.hasOwn(config.orgs, org)) throw new SubmitError('org_unknown', `org ${org} is not configured for this Agent`);
   return org;
 }
+
+// What the Agent tells its owner after a failed --personal submission.
+const FAILURE_REPLY = {
+  [PERSONAL_UNSUPPORTED]: '市场版本还不支持只放个人货架，这次没有提交。要提交到组织（需要管理员审核）吗？',
+  [PERSONAL_NOT_CONFIRMED]: '市场没有确认只放进了你的个人货架，可能已经提交了（也可能进了组织审核）。请在「我的 › 我创建的」看一下，我先不重试。',
+};
 
 // What the Agent tells its owner after a submission.
 export function ownerReply(r) {
@@ -158,8 +166,10 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
       })
       : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, scope, sleep });
   } catch (err) {
-    const message = explainSubmitError(err);
+    const say = FAILURE_REPLY[err.code];
+    const message = `${explainSubmitError(err)}${say && !opts.json ? `. Tell the owner, for example: 「${say}」` : ''}`;
     const extra = { status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null, retry_after_s: err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : null };
+    if (say) extra.owner_reply = say;
     if (isRefusal(err)) return fail(err.code ?? 'refused', message, extra);
     print(opts.json ? JSON.stringify({ ok: false, error: err.code ?? 'failed', message, ...extra }, null, 2) : `${cmd} failed: ${message}`);
     return EXIT.FAILED;

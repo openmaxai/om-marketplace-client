@@ -37,13 +37,19 @@ function reviewOf(v) {
 export const SCOPE_PERSONAL = 'personal';
 export const SCOPE_ORG = 'org';
 export const PERSONAL_UNSUPPORTED = 'PERSONAL_UNSUPPORTED';
+export const PERSONAL_NOT_CONFIRMED = 'PERSONAL_NOT_CONFIRMED';
+// The message a market without scope gives for a body with an unknown field.
+const UNKNOWN_FIELD = 'only the documented fields';
 
-// A market without scope refuses the unknown body field as a whole body (400 VALIDATION_FAILED, field "body").
+// A market without scope refuses the unknown field as a whole body: 400 VALIDATION_FAILED, errors [{field: "body",
+// message: "... only the documented fields"}]. Any other 400 is an ordinary refusal.
 function personalUnsupported(err) {
   return err instanceof MarketError && err.status === 400 && err.code === 'VALIDATION_FAILED'
-    && Array.isArray(err.errors) && err.errors.some((e) => e?.field === 'body');
+    && Array.isArray(err.errors) && err.errors.some((e) => e?.field === 'body' && typeof e.message === 'string' && e.message.includes(UNKNOWN_FIELD));
 }
 
+// Only the first call that carries scope (skill prepare, template publish) can tell an old market; finalize runs after
+// the market accepted scope at prepare, so its errors are ordinary ones.
 async function scoped(scope, fn) {
   try {
     return await fn();
@@ -55,10 +61,13 @@ async function scoped(scope, fn) {
   }
 }
 
-// The scope the market answered; a personal request must be answered as personal with no review.
+// The scope the market answered; a personal request must be answered as personal with no review. Otherwise something
+// may have been written (possibly submitted to the org), so it is not retried.
 function answeredScope(label, scope, d) {
   if (scope !== SCOPE_PERSONAL) return str(d.scope) ?? SCOPE_ORG;
-  if (d.scope !== SCOPE_PERSONAL || d.review != null) throw shape(label, 'does not confirm a personal-only submission');
+  if (d.scope !== SCOPE_PERSONAL || d.review != null) {
+    throw new MarketError(`${label}: response does not confirm a personal-only submission`, { status: 200, code: PERSONAL_NOT_CONFIRMED, transient: false });
+  }
   return SCOPE_PERSONAL;
 }
 
@@ -99,7 +108,7 @@ export async function submitSkill({
   const body = {};
   for (const k of ['name', 'description', 'changelog', 'category_id', 'examples']) if (finalize[k] != null) body[k] = finalize[k];
   if (scope != null) body.scope = scope;
-  const d = (await scoped(scope, () => retrying(() => http.request('POST', orgId, `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`, body), sleep))).data;
+  const d = (await retrying(() => http.request('POST', orgId, `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`, body), sleep)).data;
   if (!isObject(d) || !isCanonicalUuid(d.skill_id) || !isCanonicalUuid(d.skill_version_id)) {
     throw shape('market POST /skill-uploads:finalize', 'has no skill version');
   }
@@ -123,6 +132,8 @@ export async function submitTemplate({ http, orgId, manifest, changelog = null, 
     kind: 'template', template_id: d.template_id, template_version_id: d.template_version_id, slug: str(manifest.id),
     name: str(manifest.role?.name), version: str(d.version), manifest_sha256: str(d.manifest_sha256),
     scope: answeredScope('market POST /templates:publish', scope, d), review: reviewOf(d.review), submitted_via: str(d.submitted_via),
+    personal_template_id: isCanonicalUuid(d.personal_template_id) ? d.personal_template_id : null,
+    personal_template_version_id: isCanonicalUuid(d.personal_template_version_id) ? d.personal_template_version_id : null,
   };
 }
 
@@ -168,6 +179,9 @@ export function explainSubmitError(err) {
     case PERSONAL_UNSUPPORTED:
       return 'refused: this market is too old for --personal (personal-shelf-only submissions); nothing was submitted. Do not retry. '
         + 'Tell the owner it can only be submitted to the organization (pending review) for now, or that they can upload it in the workbench and keep it personal';
+    case PERSONAL_NOT_CONFIRMED:
+      return 'the market did not confirm a personal-only submission: something may already have been submitted, possibly to the organization for review. '
+        + 'Do not retry; ask the owner to check 「我的 › 我创建的」';
     case 'AGENT_UPLOAD_DISABLED':
       if (err.reason === 'agent_owner_required') return 'refused: this Agent has no active human owner in the organization';
       if (err.reason === 'existing_skill') return 'refused: a skill with this name already exists in the organization. An Agent can only create new skills: rename it (SKILL.md name) or ask a person to upload a new version in the workbench';
