@@ -200,6 +200,14 @@ export function renderStarter(clean) {
   return lines.join(LINE_SEPARATOR);
 }
 
+// The adopter's confirmation when the starter message went to the Agent's owner; owner and expert are cleaned names
+// ("" when unknown).
+export function renderHired({ owner, expert }) {
+  const zh = owner ? `已为 ${owner} 的 Agent 聘用「${expert}」` : `已为负责人的 Agent 聘用「${expert}」`;
+  const en = owner ? `Hired “${expert}” for ${owner}'s Agent` : `Hired “${expert}” for the owner's Agent`;
+  return `${zh}\n${en}`;
+}
+
 export const hasContent = (clean) => Boolean(clean.templateName && (clean.firstGuide || clean.starterTasks.length));
 
 // Stands in for the adopter's name before it is known: the longest a cleaned name can be in UTF-8 bytes.

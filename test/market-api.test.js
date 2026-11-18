@@ -33,7 +33,7 @@ test('install-intents:query sends the pending query and returns only validated k
   fake.script('POST', INTENTS, { status: 200, json: page([{ ...intent(), extra: 'x' }, tpl], { has_more: true }) }, { status: 204 });
   const got = await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 4, limit: 50 });
   assert.deepEqual(fake.market()[0].json, { status: 'pending', after_seq: 4, limit: 50 });
-  assert.deepEqual(got, page([intent(), { ...tpl, starter_message: false, adopted_by_member_id: null, starter_content: null }], { has_more: true }));
+  assert.deepEqual(got, page([intent(), { ...tpl, starter_message: false, adopted_by_member_id: null, starter_recipient_member_id: null, starter_content: null }], { has_more: true }));
   assert.equal(await api.pullInstallIntents({ orgId: ORG, agentId: AGENT, afterSeq: 9 }), null);
   assert.deepEqual(fake.market()[1].json, { status: 'pending', after_seq: 9, limit: 100 });
 });
@@ -54,6 +54,7 @@ test('install-intents:query rejects malformed responses as RESPONSE_INVALID', as
     page([intent({ discard_local_changes: 'no' })]),
     page([intent({ op: 'write_template', skill_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA, starter_message: 'yes' })]),
     page([intent({ op: 'write_template', skill_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA, adopted_by_member_id: '../x' })]),
+    page([intent({ op: 'write_template', skill_id: null, template_id: U(8), adoption_id: U(9), bundle_sha256: SHA, starter_recipient_member_id: '../x' })]),
     page(Array.from({ length: 3 }, (_, i) => intent({ seq: 5 + i })), {}),
     { items: [], has_more: false, next_after_seq: 4 },
     [],

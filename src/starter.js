@@ -3,7 +3,7 @@ import { MarketError } from './http.js';
 import { isCanonicalUuid, isOrgOrMemberId, uuidv7 } from './ids.js';
 import { ImError } from './starter/im.js';
 import {
-  LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, fitFallback, hasContent, renderStarter,
+  LIMITS, asksForCredential, cleanContent, cleanDisplayName, cleanText, fitContent, fitFallback, hasContent, renderHired, renderStarter,
 } from './starter/render.js';
 import { withinLimits } from './starter/limits.js';
 
@@ -43,9 +43,12 @@ export function imReason(err) {
 }
 
 // The starter message of an adoption, sent at most once from the Agent's own IM account: claim it with the market,
-// filter and render the content locally, check that the DM is exactly this Agent and the adopter, send it once, then
-// mark the result. Jobs live in state document `starters`, keyed by adoption id, with stage
-// claim -> checking -> waiting -> sending -> mark. After a restart a checking job is marked send_failed (nothing was
+// filter and render the content locally, check that the DM is exactly this Agent and the recipient (the Agent's owner
+// as the market names it, else the adopter), send it once, then mark the result. When the recipient is not the adopter
+// and the message was sent, the adopter gets one short plain-text confirmation in their own DM with this Agent
+// (stage confirm, client message id mkt-hired-<adoption id>); it is never sent twice, and a send whose outcome is
+// unknown is not tried again. Jobs live in state document `starters`, keyed by adoption id, with stage
+// claim -> checking -> waiting -> sending -> mark (-> confirm -> confirming). After a restart a checking job is marked send_failed (nothing was
 // sent) and a waiting job keeps waiting. A send whose outcome is unknown (a timeout, or a restart during the send) is
 // never sent again: the job moves to stage verifying, where the message is looked up by its client message id and the
 // job marked sent when found, send_failed when it is surely absent, or dropped unmarked when the lookup cannot tell.
@@ -87,7 +90,43 @@ export function createStarter({
     } catch (err) {
       if (keep(err, job, `mark ${job.result}`)) return;
     }
+    if (job.result === 'sent' && confirms(job)) {
+      put(job.adoption_id, { stage: 'confirm', confirm_from: now() });
+      return confirm(jobs()[job.adoption_id]);
+    }
     drop(job.adoption_id);
+  }
+
+  // The adopter's confirmation that the expert was hired for the owner's Agent. Waits like the starter message while a
+  // send into the adopter's DM would be a run's reply, at most STARTER_WAIT_MS; any failure ends it unsent.
+  async function confirm(job) {
+    const id = job.adoption_id;
+    try {
+      const self = await orgs.agentId(job.org_id);
+      const dm = await verifiedDm(job, self, job.adopted_by_member_id);
+      if (!dm) {
+        logger.warn(`${tag(job)}: confirmation not sent: the DM is not exactly this Agent and the adopter`);
+        return drop(id);
+      }
+      const noRun = im.supportsNoRun();
+      if (!noRun && await im.runInProgress({ conversationId: dm.conversationId })) {
+        if (now() - (job.confirm_from ?? 0) < STARTER_WAIT_MS) return undefined;
+        logger.warn(`${tag(job)}: confirmation not sent: the adopter's DM still had an active run`);
+        return drop(id);
+      }
+      let raw = null;
+      try { raw = await content(job); } catch { /* the name is left out */ }
+      const text = renderHired({
+        owner: job.recipient_name ?? '', expert: cleanText(raw?.templateName, { max: LIMITS.name, multiline: false }),
+      });
+      put(id, { stage: 'confirming' });
+      await im.sendText({ orgId: job.org_id, conversationId: dm.conversationId, text, clientMsgId: `mkt-hired-${id}`, noRun });
+      logger.info(`${tag(job)}: confirmation sent to the adopter`);
+    } catch (err) {
+      if (!(err instanceof ImError)) logger.error(`${tag(job)}: confirmation failed: ${err.message}`);
+      else logger.warn(`${tag(job)}: confirmation not sent (${imReason(err)}); not retried`);
+    }
+    return drop(id);
   }
 
   const finish = (job, result, reason = null) => {
@@ -96,15 +135,19 @@ export function createStarter({
     return mark({ ...job, result, reason });
   };
 
-  // True when the DM is exactly this Agent and the adopter; the adopter's member entry is returned for the greeting.
-  async function verifiedDm(job, self) {
-    const conversationId = await im.createDm({ orgId: job.org_id, peerMemberId: job.adopted_by_member_id });
+  const recipientOf = (job) => job.recipient_member_id ?? job.adopted_by_member_id;
+  const confirms = (job) => recipientOf(job) !== job.adopted_by_member_id;
+
+  // True when the DM is exactly this Agent and peer (the recipient by default); the peer's member entry is returned
+  // for the greeting.
+  async function verifiedDm(job, self, peer = recipientOf(job)) {
+    const conversationId = await im.createDm({ orgId: job.org_id, peerMemberId: peer });
     const conv = await im.getConversation({ orgId: job.org_id, conversationId });
     const members = await im.memberList({ orgId: job.org_id, conversationId });
     const ids = members.map((m) => m?.member_id);
     const ok = conv?.id === conversationId && String(conv?.type ?? '').toLowerCase() === 'dm'
-      && ids.length === 2 && new Set(ids).size === 2 && ids.includes(self) && ids.includes(job.adopted_by_member_id);
-    return ok ? { conversationId, adopter: members.find((m) => m.member_id === job.adopted_by_member_id) } : null;
+      && ids.length === 2 && new Set(ids).size === 2 && ids.includes(self) && ids.includes(peer);
+    return ok ? { conversationId, peer: members.find((m) => m.member_id === peer) } : null;
   }
 
   // The message text from raw content through the whole pipeline, or null with the reason it may not be sent (why
@@ -171,14 +214,14 @@ export function createStarter({
       return finish(job, 'send_failed', `dm_check_${imReason(err)}`);
     }
     if (!dm) {
-      logger.warn(`${tag(job)} not sent: the DM is not exactly this Agent and the adopter`);
+      logger.warn(`${tag(job)} not sent: the DM is not exactly this Agent and the recipient`);
       return finish(job, 'send_failed', 'dm_not_one_to_one');
     }
     put(id, { stage: 'waiting', conversation_id: dm.conversationId });
     return sendWhenFree(jobs()[id]);
   }
 
-  // The text to send now, rendered again from the content checked at the claim and the adopter's current name; null
+  // The text to send now, rendered again from the content checked at the claim and the recipient's current name; null
   // when the content changed since the claim, the DM is no longer the same 1:1 DM, or any pipeline step fails.
   async function renderAgain(job) {
     let raw;
@@ -194,9 +237,11 @@ export function createStarter({
     } catch (err) {
       return { why: `DM check failed (${err.message})`, reason: `dm_check_${imReason(err)}` };
     }
-    if (!dm) return { why: 'the DM is not exactly this Agent and the adopter', reason: 'dm_not_one_to_one' };
+    if (!dm) return { why: 'the DM is not exactly this Agent and the recipient', reason: 'dm_not_one_to_one' };
     if (dm.conversationId !== job.conversation_id) return { why: 'the DM changed after the claim', reason: 'dm_changed' };
-    return prepare(raw, cleanText(cleanDisplayName(dm.adopter?.display_name), { max: LIMITS.addressee, multiline: false }));
+    const name = cleanText(cleanDisplayName(dm.peer?.display_name), { max: LIMITS.addressee, multiline: false });
+    if (confirms(job)) put(job.adoption_id, { recipient_name: name });
+    return prepare(raw, name);
   }
 
   // Sends once nothing in the DM would take the message as a run's reply; gives up after STARTER_WAIT_MS.
@@ -306,6 +351,7 @@ export function createStarter({
 
   async function step(job) {
     if (job.stage === 'mark') return mark(job);
+    if (job.stage === 'confirm') return confirm(job);
     if (job.stage === 'verifying') return verify(job);
     if (job.stage === 'waiting') return sendWhenFree(job);
     return claimAndSend(job);
@@ -332,8 +378,14 @@ export function createStarter({
 
   async function runJobs(onlyWaiting) {
     for (const job of Object.values(jobs())) {
-      if (onlyWaiting && job.stage !== 'waiting' && job.stage !== 'verifying' && !(job.stage === 'claim' && job.hold_until)) continue;
+      if (onlyWaiting && job.stage !== 'waiting' && job.stage !== 'verifying' && job.stage !== 'confirm'
+        && !(job.stage === 'claim' && job.hold_until)) continue;
       if (held(job)) continue;
+      if (job.stage === 'confirming') {
+        logger.warn(`${tag(job)}: interrupted while sending the confirmation; it is not sent again`);
+        drop(job.adoption_id);
+        continue;
+      }
       if (job.stage === 'sending') {
         if (!canLookUp(job)) {
           logger.warn(`${tag(job)} was interrupted while sending; it is not sent again`);
@@ -355,7 +407,7 @@ export function createStarter({
       } catch (err) {
         logger.error(`${tag(job)}: ${err.message}`);
         const cur = jobs()[job.adoption_id];
-        if (cur?.stage === 'sending') drop(job.adoption_id);
+        if (cur?.stage === 'sending' || cur?.stage === 'confirm' || cur?.stage === 'confirming') drop(job.adoption_id);
         else if (cur?.stage === 'checking') await finish(cur, 'send_failed', 'internal_error');
       }
     }
@@ -363,14 +415,17 @@ export function createStarter({
 
   return {
     // Queues the starter message of an adoption whose first write the market accepted; a known adoption is not queued again.
-    // holdUntil (ms): the message waits for its template's session until then.
-    enqueue({ orgId, adoptionId, adoptedBy, content = null, holdUntil = null }) {
-      if (!isOrgOrMemberId(orgId) || !isCanonicalUuid(adoptionId) || !isOrgOrMemberId(adoptedBy)) return false;
+    // recipient: who the message is for (the adopter when not given). holdUntil (ms): the message waits for its
+    // template's session until then.
+    enqueue({ orgId, adoptionId, adoptedBy, recipient = null, content = null, holdUntil = null }) {
+      if (!isOrgOrMemberId(orgId) || !isCanonicalUuid(adoptionId) || !isOrgOrMemberId(adoptedBy)
+        || (recipient !== null && !isOrgOrMemberId(recipient))) return false;
       let added = false;
       state.update('starters', {}, (d) => {
         if (d[adoptionId] || Object.keys(d).length >= MAX_STARTER_JOBS) return;
         d[adoptionId] = {
-          org_id: orgId, adoption_id: adoptionId, adopted_by_member_id: adoptedBy, content, stage: 'claim', created_at: iso(), updated_at: iso(),
+          org_id: orgId, adoption_id: adoptionId, adopted_by_member_id: adoptedBy, recipient_member_id: recipient ?? adoptedBy, content,
+          stage: 'claim', created_at: iso(), updated_at: iso(),
           ...(Number.isFinite(holdUntil) ? { hold_until: holdUntil } : {}),
         };
         added = true;

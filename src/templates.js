@@ -416,7 +416,8 @@ export function createTemplates({
       logger.warn(`new session for the starter message of adoption ${r.adoption_id} not requested: ${err.message}`);
     }
     starter.enqueue({
-      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, content: r.starter_content ?? null, holdUntil,
+      orgId: r.org_id, adoptionId: r.adoption_id, adoptedBy: r.starter_adopted_by, recipient: r.starter_recipient ?? null,
+      content: r.starter_content ?? null, holdUntil,
     });
   }
 
@@ -464,7 +465,10 @@ export function createTemplates({
         const body = it.op === 'write_template' ? await write(it, base, queue) : remove(it, base);
         if (typeof body === 'string') return body;
         const starterOf = it.op === 'write_template' && it.starter_message === true && it.adopted_by_member_id && body.status === 'succeeded'
-          ? { starter_adopted_by: it.adopted_by_member_id, starter_content: it.starter_content ?? null } : {};
+          ? {
+            starter_adopted_by: it.adopted_by_member_id, starter_content: it.starter_content ?? null,
+            ...(it.starter_recipient_member_id ? { starter_recipient: it.starter_recipient_member_id } : {}),
+          } : {};
         // What a session must show once the market took the result; slot_at is when the slots were changed.
         const activationOf = body.status !== 'succeeded' ? {}
           : it.op === 'write_template' ? { activation: { rendered_sha256: it.bundle_sha256, slot_at: iso() } }
