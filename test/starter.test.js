@@ -313,7 +313,7 @@ test('a first guide that would exceed the body limit is cut with the fixed suffi
   const { text } = sends(s.im)[0][1];
   assert.ok(utf8Bytes(text) <= MAX_BODY_BYTES, String(utf8Bytes(text)));
   assert.ok(text.includes(`\u{20000}${TRUNCATION_SUFFIX}${LINE_SEPARATOR}${PREFIX}可以先试试这些任务`), text.slice(-3000, -2000));
-  assert.equal(text.split('\n').at(-1), END_LINE);
+  assert.deepEqual(text.split(LINE_SEPARATOR).slice(-2), [END_LINE, SAFETY_NOTICE]);
 });
 
 test('content that does not fit even with the first guide cut is not claimed', async (t) => {
@@ -694,7 +694,7 @@ test('structured: a message over the fallback limit keeps its whole text and get
   assert.ok(utf8Bytes(fallbackText) <= MAX_FALLBACK_BYTES, String(utf8Bytes(fallbackText)));
   assert.ok(fallbackText.isWellFormed());
   assert.ok(fallbackText.includes(TRUNCATION_SUFFIX));
-  assert.equal(fallbackText.split('\n').at(-1), END_LINE);
+  assert.deepEqual(fallbackText.split(LINE_SEPARATOR).slice(-2), [END_LINE, SAFETY_NOTICE]);
 });
 
 test('starter_message.structured false: AGENT_TEXT with a cmsg_ id even when openmax supports the structured send', async (t) => {

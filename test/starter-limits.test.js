@@ -4,7 +4,7 @@ import {
   MAX_BODY_BYTES, MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes, withinLimits,
 } from '../src/starter/limits.js';
 import {
-  ADDRESSEE_RESERVE, LINK_REMOVED, cleanContent, cutToBytes, fitContent, fitFallback, removeLinks, renderStarter,
+  ADDRESSEE_RESERVE, LINE_SEPARATOR, LINK_REMOVED, SAFETY_NOTICE, cleanContent, cutToBytes, fitContent, fitFallback, removeLinks, renderStarter,
 } from '../src/starter/render.js';
 import { ImError, assertNoReservedMetadata, sendParams } from '../src/starter/im.js';
 
@@ -177,13 +177,15 @@ test('cutToBytes never leaves a link the cut created', () => {
   assert.ok(utf8Bytes(at) <= MAX_FALLBACK_BYTES, String(utf8Bytes(at)));
 });
 
-test('a message that does not fit 8192 bytes even with the first guide cut gets the whole message cut to the size', () => {
+test('a message that does not fit 8192 bytes even with the first guide cut is cut to the size, keeping the safety notice', () => {
   const tasks = Array.from({ length: 3 }, (_, i) => ({ title: `t${i}`, prompt: `${ZH}\n`.repeat(400).trim() }));
   const c = { addressee: '', templateName: '周报', firstGuide: ZH.repeat(100), starterTasks: tasks };
   assert.equal(fitContent(c, { maxBodyBytes: MAX_FALLBACK_BYTES }), null);
   const fb = fitFallback(c, '张三');
   assert.ok(utf8Bytes(fb) <= MAX_FALLBACK_BYTES);
   assert.ok(validUtf8(fb));
-  assert.ok(fb.endsWith(TRUNCATION_SUFFIX));
-  assert.ok(renderStarter({ ...c, addressee: '张三' }).startsWith(fb.slice(0, -TRUNCATION_SUFFIX.length)));
+  const tail = LINE_SEPARATOR + SAFETY_NOTICE;
+  assert.ok(fb.endsWith(TRUNCATION_SUFFIX + tail));
+  assert.equal(fb.split(SAFETY_NOTICE).length - 1, 1);
+  assert.ok(renderStarter({ ...c, addressee: '张三' }).startsWith(fb.slice(0, -(TRUNCATION_SUFFIX + tail).length)));
 });

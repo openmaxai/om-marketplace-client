@@ -257,11 +257,16 @@ export function cutToBytes(text, maxBytes) {
 
 // The fallback text of the starter message rendered from clean for addressee: the whole message when it is at most
 // maxFallbackBytes, otherwise the message with first_guide cut as fitContent cuts it for that size; when even that
-// does not fit, the message itself cut to the size. The result is always within maxFallbackBytes.
+// does not fit, the message before SAFETY_NOTICE cut to the size, still followed by SAFETY_NOTICE. The result is always
+// within maxFallbackBytes.
 export function fitFallback(clean, addressee, { maxFallbackBytes = MAX_FALLBACK_BYTES } = {}) {
   const text = renderStarter({ ...clean, addressee });
   if (utf8Bytes(text) <= maxFallbackBytes) return text;
   const fitted = fitContent(clean, { maxBodyBytes: maxFallbackBytes });
   const short = fitted && renderStarter({ ...fitted, addressee });
-  return short && utf8Bytes(short) <= maxFallbackBytes ? short : cutToBytes(text, maxFallbackBytes);
+  if (short && utf8Bytes(short) <= maxFallbackBytes) return short;
+  const tail = LINE_SEPARATOR + SAFETY_NOTICE;
+  const body = text.slice(0, -tail.length);
+  const room = maxFallbackBytes - utf8Bytes(tail);
+  return room > 0 ? cutToBytes(body, room) + tail : cutToBytes(text, maxFallbackBytes);
 }
