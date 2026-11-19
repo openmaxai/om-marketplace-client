@@ -383,18 +383,22 @@ test('submit-template --dry-run asks the market to validate and lists every prob
   assert.deepEqual(readSubmissions(s.dataDir), []);
 });
 
-test('submit-template --dry-run on a market that cannot validate for Agents keeps the local result', async (t) => {
+test('submit-template --dry-run on a market that cannot validate for Agents warns and exits 5', async (t) => {
   const s = await setup(t);
   s.fake.script('POST', `${B}/templates:validate`,
     { status: 404, problem: { status: 404, code: 'NOT_FOUND' } },
     { status: 403, problem: { status: 403, code: 'AGENT_UPLOAD_DISABLED' } },
     { status: 403, problem: { status: 403, code: 'AGENT_OWNER_REQUIRED' } },
     { status: 409, problem: { status: 409, code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.12.0' } });
-  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 0);
-  assert.match(s.out.join('\n'), /local checks passed: expert template weekly-reporter; the market did not check it/);
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 5);
+  assert.match(s.out.join('\n'), /^warning: 市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验\nlocal checks passed: expert template weekly-reporter; nothing was submitted$/);
   s.out.length = 0;
-  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, json: true }), 0);
-  assert.equal(JSON.parse(s.out.join('\n')).server_checked, false);
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, json: true }), 5);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.ok, false);
+  assert.equal(j.error, 'market_check_unavailable');
+  assert.equal(j.server_checked, false);
+  assert.equal(j.message, '市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验');
   s.out.length = 0;
   assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 3);
   assert.match(s.out.join('\n'), /market check not completed: refused: this Agent has no active human owner/);

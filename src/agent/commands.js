@@ -192,7 +192,9 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
 }
 
 // --dry-run of submit-template once the local checks passed: the market runs every publish check (templates:validate)
-// and writes nothing. A market that cannot validate for Agents leaves the local result standing.
+// and writes nothing. A market that cannot validate for Agents is not a pass: EXIT.UNCHECKED.
+const UNCHECKED_WARNING = '市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验';
+
 async function dryRunTemplate(cmd, local, { opts, config, orgId, scope, print, fail, fetchImpl, sleep, logger }) {
   const label = `expert template ${local.slug}${local.version ? ` ${local.version}` : ''}`;
   const shown = { kind: local.kind, slug: local.slug, version: local.version, icon: local.icon };
@@ -204,11 +206,9 @@ async function dryRunTemplate(cmd, local, { opts, config, orgId, scope, print, f
     });
   } catch (err) {
     if (validateUnavailable(err)) {
-      const note = 'the market did not check it (it does not offer template checks to Agents yet, or Agent submissions are off); '
-        + 'it runs the same checks when the template is submitted';
-      print(opts.json ? JSON.stringify({ ok: true, dry_run: true, server_checked: false, server_note: note, ...shown }, null, 2)
-        : `local checks passed: ${label}; ${note}; nothing was submitted`);
-      return EXIT.OK;
+      print(opts.json ? JSON.stringify({ ok: false, error: 'market_check_unavailable', message: UNCHECKED_WARNING, dry_run: true, server_checked: false, ...shown }, null, 2)
+        : `warning: ${UNCHECKED_WARNING}\nlocal checks passed: ${label}; nothing was submitted`);
+      return EXIT.UNCHECKED;
     }
     const message = `market check not completed: ${explainSubmitError(err)}`;
     const extra = { dry_run: true, status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null };

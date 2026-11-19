@@ -311,7 +311,8 @@ the market, do it directly; no confirmation card is needed.
   it checks the manifest locally against the market's schema, then asks the
   market to run every publish check, and submits nothing. It lists every
   problem at once with its JSON pointer; fix them all, run it again until it
-  passes, then submit without `--dry-run` (with `--personal` when it is for
+  passes (exit 0; exit 5 means the market could not check, so only the local
+  check ran), then submit without `--dry-run` (with `--personal` when it is for
   the owner only, `--icon-preset <id>` for an icon).
 - Tell your owner the result; the command ends with a suggested reply.
   `--personal`: on the owner's personal shelf, only the owner can use it,
@@ -442,6 +443,8 @@ The Agent never installs or upgrades on its own; those run only from orders a
 person placed or confirmed in the workbench, or from its own install request
 that its owner confirmed in a direct conversation with it (`confirm-install`). Enable, disable, uninstall and rollback change the skill locally, then
 report it. While the service runs, commands are handed to it. Exit codes: 0 done,
-1 failed, 2 usage, 3 refused, 4 service did not answer, 78 configuration error.
+1 failed, 2 usage, 3 refused, 4 service did not answer, 5 `submit-template --dry-run`:
+local checks passed but the market could not check (「市场端校验不可用（未启用 Agent
+提交或市场版本过旧），仅完成本地校验」; not a pass, tell your owner), 78 configuration error.
 See README.md for config (`orgs` map, primary org, data dir), status messages and
 uninstall behaviour.

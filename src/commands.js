@@ -4,7 +4,7 @@ import path from 'node:path';
 import { readJson, writeJsonAtomic } from './state.js';
 
 export const COMMANDS = new Set(['sync', 'rollback', 'enable', 'disable', 'uninstall']);
-export const EXIT = Object.freeze({ OK: 0, FAILED: 1, USAGE: 2, REFUSED: 3, BUSY: 4, CONFIG: 78 });
+export const EXIT = Object.freeze({ OK: 0, FAILED: 1, USAGE: 2, REFUSED: 3, BUSY: 4, UNCHECKED: 5, CONFIG: 78 });
 const STALE_REQUEST_MS = 60 * 60 * 1000;
 export const MAX_ARG_LENGTH = 200;
 const MAX_REQUEST_BYTES = 4096;

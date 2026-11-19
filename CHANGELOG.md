@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `problems` in `--json`.
 - `submit-template --dry-run` asks the market to run every publish check
   (`templates:validate`) once the local check passes, lists everything it
-  reports and submits nothing. A market or cws-core without that route for
-  Agents leaves the local result (`server_checked: false`).
+  reports and submits nothing. When the market cannot check (Agent
+  submissions off, or a market or cws-core without that route for Agents) it
+  warns that only the local check ran and exits 5 (`server_checked: false`).
 - `submit-template --icon-preset <id>` sets the template's icon to an expert
   preset (`icon: {kind: "preset", preset_id}` next to the manifest).
 - A refused `submit-template` lists every manifest problem when the market

@@ -144,7 +144,8 @@ write into a directory that is accessible by group or other.
 
 `<slug>` may also be the skill id. Exit codes: 0 done, 1 failed, 2 usage,
 3 refused or not installed, 4 the running service did not answer within
-`--wait <seconds>` (default 900), 78 configuration error. A report the market
+`--wait <seconds>` (default 900), 5 `submit-template --dry-run` passed the local
+check but the market could not check it, 78 configuration error. A report the market
 could not take yet is kept and resent; the command still exits 0. Ctrl-C or
 SIGTERM while a command runs in the CLI itself aborts pending network calls,
 lets the current step finish and then exits 130. A second Ctrl-C exits at once
@@ -182,7 +183,7 @@ missing evidence, a repeated option) exit 2.
 | Command | What it does |
 |---|---|
 | `submit-skill <dir> [--personal] [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links and files that may hold credentials — `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*` and other SSH keys, `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`, `credentials*`, and any `.json` up to 1 MiB that is a Google Cloud service-account key (detected by content) — refused and named), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin (and on the owner's personal shelf); with `--personal` it goes to the owner's personal shelf only, with no review. |
-| `submit-template <manifest.json> [--personal] [--changelog <text>] [--category-id <id>] [--icon-preset <id>] [--dry-run]` | Checks the whole manifest against the market's manifest schema (every nested field; all problems at once, each with its JSON pointer) and publishes it as a new expert template, pending review; with `--personal` on the owner's personal shelf only, with no review. `--icon-preset` sets the template's icon to an expert preset (`{kind: "preset", preset_id}` in the request, not in the manifest). With `--dry-run` nothing is submitted: after the local check passes, the market runs every publish check (`templates:validate`) and all its findings are listed; a market that cannot validate for Agents (404, or the `AGENT_UPLOAD_DISABLED` older markets give) leaves the local result, marked `server_checked: false` in `--json`. In `--json`, refusals carry `problems: [{source: local\|market, pointer, reason, ...}]`; `template_id` / `template_version_id` name the personal copy with `--personal` and the organization's copy otherwise. |
+| `submit-template <manifest.json> [--personal] [--changelog <text>] [--category-id <id>] [--icon-preset <id>] [--dry-run]` | Checks the whole manifest against the market's manifest schema (every nested field; all problems at once, each with its JSON pointer) and publishes it as a new expert template, pending review; with `--personal` on the owner's personal shelf only, with no review. `--icon-preset` sets the template's icon to an expert preset (`{kind: "preset", preset_id}` in the request, not in the manifest). With `--dry-run` nothing is submitted: after the local check passes, the market runs every publish check (`templates:validate`) and all its findings are listed; a market that cannot validate for Agents (404 / 405, or `AGENT_UPLOAD_DISABLED`: Agent submissions off or an older market) prints the warning 「市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验」 and exits 5 (`--json`: `ok: false`, `error: market_check_unavailable`, `server_checked: false`). In `--json`, refusals carry `problems: [{source: local\|market, pointer, reason, ...}]`; `template_id` / `template_version_id` name the personal copy with `--personal` and the organization's copy otherwise. |
 | `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |
 
 While a request from `request-install` is pending, the service checks it every
@@ -311,7 +312,7 @@ Every field:
 ```
 
 The market's `templates:validate` for Agents also needs the cws-core route for
-Agent clients; until it is there, `--dry-run` reports the local result only.
+Agent clients; until it is there, `--dry-run` warns and exits 5 after the local check.
 
 `submit-skill` does not keep file modes: installs write every file 0600 and
 never execute package content, so a skill runs its scripts through an
