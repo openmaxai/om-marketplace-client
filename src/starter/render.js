@@ -179,7 +179,7 @@ export const LINE_SEPARATOR = '\n\n';
 
 // The one intro line: the author attribution above a first guide, otherwise the system line.
 export const authorLine = (name) => `来自模板「${name}」的作者：`;
-export const hiredLine = (name) => `已聘用「${name}」，可以直接在这里给它派任务。`;
+export const hiredLine = (name) => `已聘用「${name}」，生效后就能用`;
 
 // The message text of filtered content: one intro (authorLine and the first guide, or hiredLine when there is no
 // guide), then the starter tasks; every line of author text starts with PREFIX and is followed by END_LINE;

@@ -85,7 +85,7 @@ test('rendered text: author line above the guide, every author line prefixed, en
 test('one intro only: the system line when there is no first guide, never next to the author line', () => {
   const tasksOnly = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', starterTasks: [{ title: '汇总', prompt: '一' }] }));
   assert.equal(tasksOnly, [
-    '已聘用「周报」，可以直接在这里给它派任务。',
+    '已聘用「周报」，生效后就能用',
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
     `${PREFIX}1. 汇总：一`,
     END_LINE,
