@@ -446,7 +446,13 @@ chance. It is always on; there is no setting to turn it off.
    30-minute cooldown and apart from the 4 automatic requests, at most 12
    retries per UTC day. A change merged while no session followed the last
    request (for example a hire right after a removal) gets the same retry.
-   At most 3 requests per change. Then the alert
+   At most 3 requests per change. A request after which the runtime status
+   reported a model API problem (`health` not `ok`: rate limit or quota,
+   overload, server or authentication error) and no session followed is not
+   counted toward these 3: the session could not start, so the change was never
+   tried. The next request still waits for an idle, healthy runtime. At most 12
+   requests are given back per UTC day (`api_error_refunds`); past that they
+   count as before. Then the alert
    `template_activation_stuck` is raised and starter messages held for the
    change are released at once (see [Starter message](#starter-message)); the
    record stays pending and a later session still confirms it. A record pending for 24 hours raises

@@ -8,7 +8,7 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, DAILY_WELCOME_REQUESTS, IDLE_MIN_SECONDS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
-  DAILY_RETRY_REQUESTS, DAILY_UPDATE_REQUESTS, HOURLY_UPDATE_REQUESTS, UPDATE_REQUEST_INTERVAL_MS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
+  DAILY_RETRY_REQUESTS, DAILY_UPDATE_REQUESTS, DAILY_API_ERROR_REFUNDS, HOURLY_UPDATE_REQUESTS, UPDATE_REQUEST_INTERVAL_MS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { createStarter } from '../src/starter.js';
@@ -1588,4 +1588,111 @@ test('update: the user mark survives a restart', async (t) => {
   f.status({ idle_seconds: 30 });
   assert.equal(await b.tick(), 'requested');
   assert.equal(f.pending().user, true);
+});
+
+// #66: a request the runtime could not serve because of a model API problem is not counted toward MAX_REQUESTS.
+
+// One quick request, then the runtime reports `health` for the whole confirm wait; returns the tick after it.
+async function failedRequest(f, a, health = 'rate_limited') {
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30, health });
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONFIRM_WAIT_MS);
+  f.status({ idle_seconds: 30, health });
+  return a.tick();
+}
+
+test('api error: a request followed by a model API problem is given back, so the change never goes stuck', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  for (let i = 0; i < MAX_REQUESTS + 2; i++) {
+    // While the runtime is unhealthy nothing is asked for; the request is not counted.
+    assert.equal(await failedRequest(f, a), 'busy');
+    assert.equal(f.pending().request_count, 0);
+    assert.equal(f.pending().stuck_at, undefined);
+    // Past the quick budget's hourly cap (3 in any 60 minutes).
+    f.advance(20 * 60 * 1000);
+  }
+  assert.equal(f.alert(), false);
+  assert.equal(f.state.read('activation', null).api_error_refunds.length, MAX_REQUESTS + 2);
+  // Healthy again: asked for at once, and the session confirms it.
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  await session(f, a, [[A1, S1]]);
+  assert.equal(f.pending(), null);
+});
+
+for (const health of ['overloaded', 'server_error', 'auth_failed']) {
+  test(`api error: health ${health} gives the request back too`, async (t) => {
+    const f = await harness(t);
+    const a = f.make();
+    userWritten(f, a);
+    await failedRequest(f, a, health);
+    assert.equal(f.pending().request_count, 0);
+  });
+}
+
+test('api error: a request with a healthy runtime and no session still counts, up to stuck', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  for (let i = 1; i <= MAX_REQUESTS; i++) {
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.tick(), 'requested');
+    assert.equal(f.pending().request_count, i);
+    // The confirm wait runs from when the request is first seen delivered.
+    f.advance(ACTIVATION_CHECK_MS);
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.tick(), 'waiting');
+    f.advance(CONFIRM_WAIT_MS);
+  }
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'stuck');
+  assert.equal(f.alert(), true);
+  assert.equal(f.state.read('activation', null).api_error_refunds.length, 0);
+});
+
+test('api error: a problem reported before the request does not give it back', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  f.status({ idle_seconds: 30, health: 'rate_limited' });
+  assert.equal(await a.tick(), 'busy');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONFIRM_WAIT_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.pending().request_count, 2);
+});
+
+test('api error: a session after the request confirms it; nothing is given back', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(ACTIVATION_CHECK_MS);
+  await session(f, a, [[A1, S1]]);
+  assert.equal(f.pending(), null);
+  assert.equal(f.state.read('activation', null).api_error_refunds.length, 0);
+});
+
+test(`api error: at most ${DAILY_API_ERROR_REFUNDS} requests are given back a UTC day; past it they count`, async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  const day = new Date(f.clock.t).toISOString().slice(0, 10);
+  f.state.update('activation', {}, (d) => {
+    d.api_error_refunds = Array.from({ length: DAILY_API_ERROR_REFUNDS }, () => `${day}T00:00:00.000Z`);
+  });
+  await failedRequest(f, a);
+  assert.equal(f.pending().request_count, 1);
 });

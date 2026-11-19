@@ -34,6 +34,11 @@ export const UPDATE_REQUEST_WINDOW_MS = 60 * 60 * 1000;
 // ... and this many per UTC day. Past these the change waits for the automatic rules (IDLE_MIN_SECONDS,
 // REQUEST_COOLDOWN_MS, DAILY_REQUESTS).
 export const DAILY_UPDATE_REQUESTS = 12;
+// A request after which the runtime reported a model API problem (status health not ok: rate limit, quota, overload,
+// server or authentication error) and no session followed is not counted toward MAX_REQUESTS: the session could not
+// start, the change was never tried. At most this many such requests are given back per UTC day (loop protection);
+// past it they count as before.
+export const DAILY_API_ERROR_REFUNDS = 12;
 // How long a delivered request is given to show up as a new session before it is made again.
 export const CONFIRM_WAIT_MS = 5 * 60 * 1000;
 // A request made while no session followed the last one (a retry) does not wait REQUEST_COOLDOWN_MS; at most this
@@ -60,7 +65,8 @@ const HISTORY_KEEP_MS = 2 * 24 * 60 * 60 * 1000;
 const OUTSTANDING = new Set(['pending', 'running']);
 const EPOCH = new Date(0).toISOString();
 const EMPTY = Object.freeze({
-  pending: null, passive: null, requests: [], welcome_requests: [], update_requests: [], retry_requests: [], backfilled: false,
+  pending: null, passive: null, requests: [], welcome_requests: [], update_requests: [], retry_requests: [], api_error_refunds: [],
+  backfilled: false,
 });
 
 export const defaultStatusFile = (zylosDir) => path.join(zylosDir, 'activity-monitor', 'agent-status.json');
@@ -143,12 +149,14 @@ const isList = Array.isArray;
 // (null once it left the queue or when the enqueue's outcome is unknown); delivered_at when it was first seen
 // delivered; seen_at the last marker that did not confirm the record; welcome the adoptions whose starter message is
 // held until the record is confirmed (the check keeps asking on the starter budget while no request is in flight);
-// user true once a write the user ordered was merged in (asked for on update_requests); stuck_at when MAX_REQUESTS
+// user true once a write the user ordered was merged in (asked for on update_requests); api_error_at when the runtime
+// reported a model API problem after the last request (refundApiError); stuck_at when MAX_REQUESTS
 // requests brought no session, which releases those messages.
 // passive holds the adoptions written before 0.6.0 ({targets, seen_at}); they are confirmed by the next session that
 // shows them but never cause a request. requests lists the times of automatic new-session requests, welcome_requests
 // those made for starter messages, update_requests those made for user-ordered writes, retry_requests automatic ones
 // made while no session followed the last request; each has its own budget and none counts against another.
+// api_error_refunds lists the times a request was given back after a model API problem (DAILY_API_ERROR_REFUNDS).
 // im: the openmax IM (available(), openTurn()); flush(): sends the urgent reconcile queue; control: the control queue.
 export function createActivation({
   state, dataDir, zylosDir, logger, im = null, flush = async () => null, now = Date.now,
@@ -167,6 +175,7 @@ export function createActivation({
       welcome_requests: times(d?.welcome_requests),
       update_requests: times(d?.update_requests),
       retry_requests: times(d?.retry_requests),
+      api_error_refunds: times(d?.api_error_refunds),
       backfilled: d?.backfilled === true,
     };
   };
@@ -495,6 +504,39 @@ export function createActivation({
     return p;
   }
 
+  // The runtime reported a model API problem (fresh status, health not ok) after the record's last request, and no
+  // session has started since: kept as api_error_at, so the request can be given back (refundApiError).
+  function noteApiError(p, marker) {
+    if (!unconfirmed(p, marker) || !(p.request_count > 0)) return;
+    const s = readRuntimeStatus(statusFile, now());
+    if (!s || (s.health ?? 'ok') === 'ok') return;
+    if (Date.parse(p.api_error_at) >= Date.parse(p.requested_at)) return;
+    const at = iso();
+    save((d) => {
+      if (d.pending && d.pending.requested_at === p.requested_at) d.pending.api_error_at = at;
+    });
+    logger.info(`activation: the runtime reports ${String(s.health).slice(0, 40)} after the new-session request; it will not count toward ${MAX_REQUESTS}`);
+  }
+
+  // Once the confirm wait of an unconfirmed request is over: a request followed by a model API problem is not counted
+  // (request_count back by one), at most DAILY_API_ERROR_REFUNDS a UTC day. The next request still waits for an
+  // idle, healthy runtime (idleState).
+  function refundApiError(p) {
+    if (!(Date.parse(p.api_error_at) >= Date.parse(p.requested_at)) || !(p.request_count > 0) || !unconfirmed(p)) return;
+    let given = false;
+    save((d) => {
+      const q = d.pending;
+      if (!q || q.requested_at !== p.requested_at || q.api_error_at !== p.api_error_at) return;
+      const t = now();
+      if (d.api_error_refunds.filter((x) => utcDay(Date.parse(x)) === utcDay(t)).length >= DAILY_API_ERROR_REFUNDS) return;
+      q.request_count -= 1;
+      delete q.api_error_at;
+      d.api_error_refunds = [...d.api_error_refunds.filter((x) => t - Date.parse(x) < HISTORY_KEEP_MS), iso()];
+      given = true;
+    });
+    if (given) logger.info('activation: a new-session request the runtime could not serve (model API problem) was not counted');
+  }
+
   async function tick() {
     const marker = readMarker(dataDir);
     await confirmPassive(marker);
@@ -510,6 +552,7 @@ export function createActivation({
       if (state.setAlert(PENDING_ALERT, msg)) logger.warn(`activation: ${msg}`);
     }
     if (marker && marker.at > Date.parse(p.written_at) && !(marker.at <= Date.parse(p.seen_at))) return confirm(p, marker);
+    noteApiError(p, marker);
     if ((await followControl(p)) === 'outstanding') return 'waiting';
     const cur = read().pending;
     if (!cur) return 'none';
@@ -525,7 +568,8 @@ export function createActivation({
       if (r !== 'skipped') return r;
     }
     if (cur.requested_at && t - Math.max(Date.parse(cur.requested_at), Date.parse(cur.delivered_at ?? '') || 0) < CONFIRM_WAIT_MS) return 'waiting';
-    if (cur.request_count >= MAX_REQUESTS) {
+    refundApiError(cur);
+    if (read().pending?.request_count >= MAX_REQUESTS) {
       const msg = `template activation not confirmed after ${MAX_REQUESTS} new-session requests; waiting for the next session`;
       if (state.setAlert(STUCK_ALERT, msg)) logger.warn(`activation: ${msg}`);
       // Held starter messages are released: no more sessions are asked for this change.
