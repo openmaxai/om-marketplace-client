@@ -451,12 +451,13 @@ test('the DM changed before the send: not sent, send_failed', async (t) => {
   assert.deepEqual(s.market().at(-1), [':mark-starter-shown', { result: 'send_failed' }]);
 });
 
-test('first_guide "" from the market is no guide: the system line, then the tasks when there are any', async (t) => {
+test('first_guide "" from the market is no guide: the system line, then the author line and tasks when there are any', async (t) => {
   const s = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: CONTENT.starterTasks }, mark: [marked('sent')] });
   await s.starter.runAll();
   const lines = sends(s.im)[0][1].text.split(LINE_SEPARATOR);
   assert.equal(lines[0], hiredLine('周报助手'));
-  assert.equal(lines[1], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
+  assert.equal(lines[1], authorLine('周报助手'));
+  assert.equal(lines[2], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
   const n = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: [] }, mark: [marked('sent')] });
   await n.starter.runAll();
   assert.deepEqual(n.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);

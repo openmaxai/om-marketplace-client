@@ -82,10 +82,11 @@ test('rendered text: author line above the guide, every author line prefixed, en
   ].join(LINE_SEPARATOR));
 });
 
-test('one intro only: the system line when there is no first guide, never next to the author line', () => {
+test('author line once above any author text; system line only when there is no first guide', () => {
   const tasksOnly = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', starterTasks: [{ title: '汇总', prompt: '一' }] }));
   assert.equal(tasksOnly, [
     '已聘用「周报」，生效后就能用',
+    '来自模板「周报」的作者：',
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
     `${PREFIX}1. 汇总：一`,
     END_LINE,
@@ -94,8 +95,12 @@ test('one intro only: the system line when there is no first guide, never next t
   const bare = cleanContent({ addressee: '张三', templateName: '周报', firstGuide: '', starterTasks: [] });
   assert.equal(hasContent(bare), true);
   assert.equal(renderStarter(bare), [hiredLine('周报'), SAFETY_NOTICE].join(LINE_SEPARATOR));
+  assert.ok(!renderStarter(bare).includes(authorLine('周报')));
   const guided = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', firstGuide: 'g' }));
   assert.ok(!guided.includes(hiredLine('周报')) && guided.startsWith(authorLine('周报')));
+  const both = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', firstGuide: 'g', starterTasks: [{ title: '汇总', prompt: '一' }] }));
+  assert.equal(both.split(authorLine('周报')).length, 2, both);
+  assert.ok(!both.includes(hiredLine('周报')), both);
   for (const text of [tasksOnly, renderStarter(bare), guided]) assert.ok(!/你好|已装/.test(text) && !text.includes('张三'), text);
 });
 

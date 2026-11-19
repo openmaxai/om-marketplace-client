@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Starter message: one intro only. With a first guide the message starts with
-  `来自模板「<name>」的作者：` above the guide; without one it starts with
-  `已聘用「<name>」，生效后就能用`. The greeting line is gone,
-  starter tasks follow, and the platform safety notice is now the last line.
+- Starter message: one intro only. Without a first guide the message starts
+  with `已聘用「<name>」，生效后就能用`. Any author text (first guide, starter
+  tasks or both) sits under one line `来自模板「<name>」的作者：`. The greeting
+  line is gone and the platform safety notice is now the last line.
 - Starter message: a template with neither a first guide nor starter tasks is
   now claimed and sent (system line and safety notice only), and the hired
   confirmation still goes to the adopter when the adopter is not the owner.
