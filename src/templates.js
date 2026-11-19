@@ -403,10 +403,13 @@ export function createTemplates({
 
   // A write the market accepted waits for a session to pick it up (activation); its starter message waits for that too
   // when a new session is requested at once, or until the session when none may be requested yet (activation.welcome).
+  // Every write order comes from a user's hire, update or switch, so the session is asked for on the quick path.
   // Recorded before the report is settled locally, so a crash in between records it again, unchanged.
   async function activate(r) {
     if (activation && r.activation?.rendered_sha256) {
-      activation.recordWrite({ adoptionId: r.adoption_id, renderedSha: r.activation.rendered_sha256, at: r.activation.slot_at });
+      activation.recordWrite({
+        adoptionId: r.adoption_id, renderedSha: r.activation.rendered_sha256, at: r.activation.slot_at, userInitiated: true,
+      });
     }
     if (!r.starter_adopted_by || !starter) return;
     let holdUntil = null;

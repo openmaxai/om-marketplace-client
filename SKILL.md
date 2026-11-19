@@ -123,7 +123,11 @@ retries a day). The client has already compared the injected
 template hashes when it asks: always start the new session, and never decide
 yourself that the current session already matches the templates. A template adopted with a starter message is asked for at once on
 its own budget (Agent idle 30 seconds, at least 2 minutes apart, 12 a day,
-apart from the automatic 4); when the Agent is busy or that budget does not
+apart from the automatic 4). A template update or switch the user ordered
+(any write order) is asked for the same way, at once once the Agent has been
+idle 30 seconds with no open turn, on a budget of its own (at least 2 minutes
+apart, 3 an hour, 12 a day), not held back by the 30-minute cooldown; past that
+budget it waits for the automatic rules above. For a starter message, when the Agent is busy or that budget does not
 allow it, the starter message waits until the template is in a session, at most
 24 hours (an Agent busy that long gets it then, without a new session). When the
 Agent's runtime status or turn state cannot be read, it is sent at once. Templates adopted before 0.6.0 are confirmed by the next natural

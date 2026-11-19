@@ -271,8 +271,11 @@ chance. It is always on; there is no setting to turn it off.
    than 60 seconds ago and shows `state` idle, `health` ok (or no health
    field), `active_tools` 0 and `idle_seconds` at least 300, in two
    consecutive checks; no earlier request is still in the control queue; no OpenMax
-   conversation has an open turn, nor one closed by a reply within the last 10
-   minutes (openmax's own activity store); the last automatic request was 30
+   conversation has a turn that openmax's activity index (`runs/active.json`)
+   still lists: an open run, or one closed by its reply while its turn lasts
+   (10 minutes at most; a turn that ended is no longer listed). Without the
+   openmax CLI, or with no activity index, no turn is seen and the runtime
+   status alone decides (logged once); the last automatic request was 30
    minutes ago or more; fewer than 4 were made this UTC day. A missing or stale
    status file means no request. The 30-minute cooldown applies only after a
    request that brought a session: a retry after an unconfirmed request (step
@@ -281,6 +284,15 @@ chance. It is always on; there is no setting to turn it off.
    [Starter message](#starter-message) below) follow their own rules and are
    counted apart: they neither use the 4 automatic requests nor wait for the
    30-minute cooldown, and automatic requests do not use theirs.
+   A record holding a write the user ordered (every write order: a hire, an
+   update or a switch; the market creates write orders only for these) takes
+   the quick path in the same way, on a budget of its own: asked for as soon as
+   the Agent has been idle 30 seconds with no open turn and no request of the
+   record is in flight, at least 2 minutes apart (changes closer together share
+   one request), at most 3 in any 60 minutes and 12 per UTC day. It neither
+   waits for the 30-minute cooldown nor uses the 4 automatic requests. Past that
+   budget the record falls back to the automatic rules above. A removal alone
+   keeps the automatic rules.
 3. The request goes to the zylos control queue: "Agent Market templates were
    updated and the market client has verified, from the injected template
    hashes, that the current session does not match them. Start a new session

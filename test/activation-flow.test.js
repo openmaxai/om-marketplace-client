@@ -81,7 +81,7 @@ async function flow(t, { starterMessage = false } = {}) {
   return { ...h, queue, intents, writeResults, bundle, zylosDir, controls, status, order, templates, activation, reconcile, starts, session, reports };
 }
 
-test('a template write is activated: idle Agent asked through the control queue, marker written, template_activated reported', async (t) => {
+test('a template write is activated: an Agent idle 30 s is asked at once through the control queue, marker written, template_activated reported', async (t) => {
   const f = await flow(t);
   await f.order('write_template');
   f.status({ state: 'busy' });
@@ -90,11 +90,10 @@ test('a template write is activated: idle Agent asked through the control queue,
   assert.deepEqual(f.controls(), []);
   assert.equal(await f.activation.tick(), 'busy');
   f.clock.t += ACTIVATION_CHECK_MS;
-  f.status();
-  assert.equal(await f.activation.tick(), 'sampled');
-  f.clock.t += ACTIVATION_CHECK_MS;
-  f.status();
+  // A write order is the user's update, switch or hire: the quick path, on its own budget.
+  f.status({ idle_seconds: 30 });
   assert.equal(await f.activation.tick(), 'requested');
+  assert.equal(f.state.read('activation', null).update_requests.length, 1);
   assert.deepEqual(f.controls(), [[
     'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix', '--ack-deadline', '21600',
   ]]);
