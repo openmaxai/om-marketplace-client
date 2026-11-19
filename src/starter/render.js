@@ -177,16 +177,18 @@ const prefixed = (text) => authorLines(text).map((l) => PREFIX + l);
 // each starter task, as its own paragraph; plain-text channels only see the extra spacing.
 export const LINE_SEPARATOR = '\n\n';
 
-// The message text of filtered content: SAFETY_NOTICE once after the greeting, every line of author text starts with
-// PREFIX and END_LINE is the last line; lines are separated by LINE_SEPARATOR.
+// The one intro line: the author attribution above a first guide, otherwise the system line.
+export const authorLine = (name) => `来自模板「${name}」的作者：`;
+export const hiredLine = (name) => `已聘用「${name}」，可以直接在这里给它派任务。`;
+
+// The message text of filtered content: one intro (authorLine and the first guide, or hiredLine when there is no
+// guide), then the starter tasks; every line of author text starts with PREFIX and is followed by END_LINE;
+// SAFETY_NOTICE is the last line. Lines are separated by LINE_SEPARATOR.
 export function renderStarter(clean) {
   const name = clean.templateName;
-  const lines = [
-    `你好${clean.addressee ? `，${clean.addressee}` : ''}。专家模板「${name}」已装到我这里。`,
-    SAFETY_NOTICE,
-    `以下引导来自模板「${name}」的作者：`,
-  ];
-  if (clean.firstGuide) lines.push(...prefixed(clean.firstGuide));
+  const lines = [];
+  if (clean.firstGuide) lines.push(authorLine(name), ...prefixed(clean.firstGuide));
+  else lines.push(hiredLine(name));
   if (clean.starterTasks.length) {
     lines.push(`${PREFIX}可以先试试这些任务（复制发给我即可）：`);
     clean.starterTasks.forEach((x, i) => {
@@ -196,7 +198,8 @@ export function renderStarter(clean) {
       lines.push(PREFIX + head + (first ?? ''), ...rest.map((l) => PREFIX + l));
     });
   }
-  lines.push(END_LINE);
+  if (clean.firstGuide || clean.starterTasks.length) lines.push(END_LINE);
+  lines.push(SAFETY_NOTICE);
   return lines.join(LINE_SEPARATOR);
 }
 
@@ -208,7 +211,8 @@ export function renderHired({ owner, expert }) {
   return zh + LINE_SEPARATOR + en;
 }
 
-export const hasContent = (clean) => Boolean(clean.templateName && (clean.firstGuide || clean.starterTasks.length));
+// A template name is enough: without a first guide or starter tasks the message is hiredLine only.
+export const hasContent = (clean) => Boolean(clean.templateName);
 
 // Stands in for the adopter's name before it is known: the longest a cleaned name can be in UTF-8 bytes.
 export const ADDRESSEE_RESERVE = '\u{20000}'.repeat(LIMITS.addressee);
