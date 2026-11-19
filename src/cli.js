@@ -32,7 +32,9 @@ const USAGE = `usage: market-client <command>
   decline-install <proposal_id>  record that your owner declined
     both: --channel workspace|lark|telegram|other [--channel-detail <text>]
     --owner-message-id <id> and/or the owner's reply verbatim: --owner-message-file <path>, --owner-message-text-stdin or --owner-message-text <text>
-submit options: --dry-run (local checks only), --personal (owner's personal shelf only, no review), --changelog <text>, --category-id <id>,
+submit options: --dry-run (check only, submit nothing; submit-template: checks locally, then with the market),
+  --personal (owner's personal shelf only, no review), --changelog <text>, --category-id <id>,
+  --icon-preset <id> (submit-template: a preset icon such as expert-service),
   --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
 agent market commands take --json and --org <org_id> (default: the primary org)
 start, sync, rollback, enable, disable and uninstall wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
@@ -321,7 +323,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   const [cmd, ...rest] = argv;
   const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
   const VALUE_OPTS = {
-    '--changelog': 'changelog', '--category-id': 'categoryId', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+    '--changelog': 'changelog', '--category-id': 'categoryId', '--icon-preset': 'iconPreset', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
     '--channel': 'channel', '--channel-detail': 'channelDetail', '--owner-message-id': 'ownerMessageId', '--owner-message-text': 'ownerMessageText',
     '--owner-message-file': 'ownerMessageFile',
   };
@@ -355,6 +357,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
     : variadic ? (pos.length >= variadic[0] && pos.length <= variadic[1] ? pos.length : -1)
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
   if ([textFromStdin, opts.ownerMessageText != null, opts.ownerMessageFile != null].filter(Boolean).length > 1) badOpt = true;
+  if (opts.iconPreset != null && cmd !== 'submit-template') badOpt = true;
   if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;

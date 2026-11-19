@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-20
+
+### Added
+- `submit-template` checks the whole manifest against the market's manifest
+  schema (JSON Schema 2020-12, vendored byte-identical in
+  `src/agent/schema/` and pinned by sha256 and market commit; the tests fail
+  when the copy drifts from the pin). Every nested field is checked and every
+  problem is reported at once with its JSON pointer, in the human output and
+  as `problems` in `--json`.
+- `submit-template --dry-run` asks the market to run every publish check
+  (`templates:validate`) once the local check passes, lists everything it
+  reports and submits nothing. A market or cws-core without that route for
+  Agents leaves the local result (`server_checked: false`).
+- `submit-template --icon-preset <id>` sets the template's icon to an expert
+  preset (`icon: {kind: "preset", preset_id}` next to the manifest).
+- A refused `submit-template` lists every manifest problem when the market
+  sends them (`errors`); older markets' single reason reads as before.
+- SKILL.md and README.md: manifest format reference with a minimal and a
+  full example.
+
+### Fixed
+- The local check refused a `duty` / `boundary` on several lines, which the
+  market accepts (up to 20 lines).
+
 ## [0.11.1] - 2026-11-19
 
 ### Fixed

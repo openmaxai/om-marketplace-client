@@ -1,0 +1,760 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://market.openmax.com/schemas/expert-template-manifest.schema.json",
+  "title": "Expert template manifest",
+  "description": "Expert template manifest (schema_version 1). Structural rules only: types, required and allowed keys, enums, item counts, lengths (in Unicode code points) and value patterns. The server additionally checks, and this schema cannot express (server-only): the JSON is strict (no duplicate keys, integers only, nesting depth <= 6, <= 256 KiB); every string is NFC, has no forbidden characters (control, format, private-use and other invisible characters) and no credential (secret scan); role.name, first_guide and starter_tasks hold no request for a credential; first_guide and starter_tasks hold no unsafe instruction; no string imitates text the client writes around the template (reserved_client_text); keys are unique within each array (skills by skill_id, connectors by app, options by value); an enum default is one of its options; a text default fits max_len and passes the secret scan; role lines plus the inject segment fit 8000 estimated tokens; and, against stored data: referenced skills and knowledge files, the version order, and the name on the shelf.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "id",
+    "role",
+    "skills"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "expert_template"
+    },
+    "id": {
+      "description": "Template slug: lowercase letters and digits separated by single hyphens; at most 64.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "version": {
+      "description": "SemVer such as 1.0.0 or 1.0.0-beta.1, without build metadata; optional, the server assigns one when absent.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+    },
+    "role": {
+      "type": "object",
+      "required": [
+        "name",
+        "instructions",
+        "duty"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "\\S"
+        },
+        "persona": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "\\S",
+          "not": {
+            "description": "Instruction field: no {{ placeholders.",
+            "pattern": "\\{\\{"
+          }
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32000,
+          "pattern": "\\S",
+          "not": {
+            "description": "Instruction field: no {{ placeholders.",
+            "pattern": "\\{\\{"
+          }
+        },
+        "duty": {
+          "description": "Instruction text, up to 20 lines separated by \\n: no blank first or last line, no two blank lines in a row, no {{ placeholders.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "allOf": [
+            {
+              "pattern": "^[^\\S\\n]*\\S"
+            },
+            {
+              "pattern": "\\S[^\\S\\n]*$"
+            },
+            {
+              "pattern": "^[^\\n]*(\\n[^\\n]*){0,19}$"
+            }
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "\\{\\{"
+              },
+              {
+                "pattern": "\\n[^\\S\\n]*\\n[^\\S\\n]*\\n"
+              }
+            ]
+          }
+        },
+        "boundary": {
+          "description": "Instruction text, up to 20 lines separated by \\n: no blank first or last line, no two blank lines in a row, no {{ placeholders.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "allOf": [
+            {
+              "pattern": "^[^\\S\\n]*\\S"
+            },
+            {
+              "pattern": "\\S[^\\S\\n]*$"
+            },
+            {
+              "pattern": "^[^\\n]*(\\n[^\\n]*){0,19}$"
+            }
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "\\{\\{"
+              },
+              {
+                "pattern": "\\n[^\\S\\n]*\\n[^\\S\\n]*\\n"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "first_guide": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20000,
+      "pattern": "\\S",
+      "not": {
+        "description": "Instruction field: no {{ placeholders.",
+        "pattern": "\\{\\{"
+      }
+    },
+    "skills": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": [
+          "skill_id",
+          "skill_version_id",
+          "package_sha256"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "skill_id": {
+            "$ref": "#/$defs/uuid"
+          },
+          "skill_version_id": {
+            "$ref": "#/$defs/uuid"
+          },
+          "package_sha256": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": [
+          "app",
+          "purpose",
+          "required"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "app": {
+            "description": "Lowercase letter, then lowercase letters, digits, _ or -; at most 64. Unique within connectors (server-only).",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          },
+          "purpose": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "pattern": "\\S"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "triggers": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "title",
+          "prompt",
+          "schedule"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/key"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "pattern": "\\S"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "pattern": "\\S",
+            "not": {
+              "description": "Instruction field: no {{ placeholders.",
+              "pattern": "\\{\\{"
+            }
+          },
+          "schedule": {
+            "type": "object",
+            "required": [
+              "cron",
+              "timezone"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "cron": {
+                "description": "Five cron fields of digits, *, /, , and -; 9 to 64 characters.",
+                "type": "string",
+                "allOf": [
+                  {
+                    "pattern": "^[0-9*/,\\- ]{9,64}$"
+                  },
+                  {
+                    "pattern": "^ *[0-9*/,\\-]+( +[0-9*/,\\-]+){4} *$"
+                  }
+                ]
+              },
+              "timezone": {
+                "$ref": "#/$defs/timezone"
+              }
+            }
+          }
+        }
+      }
+    },
+    "sop": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "title",
+          "steps"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/key"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "\\S",
+            "not": {
+              "description": "Instruction field: no {{ placeholders.",
+              "pattern": "\\{\\{"
+            }
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 30,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000,
+              "pattern": "\\S",
+              "not": {
+                "description": "Instruction field: no {{ placeholders.",
+                "pattern": "\\{\\{"
+              }
+            }
+          }
+        }
+      }
+    },
+    "knowledge": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "title",
+          "sha256",
+          "size"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/key"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "\\S"
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1048576
+          }
+        }
+      }
+    },
+    "customizable_fields": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "required": [
+          "key",
+          "label",
+          "type",
+          "required"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "$ref": "#/$defs/key"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "\\S"
+          },
+          "type": {
+            "enum": [
+              "text",
+              "long_text",
+              "enum",
+              "boolean",
+              "integer",
+              "timezone",
+              "member"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "sensitive": {
+            "description": "A sensitive parameter takes no value in phase 1: it cannot be required or have a default.",
+            "type": "boolean"
+          },
+          "options": {
+            "description": "enum only: the allowed values.",
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "pattern": "\\S"
+            }
+          },
+          "max_len": {
+            "description": "text and long_text only; default 200 (text) or 4000 (long_text).",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4000
+          },
+          "default": {
+            "description": "Must be a valid value of the parameter's type (an enum default must be one of options: server-only). Not allowed for member or sensitive parameters."
+          },
+          "include_agents": {
+            "description": "member only: Agents of the org may be chosen too (default people only).",
+            "type": "boolean"
+          }
+        },
+        "allOf": [
+          {
+            "description": "options: required for type enum, not allowed for any other type.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "enum"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "options"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "options"
+                ]
+              }
+            }
+          },
+          {
+            "description": "max_len: only for type text or long_text.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "text",
+                    "long_text"
+                  ]
+                }
+              }
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "max_len"
+                ]
+              }
+            }
+          },
+          {
+            "description": "type member: no default, sensitive must be false or absent; include_agents only for type member.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "member"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "sensitive": {
+                  "const": false
+                }
+              },
+              "not": {
+                "required": [
+                  "default"
+                ]
+              }
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "include_agents"
+                ]
+              }
+            }
+          },
+          {
+            "description": "A sensitive parameter takes no value in phase 1: required must be false and there is no default.",
+            "if": {
+              "required": [
+                "sensitive"
+              ],
+              "properties": {
+                "sensitive": {
+                  "const": true
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "required": {
+                  "const": false
+                }
+              },
+              "not": {
+                "required": [
+                  "default"
+                ]
+              }
+            }
+          },
+          {
+            "description": "text and long_text: default is a string of at most max_len characters.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "text",
+                    "long_text"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "string",
+                  "maxLength": 4000
+                }
+              }
+            }
+          },
+          {
+            "description": "text without max_len: default is at most 200 characters.",
+            "if": {
+              "required": [
+                "type",
+                "default"
+              ],
+              "properties": {
+                "type": {
+                  "const": "text"
+                }
+              },
+              "not": {
+                "required": [
+                  "max_len"
+                ]
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "maxLength": 200
+                }
+              }
+            }
+          },
+          {
+            "description": "text: default is one line.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "text"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "not": {
+                    "pattern": "\\n"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "description": "enum: default is one of options.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "enum"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "description": "boolean: default is true or false.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "boolean"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          {
+            "description": "integer: default is an integer.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "integer"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          {
+            "description": "timezone: default is UTC or an IANA zone name such as Asia/Singapore.",
+            "if": {
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "const": "timezone"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "default": {
+                  "$ref": "#/$defs/timezone"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "starter_tasks": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": [
+          "title",
+          "prompt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "pattern": "\\S"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "pattern": "\\S",
+            "not": {
+              "description": "Instruction field: no {{ placeholders.",
+              "pattern": "\\{\\{"
+            }
+          }
+        }
+      }
+    },
+    "card": {
+      "type": "object",
+      "required": [
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "\\S"
+        },
+        "capabilities": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "\\S"
+          }
+        },
+        "limitations": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "\\S"
+          }
+        },
+        "guardrails": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "\\S"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "pattern": "\\S"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "description": "Lowercase UUID.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "description": "64 lowercase hex characters.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "key": {
+      "description": "Lowercase letter, then lowercase letters, digits or _; at most 32. Unique within its array (server-only).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$"
+    },
+    "timezone": {
+      "description": "UTC or an IANA zone name such as Asia/Singapore.",
+      "type": "string",
+      "pattern": "^(UTC|[A-Z][A-Za-z_]+(/[A-Z][A-Za-z0-9_+\\-]+){1,2})$"
+    }
+  }
+}

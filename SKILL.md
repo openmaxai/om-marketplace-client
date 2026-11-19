@@ -1,6 +1,6 @@
 ---
 name: om-marketplace-client
-version: 0.11.1
+version: 0.12.0
 description: >-
   Agent Market client. Use it when a task needs a capability this Agent lacks:
   search the organization's Agent Market for skills (market-client search) and
@@ -306,12 +306,13 @@ the market, do it directly; no confirmation card is needed.
   their interpreter (`bash scripts/run.sh`, `node scripts/run.js`).
   Run `market-client submit-skill <dir> --dry-run`, fix what it reports, then
   `market-client submit-skill <dir> [--personal] [--changelog <text>] [--examples <file>]`.
-- Expert template: write a manifest JSON (`schema_version: 1`,
-  `kind: "expert_template"`, a new `id` slug, `role` with `name`,
-  `instructions`, one-line `duty`, and `skills` with pinned versions of
-  listed skills, `[]` for none). Run
-  `market-client submit-template <file> --dry-run`, then without `--dry-run`
-  (with `--personal` when it is for the owner only).
+- Expert template: write a manifest JSON (see "Expert template manifest"
+  below). Always run `market-client submit-template <file> --dry-run` first:
+  it checks the manifest locally against the market's schema, then asks the
+  market to run every publish check, and submits nothing. It lists every
+  problem at once with its JSON pointer; fix them all, run it again until it
+  passes, then submit without `--dry-run` (with `--personal` when it is for
+  the owner only, `--icon-preset <id>` for an icon).
 - Tell your owner the result; the command ends with a suggested reply.
   `--personal`: on the owner's personal shelf, only the owner can use it,
   no review, for example
@@ -338,13 +339,98 @@ the market, do it directly; no confirmation card is needed.
 - `market-client submissions` lists what you submitted (review state as of
   submission).
 
+## Expert template manifest
+
+A JSON object; unknown keys are refused. Lengths count characters (a CJK
+character is 1). "Text" = a string that is not blank. Every string must be
+NFC, without invisible or control characters (line breaks are fine) and
+without credentials. Instruction fields (`persona`, `instructions`, `duty`,
+`boundary`, `first_guide`, trigger `prompt`, SOP `title` and `steps`, starter
+task `prompt`) must not contain `{{`. A `key` is `^[a-z][a-z0-9_]{0,31}$`,
+unique within its list.
+
+- `schema_version`: `1`; `kind`: `"expert_template"`; `id`: new slug
+  (lowercase letters and digits, single hyphens, at most 64); `version`
+  (optional): semver such as `1.0.0`, no `+build`.
+- `role` (required): `name` text <= 100; `instructions` text <= 32000;
+  `duty` text <= 2000, up to 20 lines, no blank first or last line, no two
+  blank lines in a row; optional `persona` text <= 2000 and `boundary` (as
+  `duty`). Role lines plus the session text must fit about 8000 tokens.
+- `skills` (required, `[]` for none, <= 20): `{skill_id, skill_version_id,
+  package_sha256}` of a listed skill version (lowercase UUIDs, 64 hex).
+- `first_guide`: text <= 20000, shown to the adopter only.
+- `connectors` (<= 10): `{app, purpose, required}`; `app`
+  `^[a-z][a-z0-9_-]{0,63}$`, `purpose` text <= 2000, `required` boolean.
+- `triggers` (<= 10): `{key, title <= 40, prompt <= 1000, schedule: {cron,
+  timezone}}`; `cron` 5 fields of digits `* / , -`; `timezone` `UTC` or an
+  IANA name such as `Asia/Singapore`.
+- `sop` (<= 30): `{key, title <= 200, steps: 1-30 texts <= 2000}`.
+- `knowledge` (<= 20): `{key, title <= 200, sha256, size 1-1048576}` of an
+  uploaded knowledge file.
+- `customizable_fields` (<= 30): `{key, label <= 100, type, required,
+  sensitive?, options?, max_len?, default?, include_agents?}`. `type` is
+  `text`, `long_text`, `enum`, `boolean`, `integer`, `timezone` or `member`.
+  `options` (1-50 unique texts <= 100) only and always for `enum`. `max_len`
+  (1-4000; default 200 for `text`, 4000 for `long_text`) only for those two.
+  `default` must fit the type (`text` one line, an `enum` default one of its
+  options). `sensitive: true` takes no value: `required` must be false and no
+  `default`. `member` (a member of the adopting org) has no `default`, is
+  never sensitive, and `include_agents: true` lets Agents be chosen too
+  (`include_agents` is only for `member`).
+- `starter_tasks` (<= 10): `{title <= 40, prompt <= 1000}`; no request for
+  credentials, no commands to read secrets or send data out.
+- `card`: `{summary <= 500, capabilities?, limitations?, guardrails?
+  (each <= 20 texts <= 200), tags? (<= 4 texts <= 32)}`.
+- The icon is not in the manifest: pass `--icon-preset <id>` (`expert-service`,
+  `expert-growth`, `expert-report`, `expert-creative`, `expert-listing`,
+  `expert-select`, `expert-global`, `expert-compliance`). Uploaded icons are
+  for people in the workspace.
+
+Minimal:
+
+```json
+{"schema_version": 1, "kind": "expert_template", "id": "inbox-helper",
+ "role": {"name": "Inbox Helper", "instructions": "Triage the inbox every morning.", "duty": "Inbox triage."},
+ "skills": []}
+```
+
+Every field:
+
+```json
+{"schema_version": 1, "kind": "expert_template", "id": "exec-assistant", "version": "1.2.0",
+ "role": {"name": "Executive Assistant", "persona": "A calm, precise assistant.",
+  "instructions": "Triage the inbox every morning and draft replies for review.",
+  "duty": "Inbox triage.\nScheduling.", "boundary": "No payments."},
+ "first_guide": "Tell me which mailbox to start with.",
+ "skills": [{"skill_id": "0190b7c4-0000-7000-8000-000000000001", "skill_version_id": "0190b7c4-0000-7000-8000-000000000002",
+  "package_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+ "connectors": [{"app": "gmail", "purpose": "Read the inbox", "required": true}],
+ "triggers": [{"key": "morning_digest", "title": "Morning digest", "prompt": "Summarise new mail.",
+  "schedule": {"cron": "0 8 * * 1-5", "timezone": "Asia/Singapore"}}],
+ "sop": [{"key": "triage", "title": "Triage", "steps": ["Read new mail.", "Label it."]}],
+ "knowledge": [{"key": "faq", "title": "FAQ", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 12}],
+ "customizable_fields": [
+  {"key": "lang", "label": "Language", "type": "enum", "required": true, "options": ["en", "zh"], "default": "en"},
+  {"key": "signature", "label": "Signature", "type": "text", "required": false, "max_len": 50},
+  {"key": "notes", "label": "Notes", "type": "long_text", "required": false},
+  {"key": "api_token", "label": "API token", "type": "text", "required": false, "sensitive": true},
+  {"key": "digest_size", "label": "Digest size", "type": "integer", "required": false, "default": 10},
+  {"key": "cc_me", "label": "CC me", "type": "boolean", "required": false, "default": true},
+  {"key": "zone", "label": "Time zone", "type": "timezone", "required": false, "default": "Asia/Singapore"},
+  {"key": "approver", "label": "Approver", "type": "member", "required": true, "include_agents": false}],
+ "starter_tasks": [{"title": "Triage today", "prompt": "Triage today's inbox."}],
+ "card": {"summary": "Keeps your inbox under control.", "capabilities": ["Triage mail"], "limitations": ["No calls"],
+  "guardrails": ["Drafts only"], "tags": ["office", "mail"]}}
+```
+
 ## Commands
 
 `market-client start | status | sync | rollback <slug> | enable <slug> | disable <slug> | uninstall <slug>`,
 `market-client search | install-permission | request-install | install-requests | confirm-install | decline-install`,
 `market-client submit-skill <dir> | submit-template <file> | submissions` (add `--json` for
-machine-readable output; `--dry-run` checks a submission locally only; `--personal` keeps it
-to the owner's personal shelf).
+machine-readable output; `--dry-run` submits nothing: it checks a skill locally, and a template
+locally and then with the market; `--personal` keeps it to the owner's personal shelf;
+`--icon-preset <id>` sets a template's icon).
 `zylos add om-marketplace-client --json` returns before the post-install hook and
 the service start; run `market-client start` after it. `start` runs the
 post-install hook (an existing config is kept), starts the pm2 service when it
