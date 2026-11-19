@@ -446,16 +446,17 @@ chance. It is always on; there is no setting to turn it off.
    30-minute cooldown and apart from the 4 automatic requests, at most 12
    retries per UTC day. A change merged while no session followed the last
    request (for example a hire right after a removal) gets the same retry.
-   At most 3 requests per change. A request after which the runtime status
-   reported a model API problem (`health` not `ok`: rate limit or quota,
-   overload, server or authentication error) and no session followed is not
-   counted toward these 3: the session could not start, so the change was never
-   tried. The next request still waits for an idle, healthy runtime. At most 12
-   requests are given back per UTC day (`api_error_refunds`); past that they
-   count as before. Then the alert
+   At most 3 requests per change. After the third, the alert
    `template_activation_stuck` is raised and starter messages held for the
    change are released at once (see [Starter message](#starter-message)); the
-   record stays pending and a later session still confirms it. A record pending for 24 hours raises
+   record stays pending and a later session still confirms it. A request is not
+   counted toward these 3 when, during its 5-minute confirm wait (from when it
+   was delivered), the runtime status reported `health` not `ok` (rate limited,
+   unavailable, authentication failed) and no session followed: the session
+   could not start, so the change was never tried. The next request still waits
+   for an idle, healthy runtime. A change that is already stuck gets nothing
+   back. At most 12 requests are given back per UTC day (`api_error_refunds`);
+   past that they count as before. A record pending for 24 hours raises
    `template_activation_pending_24h`.
 6. A rewrite of the bundle the current session already shows needs no session;
    it is reported as activated at once.
