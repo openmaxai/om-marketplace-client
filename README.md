@@ -469,7 +469,7 @@ The message is still sent at most once (the claim, and the client message id
 8. When the recipient is not the adopter (an org admin hired the expert on
    someone else's Agent) and the result is `sent`, the adopter gets one short
    plain-text confirmation in their own DM with this Agent, after the same DM
-   check: `已为 {owner} 的 Agent 聘用「{expert}」` and, on a second line,
+   check: `已为 {owner} 的 Agent 聘用「{expert}」` and, after a blank line,
    `Hired “{expert}” for {owner}'s Agent` (`renderHired` in
    `src/starter/render.js`; the owner's name is the cleaned name used in the
    greeting). It is sent as `AGENT_TEXT` with client message id

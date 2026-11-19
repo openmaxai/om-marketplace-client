@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-19
+
+### Fixed
+- Hired confirmation: the Chinese and English lines are now separated by a
+  blank line, so web chat Markdown no longer joins them into one line.
+
 ## [0.11.0] - 2026-11-18
 
 ### Changed
