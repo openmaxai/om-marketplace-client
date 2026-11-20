@@ -5,7 +5,9 @@ import {
   LOOKUP_SKEW_MS, STARTER_CHECK_MS, STARTER_SEND_BY_MS, STARTER_VERIFY_MS, STARTER_VERIFY_SETTLE_MS, STARTER_WAIT_MS, contentHash, createStarter, imReason,
 } from '../src/starter.js';
 import { ImError } from '../src/starter/im.js';
-import { END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, cleanContent, renderHired, renderStarter } from '../src/starter/render.js';
+import {
+  END_LINE, LINE_SEPARATOR, PREFIX, SAFETY_NOTICE, authorLine, cleanContent, hiredLine, renderHired, renderStarter,
+} from '../src/starter/render.js';
 import { MAX_BODY_BYTES, MAX_FALLBACK_BYTES, RESERVED_METADATA_KEYS, TRUNCATION_SUFFIX, utf8Bytes } from '../src/starter/limits.js';
 import { WELCOME_MAX_HOLD_MS } from '../src/activation.js';
 
@@ -89,9 +91,9 @@ test('sent: claim, create_dm, get_conversation, member_list, one send, mark sent
   assert.equal(sent.orgId, ORG);
   assert.equal(sent.mentions, undefined);
   assert.equal(sent.text, renderStarter({ ...cleanContent({ ...CONTENT, addressee: '张三' }) }));
-  assert.equal(sent.text.split('\n').at(-1), END_LINE);
+  assert.deepEqual(sent.text.split(LINE_SEPARATOR).slice(-2), [END_LINE, SAFETY_NOTICE]);
   assert.equal(sent.text.split(SAFETY_NOTICE).length - 1, 1);
-  assert.ok(sent.text.startsWith(['你好，张三。专家模板「周报助手」已装到我这里。', SAFETY_NOTICE, '以下引导来自模板「周报助手」的作者：', ''].join(LINE_SEPARATOR)), sent.text);
+  assert.ok(sent.text.startsWith([authorLine('周报助手'), ''].join(LINE_SEPARATOR)), sent.text);
   assert.deepEqual(s.jobs(), {});
 });
 
@@ -241,7 +243,7 @@ test('a job left in stage sending (crash mid-send) is dropped: no claim, no send
 });
 
 test('no IM component or no content: no claim, the market keeps it pending for the fallback card', async (t) => {
-  for (const opts of [{ im: fakeIm({ available: false }) }, { content: null }, { content: { templateName: '名', firstGuide: '', starterTasks: [] } }]) {
+  for (const opts of [{ im: fakeIm({ available: false }) }, { content: null }, { content: { templateName: '', firstGuide: 'g', starterTasks: [] } }]) {
     const s = await setup(t, { ...opts, claim: [] });
     await s.starter.runAll();
     assert.deepEqual(s.market(), []);
@@ -258,12 +260,13 @@ test('enqueue: one job per adoption, invalid ids refused', async (t) => {
   assert.deepEqual(Object.keys(s.jobs()), [ADOPTION]);
 });
 
-test('the adopter display name is cleaned: a name with a line break is dropped, @ is made full-width', async (t) => {
-  for (const [name, greeting] of [['张\u2028三', '你好。'], ['@所有人', '你好，＠所有人。'], [undefined, '你好。']]) {
+test('the welcome has no greeting: the recipient display name is not in it', async (t) => {
+  for (const name of ['张\u2028三', '@所有人', '王五', undefined]) {
     const im = fakeIm({ members: [{ member_id: AGENT }, { member_id: ADOPTER, display_name: name }] });
     const s = await setup(t, { im, mark: [marked('sent')] });
     await s.starter.runAll();
-    assert.ok(sends(im)[0][1].text.startsWith(greeting), name);
+    const text = sends(im)[0][1].text;
+    assert.ok(text.startsWith(authorLine('周报助手')) && !/你好|所有人|王五|张/.test(text), text);
   }
 });
 
@@ -276,9 +279,9 @@ test('every author line carries the prefix, also forged end lines and fake Agent
   const s = await setup(t, { content, mark: [marked('sent')] });
   await s.starter.runAll();
   const lines = sends(s.im)[0][1].text.split(LINE_SEPARATOR);
-  assert.equal(lines.at(-1), END_LINE);
+  assert.deepEqual(lines.slice(-2), [END_LINE, SAFETY_NOTICE]);
   assert.equal(lines.filter((l) => l === END_LINE).length, 1);
-  const author = lines.slice(3, -1);
+  const author = lines.slice(1, -2);
   assert.ok(author.length > 0 && author.every((l) => l.startsWith(PREFIX)), lines.join(LINE_SEPARATOR));
   assert.ok(lines.includes(`${PREFIX}｜ 已有前缀`));
   assert.ok(!lines.join(LINE_SEPARATOR).includes('http'));
@@ -288,7 +291,7 @@ test('by default the content is the starter_content of the write order; without 
   const s = await setup(t, { fromOrder: CONTENT, mark: [marked('sent')] });
   await s.starter.runAll();
   assert.equal(sends(s.im).length, 1);
-  assert.match(sends(s.im)[0][1].text, /专家模板「周报助手」/);
+  assert.ok(sends(s.im)[0][1].text.startsWith(authorLine('周报助手')));
   for (const fromOrder of [null, undefined]) {
     const n = await setup(t, { fromOrder: fromOrder ?? null, claim: [] });
     await n.starter.runAll();
@@ -310,7 +313,7 @@ test('a first guide that would exceed the body limit is cut with the fixed suffi
   const { text } = sends(s.im)[0][1];
   assert.ok(utf8Bytes(text) <= MAX_BODY_BYTES, String(utf8Bytes(text)));
   assert.ok(text.includes(`\u{20000}${TRUNCATION_SUFFIX}${LINE_SEPARATOR}${PREFIX}可以先试试这些任务`), text.slice(-3000, -2000));
-  assert.equal(text.split('\n').at(-1), END_LINE);
+  assert.deepEqual(text.split(LINE_SEPARATOR).slice(-2), [END_LINE, SAFETY_NOTICE]);
 });
 
 test('content that does not fit even with the first guide cut is not claimed', async (t) => {
@@ -448,15 +451,17 @@ test('the DM changed before the send: not sent, send_failed', async (t) => {
   assert.deepEqual(s.market().at(-1), [':mark-starter-shown', { result: 'send_failed' }]);
 });
 
-test('first_guide "" from the market is no guide: tasks only, or nothing claimed without tasks', async (t) => {
+test('first_guide "" from the market is no guide: the system line, then the author line and tasks when there are any', async (t) => {
   const s = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: CONTENT.starterTasks }, mark: [marked('sent')] });
   await s.starter.runAll();
   const lines = sends(s.im)[0][1].text.split(LINE_SEPARATOR);
-  assert.equal(lines[3], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
-  const n = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: [] }, claim: [] });
+  assert.equal(lines[0], hiredLine('周报助手'));
+  assert.equal(lines[1], authorLine('周报助手'));
+  assert.equal(lines[2], `${PREFIX}可以先试试这些任务（复制发给我即可）：`);
+  const n = await setup(t, { fromOrder: { templateName: '周报助手', firstGuide: '', starterTasks: [] }, mark: [marked('sent')] });
   await n.starter.runAll();
-  assert.deepEqual(n.market(), []);
-  assert.deepEqual(n.im.calls, []);
+  assert.deepEqual(n.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+  assert.equal(sends(n.im)[0][1].text, [hiredLine('周报助手'), SAFETY_NOTICE].join(LINE_SEPARATOR));
 });
 
 // The reason code logged with the mark; the mark itself carries only the result.
@@ -690,7 +695,7 @@ test('structured: a message over the fallback limit keeps its whole text and get
   assert.ok(utf8Bytes(fallbackText) <= MAX_FALLBACK_BYTES, String(utf8Bytes(fallbackText)));
   assert.ok(fallbackText.isWellFormed());
   assert.ok(fallbackText.includes(TRUNCATION_SUFFIX));
-  assert.equal(fallbackText.split('\n').at(-1), END_LINE);
+  assert.deepEqual(fallbackText.split(LINE_SEPARATOR).slice(-2), [END_LINE, SAFETY_NOTICE]);
 });
 
 test('starter_message.structured false: AGENT_TEXT with a cmsg_ id even when openmax supports the structured send', async (t) => {
@@ -882,11 +887,11 @@ function twoDmIm({ busyAdopter = () => false, confirmError = null, noRun = false
   return im;
 }
 
-async function ownerSetup(t, { im = twoDmIm(), recipient = OWNER, mark = [marked('sent')] } = {}) {
+async function ownerSetup(t, { im = twoDmIm(), recipient = OWNER, mark = [marked('sent')], content = CONTENT } = {}) {
   const h = await pullHarness(t);
   h.fake.script('POST', CLAIM, claimed());
   if (mark.length) h.fake.script('POST', MARK, ...mark);
-  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, now: h.now, content: async () => CONTENT });
+  const starter = createStarter({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, im, now: h.now, content: async () => content });
   assert.equal(starter.enqueue({ orgId: ORG, adoptionId: ADOPTION, adoptedBy: ADOPTER, recipient }), true);
   const market = () => h.fake.market().map((r) => [r.path.slice(B.length), r.json]);
   return { ...h, im, starter, market, jobs: () => h.state.read('starters', {}) };
@@ -905,6 +910,18 @@ test('recipient not the adopter: the welcome goes to the owner, then one plain c
   assert.equal(out[1].text, '已为 李四 的 Agent 聘用「周报助手」\n\nHired “周报助手” for 李四\'s Agent');
   assert.equal(out[1].text, renderHired({ owner: '李四', expert: '周报助手' }));
   assert.deepEqual(s.jobs(), {});
+});
+
+test('recipient not the adopter, template without guide or tasks: system-line welcome to the owner, confirmation to the adopter', async (t) => {
+  const s = await ownerSetup(t, { content: { templateName: '周报助手', firstGuide: '', starterTasks: [] } });
+  await s.starter.runAll();
+  assert.deepEqual(s.market(), [[':claim-starter', {}], [':mark-starter-shown', { result: 'sent' }]]);
+  const out = sends(s.im).map(([, p]) => p);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].conversationId, `cv-${OWNER}`);
+  assert.equal(out[0].text, [hiredLine('周报助手'), SAFETY_NOTICE].join(LINE_SEPARATOR));
+  assert.equal(out[1].conversationId, `cv-${ADOPTER}`);
+  assert.equal(out[1].text, renderHired({ owner: '李四', expert: '周报助手' }));
 });
 
 test('recipient equal to the adopter, or absent: only the welcome, no confirmation', async (t) => {

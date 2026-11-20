@@ -177,15 +177,19 @@ const prefixed = (text) => authorLines(text).map((l) => PREFIX + l);
 // each starter task, as its own paragraph; plain-text channels only see the extra spacing.
 export const LINE_SEPARATOR = '\n\n';
 
-// The message text of filtered content: SAFETY_NOTICE once after the greeting, every line of author text starts with
-// PREFIX and END_LINE is the last line; lines are separated by LINE_SEPARATOR.
+// authorLine heads any author text (first guide or starter tasks); hiredLine is the intro when there is no first guide.
+export const authorLine = (name) => `来自模板「${name}」的作者：`;
+export const hiredLine = (name) => `已聘用「${name}」，生效后就能用`;
+
+// The message text of filtered content: hiredLine when there is no first guide, then authorLine once above the author
+// text (first guide, then starter tasks) when there is any; every line of author text starts with PREFIX and is followed
+// by END_LINE; SAFETY_NOTICE is the last line. Lines are separated by LINE_SEPARATOR.
 export function renderStarter(clean) {
   const name = clean.templateName;
-  const lines = [
-    `你好${clean.addressee ? `，${clean.addressee}` : ''}。专家模板「${name}」已装到我这里。`,
-    SAFETY_NOTICE,
-    `以下引导来自模板「${name}」的作者：`,
-  ];
+  const authored = Boolean(clean.firstGuide || clean.starterTasks.length);
+  const lines = [];
+  if (!clean.firstGuide) lines.push(hiredLine(name));
+  if (authored) lines.push(authorLine(name));
   if (clean.firstGuide) lines.push(...prefixed(clean.firstGuide));
   if (clean.starterTasks.length) {
     lines.push(`${PREFIX}可以先试试这些任务（复制发给我即可）：`);
@@ -196,7 +200,8 @@ export function renderStarter(clean) {
       lines.push(PREFIX + head + (first ?? ''), ...rest.map((l) => PREFIX + l));
     });
   }
-  lines.push(END_LINE);
+  if (authored) lines.push(END_LINE);
+  lines.push(SAFETY_NOTICE);
   return lines.join(LINE_SEPARATOR);
 }
 
@@ -208,7 +213,8 @@ export function renderHired({ owner, expert }) {
   return zh + LINE_SEPARATOR + en;
 }
 
-export const hasContent = (clean) => Boolean(clean.templateName && (clean.firstGuide || clean.starterTasks.length));
+// A template name is enough: without a first guide or starter tasks the message is hiredLine only.
+export const hasContent = (clean) => Boolean(clean.templateName);
 
 // Stands in for the adopter's name before it is known: the longest a cleaned name can be in UTF-8 bytes.
 export const ADDRESSEE_RESERVE = '\u{20000}'.repeat(LIMITS.addressee);
@@ -253,11 +259,16 @@ export function cutToBytes(text, maxBytes) {
 
 // The fallback text of the starter message rendered from clean for addressee: the whole message when it is at most
 // maxFallbackBytes, otherwise the message with first_guide cut as fitContent cuts it for that size; when even that
-// does not fit, the message itself cut to the size. The result is always within maxFallbackBytes.
+// does not fit, the message before SAFETY_NOTICE cut to the size, still followed by SAFETY_NOTICE. The result is always
+// within maxFallbackBytes.
 export function fitFallback(clean, addressee, { maxFallbackBytes = MAX_FALLBACK_BYTES } = {}) {
   const text = renderStarter({ ...clean, addressee });
   if (utf8Bytes(text) <= maxFallbackBytes) return text;
   const fitted = fitContent(clean, { maxBodyBytes: maxFallbackBytes });
   const short = fitted && renderStarter({ ...fitted, addressee });
-  return short && utf8Bytes(short) <= maxFallbackBytes ? short : cutToBytes(text, maxFallbackBytes);
+  if (short && utf8Bytes(short) <= maxFallbackBytes) return short;
+  const tail = LINE_SEPARATOR + SAFETY_NOTICE;
+  const body = text.slice(0, -tail.length);
+  const room = maxFallbackBytes - utf8Bytes(tail);
+  return room > 0 ? cutToBytes(body, room) + tail : cutToBytes(text, maxFallbackBytes);
 }
