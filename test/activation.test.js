@@ -8,7 +8,7 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, DAILY_WELCOME_REQUESTS, IDLE_MIN_SECONDS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
-  DAILY_RETRY_REQUESTS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
+  DAILY_RETRY_REQUESTS, DAILY_UPDATE_REQUESTS, HOURLY_UPDATE_REQUESTS, UPDATE_REQUEST_INTERVAL_MS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { createStarter } from '../src/starter.js';
@@ -1415,4 +1415,177 @@ test('stuck: a new change after stuck that goes stuck itself releases its own me
   assert.equal(seen.at(-1), 'stuck');
   assert.equal(f.controls.length, 2 * MAX_REQUESTS);
   assert.deepEqual(s.sent, [`mkt-starter-${A1}`, `mkt-starter-${A2}`]);
+});
+
+// A write the user ordered (template update or switch).
+const userWritten = (f, a, id = A1, s = S1) => {
+  f.adopt(id, s);
+  a.recordWrite({ adoptionId: id, renderedSha: s, at: new Date(f.clock.t).toISOString(), userInitiated: true });
+};
+
+test('update: a user-ordered write is asked for at once on an Agent idle 30 s, not held back by the 30-minute cooldown', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  // An automatic request 10 minutes earlier, confirmed: its cooldown runs.
+  written(f, a, A1, S1);
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  await session(f, a, [[A1, S1]]);
+  f.advance(10 * 60 * 1000);
+  userWritten(f, a, A1, S2);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.controls.length, 2);
+  const doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.update_requests.length, doc.welcome_requests.length], [1, 1, 0]);
+  await session(f, a, [[A1, S2]]);
+  assert.equal(f.pending(), null);
+});
+
+test('update: an automatic write keeps the idle path (5 minutes idle, two samples)', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'busy');
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  const doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.update_requests.length], [1, 0]);
+});
+
+for (const [name, over, opts] of [
+  ['a busy runtime', { state: 'busy' }],
+  ['a tool running', { active_tools: 1 }],
+  ['idle less than 30 s', { idle_seconds: 29 }],
+  ['an open OpenMax turn', {}, { turn: () => true }],
+  ['the OpenMax turn state unreadable', {}, { turn: () => new Error('no activity store') }],
+]) {
+  test(`update: no quick request with ${name}`, async (t) => {
+    const f = await harness(t, opts);
+    const a = f.make();
+    userWritten(f, a);
+    for (let i = 0; i < 4; i++) {
+      f.status({ idle_seconds: 30, ...over });
+      assert.equal(await a.tick(), 'busy');
+      f.advance(ACTIVATION_CHECK_MS);
+    }
+    assert.deepEqual(f.controls, []);
+  });
+}
+
+test('update: writes within the interval share one request', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a, A1, S1);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(60 * 1000);
+  userWritten(f, a, A2, S2);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'waiting');
+  assert.equal(f.controls.length, 1);
+  await session(f, a, [[A1, S1], [A2, S2]]);
+  assert.equal(f.state.read('activation', null).update_requests.length, 1);
+});
+
+test('update: a write inside the interval after a confirmed request waits for the interval, then is asked for', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a, A1, S1);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  await session(f, a, [[A1, S1]]);
+  f.advance(ACTIVATION_CHECK_MS);
+  userWritten(f, a, A1, S2);
+  const t0 = Date.parse(f.state.read('activation', null).update_requests[0]);
+  while (f.clock.t - t0 < UPDATE_REQUEST_INTERVAL_MS) {
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.tick(), 'busy');
+    f.advance(ACTIVATION_CHECK_MS);
+  }
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.controls.length, 2);
+});
+
+test(`update: at most ${HOURLY_UPDATE_REQUESTS} quick requests an hour; past it the change falls back to the idle path`, async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  for (let i = 0; i < HOURLY_UPDATE_REQUESTS; i++) {
+    userWritten(f, a, A1, sha(`u${i}`));
+    f.status({ idle_seconds: 30 });
+    assert.equal(await a.tick(), 'requested');
+    await session(f, a, [[A1, sha(`u${i}`)]]);
+    f.advance(5 * 60 * 1000);
+  }
+  userWritten(f, a, A1, sha('over'));
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'busy');
+  assert.equal(f.controls.length, HOURLY_UPDATE_REQUESTS);
+  // The automatic rules still apply: 5 minutes idle, two samples, on the automatic budget.
+  assert.deepEqual(await f.twoTicks(a), ['sampled', 'requested']);
+  let doc = f.state.read('activation', null);
+  assert.deepEqual([doc.update_requests.length, doc.requests.length], [HOURLY_UPDATE_REQUESTS, 1]);
+  await session(f, a, [[A1, sha('over')]]);
+  // An hour after the first quick request the budget allows one again.
+  const first = Date.parse(doc.update_requests[0]);
+  f.clock.t = first + 60 * 60 * 1000;
+  userWritten(f, a, A1, sha('later'));
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  doc = f.state.read('activation', null);
+  assert.equal(doc.update_requests.length, HOURLY_UPDATE_REQUESTS + 1);
+});
+
+test(`update: at most ${DAILY_UPDATE_REQUESTS} quick requests a UTC day`, async (t) => {
+  const f = await harness(t);
+  f.advance(20 * 60 * 60 * 1000);
+  const a = f.make();
+  const used = Array.from({ length: DAILY_UPDATE_REQUESTS }, (_, i) => new Date(f.clock.t - (2 + i) * 60 * 60 * 1000 / 2).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, update_requests: used }));
+  userWritten(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'busy');
+  assert.deepEqual(f.controls, []);
+  // The next UTC day the quick path is back.
+  f.clock.t = Date.parse('2026-10-17T00:00:30Z');
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+});
+
+test('update: the automatic budget used up does not block a quick request, and a quick request leaves it alone', async (t) => {
+  const f = await harness(t);
+  f.advance(12 * 60 * 60 * 1000);
+  const a = f.make();
+  const used = Array.from({ length: DAILY_REQUESTS }, (_, i) => new Date(f.clock.t - i * 1000).toISOString());
+  f.state.update('activation', {}, (d) => ({ ...d, requests: used }));
+  userWritten(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  const doc = f.state.read('activation', null);
+  assert.deepEqual([doc.requests.length, doc.update_requests.length], [DAILY_REQUESTS, 1]);
+});
+
+test('update: a quick request with no session after it is made again after the confirm wait, up to MAX_REQUESTS', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONFIRM_WAIT_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.controls.length, 2);
+  assert.equal(f.pending().request_count, 2);
+});
+
+test('update: the user mark survives a restart', async (t) => {
+  const f = await harness(t);
+  userWritten(f, f.make());
+  const b = f.make();
+  f.status({ idle_seconds: 30 });
+  assert.equal(await b.tick(), 'requested');
+  assert.equal(f.pending().user, true);
 });

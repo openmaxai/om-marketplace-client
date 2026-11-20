@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-11-19
+
+### Fixed
+- Hired confirmation: the Chinese and English lines are now separated by a
+  blank line, so web chat Markdown no longer joins them into one line.
+- Template activation: a template update or switch the user ordered no longer
+  waits for the automatic idle path (5 minutes idle, 30-minute cooldown, 4 a
+  day). Like a hire with a starter message, its new session is asked for as
+  soon as the Agent has been idle 30 seconds with no open OpenMax turn, on a
+  budget of its own: at least 2 minutes apart, at most 3 in any 60 minutes and
+  12 per UTC day (`update_requests`). Past that budget the change falls back
+  to the automatic rules. Every write order counts as user-ordered: the market
+  creates them only for a hire, an update or a switch. A removal alone keeps
+  the automatic rules.
+- Template activation: when the openmax CLI is missing, the client now logs
+  once that OpenMax turns are not checked before a new session is requested.
+  README describes the turn check as it works: only a turn openmax's activity
+  index still lists counts, not every turn of the last 10 minutes.
+
 ## [0.11.0] - 2026-11-18
 
 ### Changed

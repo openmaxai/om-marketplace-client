@@ -25,6 +25,15 @@ export const DAILY_REQUESTS = 4;
 export const WELCOME_REQUEST_INTERVAL_MS = 2 * 60 * 1000;
 // ... and at most this many per UTC day (loop protection).
 export const DAILY_WELCOME_REQUESTS = 12;
+// A template update or switch the user ordered (a write order without a starter message) is asked for the same way, on
+// a budget of its own: at least this long between two (changes closer together share one request), ...
+export const UPDATE_REQUEST_INTERVAL_MS = 2 * 60 * 1000;
+// ... at most this many in any 60 minutes ...
+export const HOURLY_UPDATE_REQUESTS = 3;
+export const UPDATE_REQUEST_WINDOW_MS = 60 * 60 * 1000;
+// ... and this many per UTC day. Past these the change waits for the automatic rules (IDLE_MIN_SECONDS,
+// REQUEST_COOLDOWN_MS, DAILY_REQUESTS).
+export const DAILY_UPDATE_REQUESTS = 12;
 // How long a delivered request is given to show up as a new session before it is made again.
 export const CONFIRM_WAIT_MS = 5 * 60 * 1000;
 // A request made while no session followed the last one (a retry) does not wait REQUEST_COOLDOWN_MS; at most this
@@ -50,7 +59,9 @@ const HISTORY_KEEP_MS = 2 * 24 * 60 * 60 * 1000;
 // Control queue states in which the request may still be delivered.
 const OUTSTANDING = new Set(['pending', 'running']);
 const EPOCH = new Date(0).toISOString();
-const EMPTY = Object.freeze({ pending: null, passive: null, requests: [], welcome_requests: [], retry_requests: [], backfilled: false });
+const EMPTY = Object.freeze({
+  pending: null, passive: null, requests: [], welcome_requests: [], update_requests: [], retry_requests: [], backfilled: false,
+});
 
 export const defaultStatusFile = (zylosDir) => path.join(zylosDir, 'activity-monitor', 'agent-status.json');
 export const controlScript = (zylosDir) => path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
@@ -125,18 +136,19 @@ const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
 const validTarget = (x) => x && isCanonicalUuid(x.adoption_id) && isSha256Hex(x.rendered_sha256);
 const isList = Array.isArray;
 
-// State document `activation`: {pending, passive, requests, welcome_requests, retry_requests, backfilled}.
+// State document `activation`: {pending, passive, requests, welcome_requests, update_requests, retry_requests, backfilled}.
 // pending is the one record of this Agent, {pending_since, written_at, targets: [{adoption_id, rendered_sha256}],
-// removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id], stuck_at} or
-// null. written_at is the last change merged in; control_id the control queue item of the last request (null once it
-// left the queue or when the enqueue's outcome is unknown); delivered_at when it was first seen delivered; seen_at the
-// last marker that did not confirm the record; welcome the adoptions whose starter message is held until the record is
-// confirmed (the check keeps asking on the starter budget while no request is in flight); stuck_at when MAX_REQUESTS
+// removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id], user,
+// stuck_at} or null. written_at is the last change merged in; control_id the control queue item of the last request
+// (null once it left the queue or when the enqueue's outcome is unknown); delivered_at when it was first seen
+// delivered; seen_at the last marker that did not confirm the record; welcome the adoptions whose starter message is
+// held until the record is confirmed (the check keeps asking on the starter budget while no request is in flight);
+// user true once a write the user ordered was merged in (asked for on update_requests); stuck_at when MAX_REQUESTS
 // requests brought no session, which releases those messages.
 // passive holds the adoptions written before 0.6.0 ({targets, seen_at}); they are confirmed by the next session that
 // shows them but never cause a request. requests lists the times of automatic new-session requests, welcome_requests
-// those made for starter messages, retry_requests automatic ones made while no session followed the last request;
-// each has its own budget and none counts against another.
+// those made for starter messages, update_requests those made for user-ordered writes, retry_requests automatic ones
+// made while no session followed the last request; each has its own budget and none counts against another.
 // im: the openmax IM (available(), openTurn()); flush(): sends the urgent reconcile queue; control: the control queue.
 export function createActivation({
   state, dataDir, zylosDir, logger, im = null, flush = async () => null, now = Date.now,
@@ -153,6 +165,7 @@ export function createActivation({
       passive: q && typeof q === 'object' && isList(q.targets) && q.targets.length ? q : null,
       requests: times(d?.requests),
       welcome_requests: times(d?.welcome_requests),
+      update_requests: times(d?.update_requests),
       retry_requests: times(d?.retry_requests),
       backfilled: d?.backfilled === true,
     };
@@ -166,6 +179,7 @@ export function createActivation({
   });
   let sampledAt = null;
   let turnWarned = false;
+  let imWarned = false;
 
   function clearAlerts() {
     state.clearAlert(STUCK_ALERT);
@@ -243,14 +257,20 @@ export function createActivation({
   }
 
   // True when the Agent may be asked for a new session: the runtime status (fresh) shows it healthy and idle for
-  // minIdle seconds with no tool running, and no OpenMax turn is open (also one that ended with a reply within the
-  // last 10 minutes). The control queue holds requests while the runtime is not healthy.
+  // minIdle seconds with no tool running, and no OpenMax turn is open: a run openmax still lists in its active index
+  // (open, or closed on its reply while its turn lasts, 10 minutes at most). A turn that has ended is no longer listed,
+  // and without the openmax CLI, or with no active index, no turn is seen; then only the runtime status decides.
+  // The control queue holds requests while the runtime is not healthy.
   // idleState says 'idle', 'busy', or 'unknown' when the runtime status or the turn state cannot be read.
   async function idleState(minIdle) {
     const s = readRuntimeStatus(statusFile, now());
     if (!s) return 'unknown';
     if (s.state !== 'idle' || s.active_tools !== 0 || !(Number(s.idle_seconds) >= minIdle) || (s.health ?? 'ok') !== 'ok') return 'busy';
-    if (!im?.available()) return 'idle';
+    if (!im?.available()) {
+      if (!imWarned) logger.info('activation: openmax CLI not found; OpenMax turns are not checked before a new session is requested');
+      imWarned = true;
+      return 'idle';
+    }
     try {
       return (await im.openTurn()) ? 'busy' : 'idle';
     } catch (err) {
@@ -261,18 +281,21 @@ export function createActivation({
   }
   const idle = async (minIdle) => (await idleState(minIdle)) === 'idle';
 
-  // The interval since the last request of the list has passed and its daily cap is not reached.
+  // The interval since the last request of the list has passed and neither its daily nor its hourly cap is reached.
   const BUDGETS = {
     requests: [REQUEST_COOLDOWN_MS, DAILY_REQUESTS],
     welcome_requests: [WELCOME_REQUEST_INTERVAL_MS, DAILY_WELCOME_REQUESTS],
+    update_requests: [UPDATE_REQUEST_INTERVAL_MS, DAILY_UPDATE_REQUESTS, HOURLY_UPDATE_REQUESTS],
     retry_requests: [0, DAILY_RETRY_REQUESTS],
   };
   function allowed(d, list) {
     const requests = d[list];
-    const [gap, cap] = BUDGETS[list];
+    const [gap, cap, hourly = Infinity] = BUDGETS[list];
     const t = now();
-    const last = Math.max(-Infinity, ...requests.map((x) => Date.parse(x)).filter((x) => x <= t));
-    return t - last >= gap && requests.filter((x) => utcDay(Date.parse(x)) === utcDay(t)).length < cap;
+    const at = requests.map((x) => Date.parse(x));
+    const last = Math.max(-Infinity, ...at.filter((x) => x <= t));
+    return t - last >= gap && at.filter((x) => utcDay(x) === utcDay(t)).length < cap
+      && at.filter((x) => t - x < UPDATE_REQUEST_WINDOW_MS).length < hourly;
   }
 
   // True while the record's last request may still bring a session that has every change merged so far: it is still in
@@ -297,6 +320,9 @@ export function createActivation({
 
   // True while a starter message is held until the record is confirmed.
   const welcomeWaits = (p) => isList(p?.welcome) && p.welcome.some((id) => p.targets.some((x) => x.adoption_id === id));
+
+  // The budgets of the quick requests: a held starter message, or a write the user ordered.
+  const QUICK = { welcome: 'welcome_requests', update: 'update_requests' };
 
   // Follows the last request in the control queue: 'outstanding' while it may still be delivered (also when its state
   // cannot be read), otherwise its id is dropped (the first time it is seen delivered is kept as delivered_at).
@@ -324,13 +350,15 @@ export function createActivation({
     return 'gone';
   }
 
-  // True when a request may be made now; checked again inside the update that counts it. A request for a starter
-  // message (welcome) is checked on its own budget and is not made while the last one is still in flight; it does not
-  // wait CONFIRM_WAIT_MS after a request whose session already started.
-  function mayRequest(d, welcome = false) {
+  // True when a request may be made now; checked again inside the update that counts it. A quick request (kind
+  // 'welcome' for a starter message, 'update' for a write the user ordered) is checked on its own budget and is not made
+  // while the last one is still in flight; it does not wait CONFIRM_WAIT_MS after a request whose session already
+  // started.
+  function mayRequest(d, kind = null) {
     const p = d.pending;
     if (!p || Number.isSafeInteger(p.control_id) || p.request_count >= MAX_REQUESTS) return false;
-    if (welcome) return allowed(d, 'welcome_requests') && !inFlight(p);
+    if (kind === 'update' && p.user !== true) return false;
+    if (kind) return allowed(d, QUICK[kind]) && !inFlight(p);
     if (!allowed(d, autoList(p))) return false;
     return !(p.requested_at && now() - Math.max(Date.parse(p.requested_at), Date.parse(p.delivered_at ?? '') || 0) < CONFIRM_WAIT_MS);
   }
@@ -339,18 +367,18 @@ export function createActivation({
   // that checks it may be made, so a request that lost to another one is skipped. It is counted before it is enqueued
   // (a crash in between loses it rather than enqueueing it twice). A refused enqueue is taken back unless a newer
   // change reset the count meanwhile; one whose outcome is unknown (timeout) stays counted and is waited for.
-  // welcome: the request is for a starter message and counted in welcome_requests; otherwise in requests, or in
-  // retry_requests when no session followed the last request.
+  // kind: 'welcome' counts the request in welcome_requests, 'update' in update_requests; otherwise it is counted in
+  // requests, or in retry_requests when no session followed the last request.
   let chain = Promise.resolve();
-  function request(why, welcome = false) {
+  function request(why, kind = null) {
     let list = null;
     const run = async () => {
       if ((await followControl(read().pending)) === 'outstanding') return 'waiting';
       const at = iso();
       let taken = null;
       save((d) => {
-        if (!mayRequest(d, welcome)) return;
-        list = welcome ? 'welcome_requests' : autoList(d.pending);
+        if (!mayRequest(d, kind)) return;
+        list = kind ? QUICK[kind] : autoList(d.pending);
         taken = { requested_at: d.pending.requested_at, delivered_at: d.pending.delivered_at ?? null, count: d.pending.request_count + 1 };
         Object.assign(d.pending, { requested_at: at, request_count: taken.count, control_id: null, delivered_at: null });
         d[list] = [...d[list].filter((x) => now() - Date.parse(x) < HISTORY_KEEP_MS), at];
@@ -487,8 +515,13 @@ export function createActivation({
     if (!cur) return 'none';
     // A held starter message: asked for on the starter budget as soon as it allows and the Agent is idle
     // QUICK_IDLE_SECONDS; otherwise the automatic rules below apply.
-    if (welcomeWaits(cur) && mayRequest(read(), true) && (await idle(QUICK_IDLE_SECONDS))) {
-      const r = await request('starter message', true);
+    if (welcomeWaits(cur) && mayRequest(read(), 'welcome') && (await idle(QUICK_IDLE_SECONDS))) {
+      const r = await request('starter message', 'welcome');
+      if (r !== 'skipped') return r;
+    }
+    // A write the user ordered (update, switch): the same, on its own budget. Past it the automatic rules apply.
+    if (mayRequest(read(), 'update') && (await idle(QUICK_IDLE_SECONDS))) {
+      const r = await request('template update by the user', 'update');
       if (r !== 'skipped') return r;
     }
     if (cur.requested_at && t - Math.max(Date.parse(cur.requested_at), Date.parse(cur.delivered_at ?? '') || 0) < CONFIRM_WAIT_MS) return 'waiting';
@@ -522,8 +555,9 @@ export function createActivation({
     ACTIVATION_CHECK_MS,
     // A template write the market accepted: the adoption must show up with this rendered bundle. A rewrite of the
     // bundle the current session already shows (per the latest marker, with no change of it waiting) needs no session:
-    // it is reported as activated at once.
-    recordWrite({ adoptionId, renderedSha, at }) {
+    // it is reported as activated at once. userInitiated: the user ordered the write (the record then takes the quick
+    // requests on update_requests).
+    recordWrite({ adoptionId, renderedSha, at, userInitiated = false }) {
       if (!validTarget({ adoption_id: adoptionId, rendered_sha256: renderedSha })) return 'invalid';
       const p = read().pending;
       const waiting = p?.targets.some((x) => x.adoption_id === adoptionId) || p?.removed.includes(adoptionId);
@@ -541,6 +575,7 @@ export function createActivation({
         if (cur?.rendered_sha256 === renderedSha && Date.parse(at) <= Date.parse(q.written_at)) return;
         q.targets = [...q.targets.filter((x) => x.adoption_id !== adoptionId), { adoption_id: adoptionId, rendered_sha256: renderedSha }];
         q.removed = q.removed.filter((x) => x !== adoptionId);
+        if (userInitiated) q.user = true;
       });
       return 'pending';
     },
@@ -594,7 +629,7 @@ export function createActivation({
         st = await idleState(QUICK_IDLE_SECONDS);
         if (st === 'unknown') return null;
         if (st === 'idle') {
-          const r = await request('starter message', true);
+          const r = await request('starter message', 'welcome');
           // Held also when another request won meanwhile.
           const q = read().pending;
           if (!has(q)) return null;

@@ -902,7 +902,7 @@ test('recipient not the adopter: the welcome goes to the owner, then one plain c
   assert.equal(out[0].text, renderStarter({ ...cleanContent({ ...CONTENT, addressee: '李四' }) }));
   assert.equal(out[1].conversationId, `cv-${ADOPTER}`);
   assert.equal(out[1].clientMsgId, HIRED);
-  assert.equal(out[1].text, '已为 李四 的 Agent 聘用「周报助手」\nHired “周报助手” for 李四\'s Agent');
+  assert.equal(out[1].text, '已为 李四 的 Agent 聘用「周报助手」\n\nHired “周报助手” for 李四\'s Agent');
   assert.equal(out[1].text, renderHired({ owner: '李四', expert: '周报助手' }));
   assert.deepEqual(s.jobs(), {});
 });
@@ -970,4 +970,9 @@ test('the confirmation waits while the adopter DM has a run, and gives up after 
     assert.equal(confirmations.length, clear ? 1 : 0);
     assert.deepEqual(s.jobs(), {});
   }
+});
+
+test('renderHired separates the zh and en lines with LINE_SEPARATOR', () => {
+  assert.equal(renderHired({ owner: '李四', expert: '周报助手' }), `已为 李四 的 Agent 聘用「周报助手」${LINE_SEPARATOR}Hired “周报助手” for 李四's Agent`);
+  assert.equal(renderHired({ owner: '', expert: '周报助手' }), `已为负责人的 Agent 聘用「周报助手」${LINE_SEPARATOR}Hired “周报助手” for the owner's Agent`);
 });

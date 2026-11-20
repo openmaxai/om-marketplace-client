@@ -201,11 +201,11 @@ export function renderStarter(clean) {
 }
 
 // The adopter's confirmation when the starter message went to the Agent's owner; owner and expert are cleaned names
-// ("" when unknown).
+// ("" when unknown). The two lines are joined by LINE_SEPARATOR so Markdown renderers keep them apart.
 export function renderHired({ owner, expert }) {
   const zh = owner ? `已为 ${owner} 的 Agent 聘用「${expert}」` : `已为负责人的 Agent 聘用「${expert}」`;
   const en = owner ? `Hired “${expert}” for ${owner}'s Agent` : `Hired “${expert}” for the owner's Agent`;
-  return `${zh}\n${en}`;
+  return zh + LINE_SEPARATOR + en;
 }
 
 export const hasContent = (clean) => Boolean(clean.templateName && (clean.firstGuide || clean.starterTasks.length));
