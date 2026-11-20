@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-20
+
 ### Changed
 - Starter message: one intro only. Without a first guide the message starts
   with `已聘用「<name>」，生效后就能用`. Any author text (first guide, starter
