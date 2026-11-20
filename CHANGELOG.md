@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-20
+
 ### Changed
 - Starter message: one intro only. Without a first guide the message starts
   with `已聘用「<name>」，生效后就能用`. Any author text (first guide, starter
@@ -15,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Starter message: a template with neither a first guide nor starter tasks is
   now claimed and sent (system line and safety notice only), and the hired
   confirmation still goes to the adopter when the adopter is not the owner.
+
+### Fixed
+- Template activation: a new-session request during whose confirm wait (5 minutes
+  from delivery) the runtime reported a model API problem (status `health` not
+  `ok`: rate limited, unavailable, authentication failed) and no session followed
+  no longer counts toward the 3 requests per change. A shared quota running out
+  or an API outage therefore no longer drives every Agent waiting for activation
+  into `template_activation_stuck` (and releases its held starter message early);
+  the change is asked for again once the runtime is healthy and idle. A problem
+  while the request is still queued or after the wait, or on a change already
+  stuck, gives nothing back. At most 12 such requests are given back per UTC day
+  (`api_error_refunds`); past that they count as before (#66).
 
 ## [0.12.0] - 2026-11-20
 
