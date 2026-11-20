@@ -1,59 +1,39 @@
-// Local shape check of an expert template manifest before upload. The market runs the full validation (text limits,
-// credential and unsafe-instruction scans, inject budget); this catches the mistakes an author makes most often.
+// Local check of an expert template manifest before upload, against the market's manifest schema (structure: every
+// field, type, limit and allowed value). Text rules the schema cannot express (NFC, invisible characters, credential and
+// unsafe-instruction scans, inject budget, references to listed skills) are checked by the market; `--dry-run` asks it.
 import fs from 'node:fs';
-import { validSemver, validSlug } from '../pkg/frontmatter.js';
 import { SubmitError } from './pack.js';
+import { readPinnedSchema } from './schema/pin.js';
+import { createChecker } from './schema/check.js';
 
 export const MAX_MANIFEST_BYTES = 256 << 10;
-const TOP_REQUIRED = ['schema_version', 'kind', 'id', 'role', 'skills'];
-const TOP_OPTIONAL = ['version', 'connectors', 'triggers', 'sop', 'knowledge', 'customizable_fields', 'starter_tasks', 'card', 'first_guide'];
-const ROLE_REQUIRED = ['name', 'instructions', 'duty'];
-const ROLE_OPTIONAL = ['persona', 'boundary'];
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const SHA = /^[0-9a-f]{64}$/;
+// Preset icons of expert templates, in display order.
+export const EXPERT_ICON_PRESETS = ['expert-service', 'expert-growth', 'expert-report', 'expert-creative', 'expert-listing',
+  'expert-select', 'expert-global', 'expert-compliance'];
 
-const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const nonEmpty = (v) => typeof v === 'string' && v.trim() !== '';
+let checker = null;
+const check = (m) => {
+  checker ??= createChecker(readPinnedSchema());
+  return checker(m);
+};
 
-function keys(o, ptr, required, optional, problems) {
-  const allowed = new Set([...required, ...optional]);
-  for (const k of required) if (!(k in o)) problems.push(`${ptr}/${k}: missing_field`);
-  for (const k of Object.keys(o)) if (!allowed.has(k)) problems.push(`${ptr}/${k}: unknown_field`);
+// Every problem as {pointer, reason, message} (empty when the manifest passes the schema).
+export function manifestProblems(m) {
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) {
+    return [{ pointer: '', reason: 'malformed', message: 'the manifest must be a JSON object' }];
+  }
+  return check(m);
 }
 
-// Returns the problems as "<JSON pointer>: <reason>" lines (empty when the shape is fine).
+export const problemLine = (p) => `${p.pointer || '(manifest)'}: ${p.reason}${p.message ? ` (${p.message})` : ''}`;
+
+// The problems as "<JSON pointer>: <reason> (<what is expected>)" lines.
 export function checkManifest(m) {
-  const problems = [];
-  if (!isObject(m)) return [': malformed (the manifest must be a JSON object)'];
-  keys(m, '', TOP_REQUIRED, TOP_OPTIONAL, problems);
-  if ('schema_version' in m && m.schema_version !== 1) problems.push('/schema_version: bad_value (must be 1)');
-  if ('kind' in m && m.kind !== 'expert_template') problems.push('/kind: bad_value (must be "expert_template")');
-  if ('id' in m && !(typeof m.id === 'string' && validSlug(m.id))) problems.push('/id: bad_value (lowercase letters, digits and hyphens)');
-  if ('version' in m && !(typeof m.version === 'string' && validSemver(m.version))) problems.push('/version: bad_value (semver such as 1.0.0)');
-  if ('role' in m) {
-    if (!isObject(m.role)) problems.push('/role: bad_value (must be an object)');
-    else {
-      keys(m.role, '/role', ROLE_REQUIRED, ROLE_OPTIONAL, problems);
-      for (const k of ROLE_REQUIRED) if (k in m.role && !nonEmpty(m.role[k])) problems.push(`/role/${k}: bad_value (non-empty text)`);
-      for (const k of ['duty', 'boundary']) {
-        if (typeof m.role[k] === 'string' && /[\r\n]/.test(m.role[k])) problems.push(`/role/${k}: bad_value (one line)`);
-      }
-    }
-  }
-  if ('skills' in m) {
-    if (!Array.isArray(m.skills) || m.skills.length > 20) problems.push('/skills: bad_value (array of at most 20)');
-    else {
-      m.skills.forEach((s, i) => {
-        if (!isObject(s) || !UUID.test(s.skill_id) || !UUID.test(s.skill_version_id) || !SHA.test(s.package_sha256)) {
-          problems.push(`/skills/${i}: bad_value ({skill_id, skill_version_id, package_sha256} of a listed skill version)`);
-        }
-      });
-    }
-  }
-  return problems;
+  return manifestProblems(m).map(problemLine);
 }
 
-// Reads and checks a manifest file; returns { manifest, raw }. Throws SubmitError('manifest_invalid', ...).
+// Reads and checks a manifest file; returns { manifest, raw }. Throws SubmitError('manifest_invalid', ...) carrying
+// every problem in err.problems.
 export function readManifest(file) {
   let raw;
   try { raw = fs.readFileSync(file); } catch { throw new SubmitError('not_found', `${file} cannot be read`); }
@@ -62,7 +42,20 @@ export function readManifest(file) {
   try { manifest = JSON.parse(raw.toString('utf8')); } catch (err) {
     throw new SubmitError('manifest_invalid', `manifest is not valid JSON: ${err.message}`);
   }
-  const problems = checkManifest(manifest);
-  if (problems.length) throw new SubmitError('manifest_invalid', `manifest invalid:\n  ${problems.join('\n  ')}`);
+  const problems = manifestProblems(manifest);
+  if (problems.length) {
+    const err = new SubmitError('manifest_invalid', `manifest invalid (${problems.length} problem${problems.length === 1 ? '' : 's'}):\n  ${problems.map(problemLine).join('\n  ')}`);
+    err.problems = problems;
+    throw err;
+  }
   return { manifest, raw };
+}
+
+// The icon field of templates:publish for a preset id. Only the form is checked here; the market decides which ids
+// exist (EXPERT_ICON_PRESETS are the ones it had when this client was released).
+export function presetIcon(id) {
+  if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
+    throw new SubmitError('icon_invalid', `--icon-preset takes a preset id such as ${EXPERT_ICON_PRESETS.join(', ')}`);
+  }
+  return { kind: 'preset', preset_id: id };
 }

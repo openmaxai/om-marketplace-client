@@ -119,11 +119,82 @@ export async function submitSkill({
   };
 }
 
-export async function submitTemplate({ http, orgId, manifest, changelog = null, categoryId = null, scope = null, sleep = realSleep }) {
+// The body templates:publish and templates:validate take; icon is {kind: "preset", preset_id} or null (none sent).
+function templateBody({ manifest, changelog, categoryId, icon, scope }) {
   const body = { manifest };
   if (changelog != null) body.changelog = changelog;
   if (categoryId != null) body.category_id = categoryId;
+  if (icon != null) body.icon = icon;
   if (scope != null) body.scope = scope;
+  return body;
+}
+
+const MAX_FAILURES = 100;
+const text = (v, max) => (typeof v === 'string' && v.length <= max ? v : null);
+
+// One failure the market reported for a manifest (templates:validate errors[], or a TEMPLATE_MANIFEST_INVALID
+// problem's errors[]): {code, reason, pointer, index, rule, rule_class, sentence}; null when it is not one.
+export function manifestFailure(e, code = null) {
+  if (!isObject(e)) return null;
+  const reason = text(e.reason, 64);
+  const c = text(e.code, 64) ?? code;
+  if (!reason && !c) return null;
+  return {
+    code: c, reason, pointer: text(e.field, 256), index: Number.isSafeInteger(e.index) ? e.index : null,
+    rule: text(e.rule, 64), rule_class: text(e.rule_class, 64), sentence: text(e.sentence, 1000),
+  };
+}
+
+// "<pointer>: <reason> ..." for one failure; text the market echoes is quoted as data.
+export function failureLine(f) {
+  const where = f.pointer ?? (f.index != null ? `/skills (item ${f.index})` : '(request)');
+  const what = f.reason ?? f.code ?? 'invalid';
+  const tail = [
+    f.code && f.code !== 'TEMPLATE_MANIFEST_INVALID' ? f.code : null,
+    f.rule ? `rule ${f.rule}` : null,
+    f.rule_class ? `unsafe instruction ${f.rule_class}` : null,
+  ].filter(Boolean).join(', ');
+  return `${where}: ${what}${tail ? ` (${tail})` : ''}${f.sentence ? ` ${marketQuote(f.sentence)}` : ''}`;
+}
+
+// templates:validate: every check of templates:publish, nothing written. Returns {ok, failures, manifest_sha256,
+// inject_tokens}.
+export async function validateTemplate({ http, orgId, manifest, changelog = null, categoryId = null, icon = null, scope = null, sleep = realSleep }) {
+  const label = 'market POST /templates:validate';
+  const body = templateBody({ manifest, changelog, categoryId, icon, scope });
+  const d = (await scoped(scope, () => retrying(() => http.request('POST', orgId, '/templates:validate', body), sleep))).data;
+  if (!isObject(d) || typeof d.ok !== 'boolean' || !Array.isArray(d.errors)) throw shape(label, 'is not a validation result');
+  const failures = d.errors.slice(0, MAX_FAILURES).map((e) => manifestFailure(e)).filter(Boolean);
+  if (d.ok !== (d.errors.length === 0) || failures.length !== Math.min(d.errors.length, MAX_FAILURES)) {
+    throw shape(label, 'is not a validation result');
+  }
+  return {
+    ok: d.ok, failures, manifest_sha256: typeof d.manifest_sha256 === 'string' && /^[0-9a-f]{64}$/.test(d.manifest_sha256) ? d.manifest_sha256 : null,
+    inject_tokens: Number.isSafeInteger(d.inject_tokens) ? d.inject_tokens : null,
+  };
+}
+
+// A market or route without templates:validate for Agents: 404 / 405, or the 403 a market answered an Agent with
+// before Agents could validate (no reason). Such a market cannot check the manifest; publish still checks it.
+export function validateUnavailable(err) {
+  return err instanceof MarketError && (err.status === 404 || err.status === 405
+    || (err.status === 403 && err.code === 'AGENT_UPLOAD_DISABLED' && !err.reason));
+}
+
+// The manifest failures of a refused publish: its errors[] when the market lists them, else the single top-level one.
+export function publishFailures(err) {
+  if (!(err instanceof MarketError) || err.code !== 'TEMPLATE_MANIFEST_INVALID') return [];
+  const listed = (err.errors ?? []).slice(0, MAX_FAILURES).map((e) => manifestFailure(e, err.code)).filter((f) => f?.reason);
+  if (listed.length) return listed;
+  const x = err.extra ?? {};
+  return [manifestFailure({ reason: err.reason, field: x.field, index: x.index, rule: x.rule, rule_class: x.rule_class, sentence: x.sentence }, err.code)]
+    .filter(Boolean);
+}
+
+export async function submitTemplate({
+  http, orgId, manifest, changelog = null, categoryId = null, icon = null, scope = null, sleep = realSleep,
+}) {
+  const body = templateBody({ manifest, changelog, categoryId, icon, scope });
   const d = (await scoped(scope, () => retrying(() => http.request('POST', orgId, '/templates:publish', body), sleep))).data;
   if (!isObject(d) || !isCanonicalUuid(d.template_id) || !isCanonicalUuid(d.template_version_id)) {
     throw shape('market POST /templates:publish', 'has no template version');
@@ -187,10 +258,13 @@ export function explainSubmitError(err) {
       if (err.reason === 'existing_skill') return 'refused: a skill with this name already exists in the organization. An Agent can only create new skills: rename it (SKILL.md name) or ask a person to upload a new version in the workbench';
       if (err.reason === 'existing_template') return 'refused: an expert template with this id already exists. An Agent can only create new templates: change the manifest id or ask a person to publish a new version in the workbench';
       return 'refused: Agent submissions are turned off in this market';
-    case 'TEMPLATE_MANIFEST_INVALID':
+    case 'TEMPLATE_MANIFEST_INVALID': {
+      const all = publishFailures(err);
+      if (all.length > 1) return `manifest refused (${all.length} problems):\n  ${all.map(failureLine).join('\n  ')}`;
       if (x.rule_class) return `manifest refused: unsafe instruction (${x.rule_class})${at}${x.sentence ? ` ${marketQuote(x.sentence)}` : ''}`;
       if (err.reason === 'version_not_greater') return `manifest refused: version must be greater than ${x.previous_version ?? 'the existing one'}`;
       return `manifest refused: ${err.reason ?? 'invalid'}${at}${x.rule ? ` (rule ${x.rule})` : ''}`;
+    }
     case 'TEMPLATE_REF_INVALID':
       return `manifest refused: a referenced skill or knowledge file is not usable (${err.reason ?? 'invalid'})${at}`;
     case 'PACKAGE_UNSAFE':

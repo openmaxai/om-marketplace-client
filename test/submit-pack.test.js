@@ -55,14 +55,20 @@ const MANIFEST = {
   skills: [],
 };
 
-test('template manifest shape check names each problem by JSON pointer', () => {
+test('template manifest check names every problem by JSON pointer', () => {
   assert.deepEqual(checkManifest(MANIFEST), []);
-  const p = checkManifest({ ...MANIFEST, kind: 'x', extra: 1, role: { name: '', instructions: 'i', duty: 'a\nb' }, skills: [{}] });
+  assert.deepEqual(checkManifest({ ...MANIFEST, role: { ...MANIFEST.role, duty: 'Writes reports.\nFiles them.' } }), [], 'duty may span lines');
+  const p = checkManifest({ ...MANIFEST, kind: 'x', extra: 1, role: { name: '', instructions: 'i', duty: 'a\n\n\nb' }, skills: [{}] });
   assert.deepEqual(p.sort(), [
-    '/extra: unknown_field', '/kind: bad_value (must be "expert_template")', '/role/duty: bad_value (one line)',
-    '/role/name: bad_value (non-empty text)', '/skills/0: bad_value ({skill_id, skill_version_id, package_sha256} of a listed skill version)',
+    '/extra: unknown_field (not a manifest field)',
+    '/kind: bad_value (must be "expert_template")',
+    '/role/duty: bad_value (no two blank lines in a row)',
+    '/role/name: bad_value (must not be blank)',
+    '/skills/0/package_sha256: missing_field (required)',
+    '/skills/0/skill_id: missing_field (required)',
+    '/skills/0/skill_version_id: missing_field (required)',
   ]);
-  assert.deepEqual(checkManifest([]), [': malformed (the manifest must be a JSON object)']);
+  assert.deepEqual(checkManifest([]), ['(manifest): malformed (the manifest must be a JSON object)']);
 });
 
 test('readManifest reports unreadable, non-JSON and invalid files', () => {

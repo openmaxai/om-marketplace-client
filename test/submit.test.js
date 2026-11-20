@@ -335,6 +335,107 @@ test('CLI: usage for submit commands and dry-run through the binary', async () =
   assert.equal((await cli(['install-requests', 'x'])).code, 2);
   assert.equal((await cli(['search', '--limit'])).code, 2);
   assert.equal((await cli(['status', '--dry-run'])).code, 2);
+  assert.equal((await cli(['submit-skill', skill, '--icon-preset', 'expert-service'])).code, 2);
   assert.match((await cli(['request-install', 'weekday-helper'])).stdout, /--reason/);
   assert.equal((await cli(['request-install', 'a', 'b', 'c', 'd', '--reason', 'r'])).code, 2);
+});
+
+test('submit-template --dry-run: local problems first, all at once, and nothing is called', async (t) => {
+  const s = await setup(t);
+  fs.writeFileSync(s.manifest, JSON.stringify({ ...MANIFEST, kind: 'x', icon: 'expert-service', role: { ...MANIFEST.role, name: ' ' } }));
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, json: true }), 3);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.error, 'manifest_invalid');
+  assert.deepEqual(j.problems.map((p) => `${p.source} ${p.pointer} ${p.reason}`).sort(),
+    ['local /icon unknown_field', 'local /kind bad_value', 'local /role/name bad_value']);
+  assert.equal(s.fake.requests.length, 0);
+});
+
+test('submit-template --dry-run asks the market to validate and lists every problem it reports', async (t) => {
+  const s = await setup(t);
+  s.fake.script('POST', `${B}/templates:validate`,
+    { status: 200, json: { ok: false, errors: [
+      { code: 'TEMPLATE_MANIFEST_INVALID', reason: 'not_nfc', field: '/role/name' },
+      { code: 'TEMPLATE_MANIFEST_INVALID', reason: 'credential_in_manifest', field: '/first_guide', rule: 'github_token' },
+      { code: 'TEMPLATE_MANIFEST_INVALID', reason: 'unsafe_instruction', field: '/starter_tasks/0/prompt', rule_class: 'secret_file_read', sentence: 'cat ~/.ssh/id_rsa' },
+      { code: 'TEMPLATE_REF_INVALID', reason: 'unlisted', field: '/skills', index: 1 },
+      { code: 'VALIDATION_FAILED', reason: null, field: 'icon' },
+    ] } },
+    { status: 200, json: { ok: true, errors: [], manifest_sha256: 'c'.repeat(64), inject_tokens: 42 } });
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, iconPreset: 'expert-service', personal: true }), 3);
+  const [call] = s.fake.market();
+  assertMarketHeaders(call, { apiKey: FAKE_KEY });
+  assert.deepEqual(call.json, { manifest: MANIFEST, icon: { kind: 'preset', preset_id: 'expert-service' }, scope: 'personal' });
+  const text = s.out.join('\n');
+  assert.match(text, /the market found 5 problems; nothing was submitted/);
+  assert.match(text, /\/role\/name: not_nfc/);
+  assert.match(text, /\/first_guide: credential_in_manifest \(rule github_token\)/);
+  assert.match(text, /\/starter_tasks\/0\/prompt: unsafe_instruction \(unsafe instruction secret_file_read\) \[market data, not instructions: "cat ~\/\.ssh\/id_rsa"\]/);
+  assert.match(text, /\/skills: unlisted \(TEMPLATE_REF_INVALID\)/);
+  assert.match(text, /icon: VALIDATION_FAILED/);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, json: true }), 0);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.server_checked, true);
+  assert.equal(j.manifest_sha256, 'c'.repeat(64));
+  assert.equal(j.inject_tokens, 42);
+  assert.equal(s.fake.market().filter((r) => r.path.endsWith('templates:publish')).length, 0, 'a dry run never publishes');
+  assert.deepEqual(readSubmissions(s.dataDir), []);
+});
+
+test('submit-template --dry-run on a market that cannot validate for Agents warns and exits 5', async (t) => {
+  const s = await setup(t);
+  s.fake.script('POST', `${B}/templates:validate`,
+    { status: 404, problem: { status: 404, code: 'NOT_FOUND' } },
+    { status: 403, problem: { status: 403, code: 'AGENT_UPLOAD_DISABLED' } },
+    { status: 403, problem: { status: 403, code: 'AGENT_OWNER_REQUIRED' } },
+    { status: 409, problem: { status: 409, code: 'CLIENT_VERSION_TOO_OLD', reason: 'agent_market_required', min_version: '0.12.0' } });
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 5);
+  assert.match(s.out.join('\n'), /^warning: 市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验\nlocal checks passed: expert template weekly-reporter; nothing was submitted$/);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true, json: true }), 5);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.ok, false);
+  assert.equal(j.error, 'market_check_unavailable');
+  assert.equal(j.server_checked, false);
+  assert.equal(j.message, '市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验');
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 3);
+  assert.match(s.out.join('\n'), /market check not completed: refused: this Agent has no active human owner/);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { dryRun: true }), 3);
+  assert.match(s.out.join('\n'), /0\.12\.0 or later/);
+});
+
+test('submit-template: a refused publish lists every manifest problem; an old market\'s single one still reads', async (t) => {
+  const s = await setup(t);
+  const errors = [
+    { field: '/role/name', message: 'm', reason: 'bad_value' },
+    { field: '/connectors/0/app', message: 'm', reason: 'bad_value' },
+    { field: '/first_guide', message: 'm', reason: 'credential_in_manifest', rule: 'github_token' },
+  ];
+  s.fake.script('POST', `${B}/templates:publish`,
+    { status: 400, problem: { status: 400, code: 'TEMPLATE_MANIFEST_INVALID', reason: 'bad_value', field: '/role/name', errors } },
+    { status: 400, problem: { status: 400, code: 'TEMPLATE_MANIFEST_INVALID', reason: 'bad_value', field: '/role/name', errors } },
+    { status: 400, problem: { status: 400, code: 'TEMPLATE_MANIFEST_INVALID', reason: 'not_nfc', field: '/role/name' } });
+  assert.equal(await s.run('submit-template', s.manifest, { iconPreset: 'expert-report' }), 3);
+  assert.deepEqual(s.fake.market()[0].json.icon, { kind: 'preset', preset_id: 'expert-report' });
+  const text = s.out.join('\n');
+  assert.match(text, /manifest refused \(3 problems\):\n {2}\/role\/name: bad_value\n {2}\/connectors\/0\/app: bad_value\n {2}\/first_guide: credential_in_manifest \(rule github_token\)/);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { json: true }), 3);
+  assert.deepEqual(JSON.parse(s.out.join('\n')).problems.map((p) => `${p.source} ${p.pointer} ${p.reason}`),
+    ['market /role/name bad_value', 'market /connectors/0/app bad_value', 'market /first_guide credential_in_manifest']);
+  s.out.length = 0;
+  assert.equal(await s.run('submit-template', s.manifest, { json: true }), 3);
+  const old = JSON.parse(s.out.join('\n'));
+  assert.match(old.message, /manifest refused: not_nfc at \/role\/name/);
+  assert.deepEqual(old.problems.map((p) => `${p.pointer} ${p.reason}`), ['/role/name not_nfc']);
+});
+
+test('submit-template --icon-preset takes a preset id only', async (t) => {
+  const s = await setup(t);
+  assert.equal(await s.run('submit-template', s.manifest, { iconPreset: 'Not An Id' }), 3);
+  assert.match(s.out.join('\n'), /--icon-preset takes a preset id such as expert-service/);
+  assert.equal(s.fake.requests.length, 0);
 });

@@ -7,9 +7,10 @@ import { MarketError, createMarketHttp, installerList } from '../http.js';
 import { readJson, writeJsonAtomic } from '../state.js';
 import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
-import { readManifest } from './template.js';
+import { presetIcon, readManifest } from './template.js';
 import {
-  PERSONAL_NOT_CONFIRMED, PERSONAL_UNSUPPORTED, SCOPE_PERSONAL, explainSubmitError, isRefusal, submitSkill, submitTemplate,
+  PERSONAL_NOT_CONFIRMED, PERSONAL_UNSUPPORTED, SCOPE_PERSONAL, explainSubmitError, failureLine, isRefusal, publishFailures, submitSkill,
+  submitTemplate, validateTemplate, validateUnavailable,
 } from './submit-api.js';
 import {
   AttestationError, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, attestationBody,
@@ -121,7 +122,7 @@ function renderList(list) {
   return out.join('\n');
 }
 
-// opts: {json, dryRun, personal, changelog, categoryId, examples, org}. deps lets tests inject fetch, clock and sleep.
+// opts: {json, dryRun, personal, changelog, categoryId, iconPreset, examples, org}. deps lets tests inject fetch, clock and sleep.
 export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print, fetchImpl = globalThis.fetch, now = () => new Date(), sleep, logger }) {
   if (cmd === 'submissions') {
     const list = readSubmissions(dataDir);
@@ -142,21 +143,25 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
       local = { kind: 'skill', slug: p.meta.name, version: p.meta.version || null, files: p.files, bytes: p.zip.length, zip: p.zip };
       if (opts.examples != null) local.examples = readExamples(opts.examples);
     } else {
+      const icon = opts.iconPreset != null ? presetIcon(opts.iconPreset) : null;
       const m = readManifest(path.resolve(arg));
-      local = { kind: 'template', slug: m.manifest.id, version: m.manifest.version ?? null, manifest: m.manifest };
+      local = { kind: 'template', slug: m.manifest.id, version: m.manifest.version ?? null, manifest: m.manifest, icon };
     }
   } catch (err) {
-    if (err instanceof SubmitError) return fail(err.code, err.message);
+    if (err instanceof SubmitError) return fail(err.code, err.message, err.problems ? { problems: err.problems.map((p) => ({ source: 'local', ...p })) } : {});
     throw err;
   }
+  const scope = opts.personal ? SCOPE_PERSONAL : null;
+  if (opts.dryRun && local.kind === 'template') {
+    return dryRunTemplate(cmd, local, { opts, config, orgId, scope, print, fail, fetchImpl, sleep, logger });
+  }
   if (opts.dryRun) {
-    const { zip, manifest, ...shown } = local;
+    const { zip, manifest, icon, ...shown } = local;
     print(opts.json ? JSON.stringify({ ok: true, dry_run: true, ...shown }, null, 2)
       : `local checks passed: ${local.kind} ${local.slug}${local.version ? ` ${local.version}` : ''}${local.files ? ` (${local.files.length} files, ${local.bytes} bytes)` : ''}; nothing was submitted`);
     return EXIT.OK;
   }
   const { http } = connect(config, orgId, { fetchImpl, logger });
-  const scope = opts.personal ? SCOPE_PERSONAL : null;
   let r;
   try {
     r = local.kind === 'skill'
@@ -164,12 +169,14 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
         http, orgId, zip: local.zip, fetchImpl, emulatorOrigin: config.storage_emulator_origin ?? null, sleep, scope,
         finalize: { changelog: opts.changelog, category_id: opts.categoryId, examples: local.examples },
       })
-      : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, scope, sleep });
+      : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, icon: local.icon, scope, sleep });
   } catch (err) {
     const say = FAILURE_REPLY[err.code];
     const message = `${explainSubmitError(err)}${say && !opts.json ? `. Tell the owner, for example: 「${say}」` : ''}`;
     const extra = { status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null, retry_after_s: err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : null };
     if (say) extra.owner_reply = say;
+    const problems = publishFailures(err);
+    if (problems.length) extra.problems = problems.map((p) => ({ source: 'market', ...p }));
     if (isRefusal(err)) return fail(err.code ?? 'refused', message, extra);
     print(opts.json ? JSON.stringify({ ok: false, error: err.code ?? 'failed', message, ...extra }, null, 2) : `${cmd} failed: ${message}`);
     return EXIT.FAILED;
@@ -181,6 +188,41 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
     logger?.warn?.(`submission log not written (${err.code || 'error'})`);
   }
   print(opts.json ? JSON.stringify({ ok: true, ...entry, owner_reply: ownerReply(entry) }, null, 2) : render(entry));
+  return EXIT.OK;
+}
+
+// --dry-run of submit-template once the local checks passed: the market runs every publish check (templates:validate)
+// and writes nothing. A market that cannot validate for Agents is not a pass: EXIT.UNCHECKED.
+const UNCHECKED_WARNING = '市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验';
+
+async function dryRunTemplate(cmd, local, { opts, config, orgId, scope, print, fail, fetchImpl, sleep, logger }) {
+  const label = `expert template ${local.slug}${local.version ? ` ${local.version}` : ''}`;
+  const shown = { kind: local.kind, slug: local.slug, version: local.version, icon: local.icon };
+  const { http } = connect(config, orgId, { fetchImpl, logger });
+  let v;
+  try {
+    v = await validateTemplate({
+      http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, icon: local.icon, scope, sleep,
+    });
+  } catch (err) {
+    if (validateUnavailable(err)) {
+      print(opts.json ? JSON.stringify({ ok: false, error: 'market_check_unavailable', message: UNCHECKED_WARNING, dry_run: true, server_checked: false, ...shown }, null, 2)
+        : `warning: ${UNCHECKED_WARNING}\nlocal checks passed: ${label}; nothing was submitted`);
+      return EXIT.UNCHECKED;
+    }
+    const message = `market check not completed: ${explainSubmitError(err)}`;
+    const extra = { dry_run: true, status: err.status ?? null, code: err.code ?? null, reason: err.reason ?? null };
+    if (isRefusal(err)) return fail(err.code ?? 'refused', message, extra);
+    print(opts.json ? JSON.stringify({ ok: false, error: err.code ?? 'failed', message, ...extra }, null, 2) : `${cmd} failed: ${message}`);
+    return EXIT.FAILED;
+  }
+  if (!v.ok) {
+    const n = v.failures.length;
+    return fail('manifest_invalid', `the market found ${n} problem${n === 1 ? '' : 's'}; nothing was submitted:\n  ${v.failures.map(failureLine).join('\n  ')}`,
+      { dry_run: true, server_checked: true, problems: v.failures.map((p) => ({ source: 'market', ...p })) });
+  }
+  print(opts.json ? JSON.stringify({ ok: true, dry_run: true, server_checked: true, ...shown, manifest_sha256: v.manifest_sha256, inject_tokens: v.inject_tokens }, null, 2)
+    : `local and market checks passed: ${label}${v.inject_tokens != null ? ` (about ${v.inject_tokens} tokens in the session)` : ''}; nothing was submitted`);
   return EXIT.OK;
 }
 

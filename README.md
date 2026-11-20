@@ -144,7 +144,8 @@ write into a directory that is accessible by group or other.
 
 `<slug>` may also be the skill id. Exit codes: 0 done, 1 failed, 2 usage,
 3 refused or not installed, 4 the running service did not answer within
-`--wait <seconds>` (default 900), 78 configuration error. A report the market
+`--wait <seconds>` (default 900), 5 `submit-template --dry-run` passed the local
+check but the market could not check it, 78 configuration error. A report the market
 could not take yet is kept and resent; the command still exits 0. Ctrl-C or
 SIGTERM while a command runs in the CLI itself aborts pending network calls,
 lets the current step finish and then exits 130. A second Ctrl-C exits at once
@@ -182,7 +183,7 @@ missing evidence, a repeated option) exit 2.
 | Command | What it does |
 |---|---|
 | `submit-skill <dir> [--personal] [--changelog <text>] [--examples <file>] [--category-id <id>] [--dry-run]` | Packs the directory (top-level `SKILL.md`; `.git` skipped; symbolic links and files that may hold credentials — `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*` and other SSH keys, `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`, `credentials*`, and any `.json` up to 1 MiB that is a Google Cloud service-account key (detected by content) — refused and named), checks it with the install-path rules, then uploads it as a new skill. It lands pending review by an org admin (and on the owner's personal shelf); with `--personal` it goes to the owner's personal shelf only, with no review. |
-| `submit-template <manifest.json> [--personal] [--changelog <text>] [--category-id <id>] [--dry-run]` | Checks the manifest shape and publishes it as a new expert template, pending review; with `--personal` on the owner's personal shelf only, with no review. In `--json`, `template_id` / `template_version_id` name the personal copy with `--personal` and the organization's copy otherwise. |
+| `submit-template <manifest.json> [--personal] [--changelog <text>] [--category-id <id>] [--icon-preset <id>] [--dry-run]` | Checks the whole manifest against the market's manifest schema (every nested field; all problems at once, each with its JSON pointer) and publishes it as a new expert template, pending review; with `--personal` on the owner's personal shelf only, with no review. `--icon-preset` sets the template's icon to an expert preset (`{kind: "preset", preset_id}` in the request, not in the manifest). With `--dry-run` nothing is submitted: after the local check passes, the market runs every publish check (`templates:validate`) and all its findings are listed; a market that cannot validate for Agents (404 / 405, or `AGENT_UPLOAD_DISABLED`: Agent submissions off or an older market) prints the warning 「市场端校验不可用（未启用 Agent 提交或市场版本过旧），仅完成本地校验」 and exits 5 (`--json`: `ok: false`, `error: market_check_unavailable`, `server_checked: false`). In `--json`, refusals carry `problems: [{source: local\|market, pointer, reason, ...}]`; `template_id` / `template_version_id` name the personal copy with `--personal` and the organization's copy otherwise. |
 | `submissions` | Submissions made from this Agent, kept in `submissions.json` in the data dir (last 200; review state as of submission). |
 
 While a request from `request-install` is pending, the service checks it every
@@ -190,6 +191,128 @@ While a request from `request-install` is pending, the service checks it every
 runs a poll round as soon as it is confirmed, so a confirmation made in the
 workspace or with `confirm-install` installs within seconds. It stops when the request is decided, superseded, gone, or expired. The
 pending requests are kept as files in `proposal-watch/` in the data dir.
+
+### Expert template manifest
+
+Run `submit-template <file> --dry-run` first: it checks the manifest locally and
+with the market and submits nothing. The local check uses
+`src/agent/schema/expert-template-manifest.schema.json`, a byte-identical copy
+of the market's `docs/schemas/expert-template-manifest.schema.json` (JSON Schema
+2020-12) pinned by sha256 and market commit in `src/agent/schema/pin.js`; the
+tests fail when the copy and the pin differ, and run the market's shared cases
+(`test/vectors/expert-template-manifest.cases.json`). The market's
+`docs/expert-template-manifest.md` is the full field reference.
+
+A JSON object; unknown keys are refused (`unknown_field`). Lengths count Unicode
+characters. "Text" is a string that is not blank. Instruction fields
+(`role.persona`, `role.instructions`, `role.duty`, `role.boundary`,
+`first_guide`, `triggers[].prompt`, `sop[].title`, `sop[].steps[]`,
+`starter_tasks[].prompt`) must not contain `{{`. A `key` is
+`^[a-z][a-z0-9_]{0,31}$`, unique within its list.
+
+| Field | Required | Rules |
+|---|---|---|
+| `schema_version` | yes | `1` |
+| `kind` | yes | `"expert_template"` |
+| `id` | yes | slug: lowercase letters and digits separated by single hyphens, at most 64 |
+| `version` | no | semver (`1.0.0`, `1.0.0-beta.1`), no build metadata; the market assigns one when absent |
+| `role` | yes | `name` text <= 100; `instructions` text <= 32000; `duty` text <= 2000, up to 20 lines, no blank first or last line, no two blank lines in a row; optional `persona` text <= 2000 and `boundary` (as `duty`). Role lines plus the session text must fit 8000 estimated tokens |
+| `skills` | yes | <= 20 of `{skill_id, skill_version_id, package_sha256}` (lowercase UUIDs, 64 hex) of listed skill versions; `[]` for none |
+| `first_guide` | no | text <= 20000, shown to the adopter only |
+| `connectors` | no | <= 10 of `{app, purpose, required}`: `app` `^[a-z][a-z0-9_-]{0,63}$`, `purpose` text <= 2000, `required` boolean |
+| `triggers` | no | <= 10 of `{key, title <= 40, prompt <= 1000, schedule: {cron, timezone}}`: 5 cron fields of digits and `* / , -`; `UTC` or an IANA zone |
+| `sop` | no | <= 30 of `{key, title <= 200, steps}`: 1 to 30 texts <= 2000 |
+| `knowledge` | no | <= 20 of `{key, title <= 200, sha256, size}`: an uploaded knowledge file, 1 to 1048576 bytes |
+| `customizable_fields` | no | <= 30 adoption parameters, below |
+| `starter_tasks` | no | <= 10 of `{title <= 40, prompt <= 1000}` |
+| `card` | no | `{summary <= 500, capabilities?, limitations?, guardrails?, tags?}`: the three lists <= 20 texts <= 200, `tags` <= 4 texts <= 32 |
+
+Adoption parameters `{key, label, type, required, sensitive?, options?, max_len?, default?, include_agents?}`:
+`label` text <= 100; `type` is `text`, `long_text`, `enum`, `boolean`,
+`integer`, `timezone` or `member`; `options` (1 to 50 unique texts <= 100) only
+and always for `enum`; `max_len` (1 to 4000; default 200 for `text`, 4000 for
+`long_text`) only for those two; `default` fits the type (`text` one line,
+within `max_len`; an `enum` default is one of its options). A `sensitive`
+parameter takes no value: not `required`, no `default`. A `member` parameter (a
+member of the adopting org, chosen at adoption) has no `default`, is never
+sensitive, and `include_agents: true` lets Agents be chosen too.
+
+The icon is not part of the manifest: `--icon-preset <id>` sends
+`icon: {kind: "preset", preset_id}` next to the manifest. Expert presets:
+`expert-service`, `expert-growth`, `expert-report`, `expert-creative`,
+`expert-listing`, `expert-select`, `expert-global`, `expert-compliance`.
+Uploaded icons (`{kind: "upload", icon_id}`) are for people in the workspace;
+the market refuses them from an Agent.
+
+Only the market checks: NFC, invisible and control characters, credentials
+(secret scan), requests for credentials and unsafe instructions in
+`first_guide` and starter tasks, text that imitates the client's own lines,
+duplicates within lists, an `enum` default outside its options, the token
+budget, and everything against stored data (listed skills, knowledge files,
+version order, the name on the shelf, an existing template id).
+
+Minimal:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "expert_template",
+  "id": "inbox-helper",
+  "role": {"name": "Inbox Helper", "instructions": "Triage the inbox every morning.", "duty": "Inbox triage."},
+  "skills": []
+}
+```
+
+Every field:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "expert_template",
+  "id": "exec-assistant",
+  "version": "1.2.0",
+  "role": {
+    "name": "Executive Assistant",
+    "persona": "A calm, precise assistant.",
+    "instructions": "Triage the inbox every morning and draft replies for review.",
+    "duty": "Inbox triage.\nScheduling.",
+    "boundary": "No payments."
+  },
+  "first_guide": "Tell me which mailbox to start with.",
+  "skills": [
+    {"skill_id": "0190b7c4-0000-7000-8000-000000000001", "skill_version_id": "0190b7c4-0000-7000-8000-000000000002",
+     "package_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  ],
+  "connectors": [{"app": "gmail", "purpose": "Read the inbox", "required": true}],
+  "triggers": [
+    {"key": "morning_digest", "title": "Morning digest", "prompt": "Summarise new mail.",
+     "schedule": {"cron": "0 8 * * 1-5", "timezone": "Asia/Singapore"}}
+  ],
+  "sop": [{"key": "triage", "title": "Triage", "steps": ["Read new mail.", "Label it."]}],
+  "knowledge": [{"key": "faq", "title": "FAQ", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 12}],
+  "customizable_fields": [
+    {"key": "lang", "label": "Language", "type": "enum", "required": true, "options": ["en", "zh"], "default": "en"},
+    {"key": "signature", "label": "Signature", "type": "text", "required": false, "max_len": 50},
+    {"key": "notes", "label": "Notes", "type": "long_text", "required": false},
+    {"key": "api_token", "label": "API token", "type": "text", "required": false, "sensitive": true},
+    {"key": "digest_size", "label": "Digest size", "type": "integer", "required": false, "default": 10},
+    {"key": "cc_me", "label": "CC me", "type": "boolean", "required": false, "default": true},
+    {"key": "zone", "label": "Time zone", "type": "timezone", "required": false, "default": "Asia/Singapore"},
+    {"key": "approver", "label": "Approver", "type": "member", "required": true, "include_agents": false}
+  ],
+  "starter_tasks": [{"title": "Triage today", "prompt": "Triage today's inbox."}],
+  "card": {
+    "summary": "Keeps your inbox under control.",
+    "capabilities": ["Triage mail"],
+    "limitations": ["No calls"],
+    "guardrails": ["Drafts only"],
+    "tags": ["office", "mail"]
+  }
+}
+```
+
+The market's `templates:validate` for Agents also needs the cws-core route for
+Agent clients; until it is there, `--dry-run` warns and exits 5 after the local check.
 
 `submit-skill` does not keep file modes: installs write every file 0600 and
 never execute package content, so a skill runs its scripts through an
