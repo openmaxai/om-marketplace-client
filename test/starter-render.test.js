@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  END_LINE, LINE_SEPARATOR, LINK_REMOVED, LIMITS, PREFIX, SAFETY_NOTICE, TLDS, asksForCredential, authorLine, cleanContent, cleanDisplayName, cleanText, hasContent, hiredLine, removeLinks, renderStarter,
+  END_LINE, LINE_SEPARATOR, LINK_REMOVED, LIMITS, PREFIX, SAFETY_NOTICE, TLDS, asksForCredential, cleanContent, cleanDisplayName, cleanText, hasContent, hiredLine, removeLinks, renderStarter,
 } from '../src/starter/render.js';
 
 const one = (s) => cleanText(s, { max: 1000, multiline: false });
@@ -73,7 +73,6 @@ test('rendered text: author line above the guide, every author line prefixed, en
     starterTasks: [{ title: '汇总', prompt: '一\n二' }, { title: '只有标题', prompt: '' }],
   });
   assert.equal(renderStarter(c), [
-    '来自模板「周报」的作者：',
     `${PREFIX}第一行`, `${PREFIX}第二行`,
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
     `${PREFIX}1. 汇总：一`, `${PREFIX}二`, `${PREFIX}2. 只有标题`,
@@ -82,11 +81,10 @@ test('rendered text: author line above the guide, every author line prefixed, en
   ].join(LINE_SEPARATOR));
 });
 
-test('author line once above any author text; system line only when there is no first guide', () => {
+test('no source line above author text; system line only when there is no first guide', () => {
   const tasksOnly = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', starterTasks: [{ title: '汇总', prompt: '一' }] }));
   assert.equal(tasksOnly, [
     '已聘用「周报」，生效后就能用',
-    '来自模板「周报」的作者：',
     `${PREFIX}可以先试试这些任务（复制发给我即可）：`,
     `${PREFIX}1. 汇总：一`,
     END_LINE,
@@ -95,12 +93,11 @@ test('author line once above any author text; system line only when there is no 
   const bare = cleanContent({ addressee: '张三', templateName: '周报', firstGuide: '', starterTasks: [] });
   assert.equal(hasContent(bare), true);
   assert.equal(renderStarter(bare), [hiredLine('周报'), SAFETY_NOTICE].join(LINE_SEPARATOR));
-  assert.ok(!renderStarter(bare).includes(authorLine('周报')));
   const guided = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', firstGuide: 'g' }));
-  assert.ok(!guided.includes(hiredLine('周报')) && guided.startsWith(authorLine('周报')));
+  assert.ok(!guided.includes(hiredLine('周报')) && guided.startsWith(`${PREFIX}g`), guided);
   const both = renderStarter(cleanContent({ addressee: '张三', templateName: '周报', firstGuide: 'g', starterTasks: [{ title: '汇总', prompt: '一' }] }));
-  assert.equal(both.split(authorLine('周报')).length, 2, both);
   assert.ok(!both.includes(hiredLine('周报')), both);
+  for (const text of [tasksOnly, renderStarter(bare), guided, both]) assert.ok(!text.includes('来自模板') && !text.includes('的作者'), text);
   for (const text of [tasksOnly, renderStarter(bare), guided]) assert.ok(!/你好|已装/.test(text) && !text.includes('张三'), text);
 });
 
@@ -122,9 +119,9 @@ test('Markdown (GFM without hard breaks): every line is its own paragraph and no
     assert.ok(lines.every((l) => !/ {2}$|\\$/.test(l)), text);
     // Every line is client text or starts with the prefix, so author text never opens a heading, list, fence,
     // quote, table, thematic break, HTML or indented code block.
-    const client = new Set([SAFETY_NOTICE, authorLine('周报'), END_LINE]);
+    const client = new Set([SAFETY_NOTICE, END_LINE]);
     assert.ok(lines.every((l) => client.has(l) || l.startsWith(PREFIX)), text);
-    assert.equal(lines[0], authorLine('周报'));
+    assert.ok(lines[0].startsWith(PREFIX), lines[0]);
     // One line per task.
     for (const n of ['1. 一', '2. 二', '3. 三：q']) assert.equal(lines.filter((l) => l.startsWith(`${PREFIX}${n}`)).length, 1, n);
   }

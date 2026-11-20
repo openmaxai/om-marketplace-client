@@ -177,19 +177,17 @@ const prefixed = (text) => authorLines(text).map((l) => PREFIX + l);
 // each starter task, as its own paragraph; plain-text channels only see the extra spacing.
 export const LINE_SEPARATOR = '\n\n';
 
-// authorLine heads any author text (first guide or starter tasks); hiredLine is the intro when there is no first guide.
-export const authorLine = (name) => `来自模板「${name}」的作者：`;
+// hiredLine is the intro when there is no first guide; author text follows without a source line.
 export const hiredLine = (name) => `已聘用「${name}」，生效后就能用`;
 
-// The message text of filtered content: hiredLine when there is no first guide, then authorLine once above the author
-// text (first guide, then starter tasks) when there is any; every line of author text starts with PREFIX and is followed
-// by END_LINE; SAFETY_NOTICE is the last line. Lines are separated by LINE_SEPARATOR.
+// The message text of filtered content: hiredLine when there is no first guide, then the author text (first guide, then
+// starter tasks) when there is any; every line of author text starts with PREFIX and is followed by END_LINE;
+// SAFETY_NOTICE is the last line. Lines are separated by LINE_SEPARATOR.
 export function renderStarter(clean) {
   const name = clean.templateName;
   const authored = Boolean(clean.firstGuide || clean.starterTasks.length);
   const lines = [];
   if (!clean.firstGuide) lines.push(hiredLine(name));
-  if (authored) lines.push(authorLine(name));
   if (clean.firstGuide) lines.push(...prefixed(clean.firstGuide));
   if (clean.starterTasks.length) {
     lines.push(`${PREFIX}可以先试试这些任务（复制发给我即可）：`);

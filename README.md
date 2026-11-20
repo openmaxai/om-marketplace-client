@@ -540,10 +540,9 @@ The message is still sent at most once (the claim, and the client message id
    `[链接已移除]`; `@` becomes `＠`; zero-width, bidi and other control
    characters are removed; one-line fields lose their line breaks; lengths are
    cut (name 40, guide 2000, title 40, prompt 500). Without a first guide the
-   message opens with the system line `已聘用「<name>」，生效后就能用`. Any
-   author text (first guide, starter tasks or both) sits under one line
-   `来自模板「<name>」的作者：`. A template with neither a guide nor starter
-   tasks gets the system line only.
+   message opens with the system line `已聘用「<name>」，生效后就能用`; author
+   text (first guide, starter tasks or both) follows with no source line. A
+   template with neither a guide nor starter tasks gets the system line only.
    Every line of author text starts with `｜ ` and author text is followed by
    the fixed line `（以上为模板作者提供的内容）`. The last line is the fixed
    platform safety notice (`SAFETY_NOTICE` in `src/starter/render.js`, Chinese
