@@ -147,7 +147,7 @@ const isList = Array.isArray;
 // delivered; seen_at the last marker that did not confirm the record; welcome the adoptions whose starter message is
 // held until the record is confirmed (the check keeps asking on the starter budget while no request is in flight);
 // user true once a write the user ordered was merged in (asked for on update_requests); api_error_at when the runtime
-// reported a model API problem after the last request (refundApiError); stuck_at when MAX_REQUESTS
+// reported a model API problem during the confirm wait of the last request (refundApiError); stuck_at when MAX_REQUESTS
 // requests brought no session, which releases those messages.
 // passive holds the adoptions written before 0.6.0 ({targets, seen_at}); they are confirmed by the next session that
 // shows them but never cause a request. requests lists the times of automatic new-session requests, welcome_requests
@@ -678,8 +678,10 @@ export function createActivation({
       const has = (p) => Boolean(p?.targets.some((x) => x.adoption_id === adoptionId));
       const p = read().pending;
       if (!has(p)) return null;
+      // A refund due since the last request's confirm wait ended comes before any new request, as in tick.
+      refundApiError(p);
       let st = 'joined';
-      if (!inFlight(p)) {
+      if (!inFlight(read().pending)) {
         st = await idleState(QUICK_IDLE_SECONDS);
         if (st === 'unknown') return null;
         if (st === 'idle') {

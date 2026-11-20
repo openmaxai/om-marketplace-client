@@ -1798,6 +1798,42 @@ test('api error: the request is given back before the quick request a user-order
   assert.equal(f.state.read('activation', null).api_error_refunds.length, 1);
 });
 
+test('api error: a starter message asked for after the wait ends gets the request back before its own request', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  written(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30, health: 'rate_limited' });
+  assert.equal(await a.tick(), 'waiting');
+  assert.ok(f.pending().api_error_at);
+  // Healthy again; the starter message is asked for again before the next tick.
+  f.advance(CONFIRM_WAIT_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.welcome(A1), f.clock.t + WELCOME_MAX_HOLD_MS);
+  assert.equal(f.controls.length, 2);
+  assert.equal(f.pending().request_count, 1);
+  assert.equal(f.state.read('activation', null).api_error_refunds.length, 1);
+});
+
+test('api error: a status file without a health field is no information; the request counts', async (t) => {
+  const f = await harness(t);
+  const a = f.make();
+  userWritten(f, a);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  f.advance(ACTIVATION_CHECK_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'waiting');
+  f.advance(CONFIRM_WAIT_MS);
+  f.status({ idle_seconds: 30 });
+  assert.equal(await a.tick(), 'requested');
+  assert.equal(f.pending().api_error_at, undefined);
+  assert.equal(f.state.read('activation', null).api_error_refunds.length, 0);
+  assert.equal(f.pending().request_count, 2);
+});
+
 test('api error: a stale status file (older than 60 s) is no information; the request counts', async (t) => {
   const f = await harness(t);
   const a = f.make();
