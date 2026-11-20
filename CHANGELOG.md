@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-20
+
 ### Changed
 - Starter message: the source line `来自模板「<name>」的作者：` above author
   text is gone. The first guide, or the system line when there is none, opens
