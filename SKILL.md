@@ -100,8 +100,9 @@ Post-install and post-upgrade declare the template session-start shards and run
 the zylos hook sync only when their hooks are missing. On Claude the agent
 restarts once when idle; memory and context are kept. On Codex the templates
 take effect when the Codex session next starts. Until then a template write
-raises an alert and waits at most 15 minutes, then is reported as failed
-(`inject_unavailable`).
+raises an alert, asks the idle Agent for one new session, and waits at most 15
+minutes, then is reported as failed (`inject_unavailable`); it is reported at
+once when a new session started and the hooks are still missing.
 Each template shard prints a fixed priority line (organization rules > template
 > the agent's own habits), the template's file path, the template's duty and
 boundary (`role.json`, one line each; no boundary line when it is empty), then

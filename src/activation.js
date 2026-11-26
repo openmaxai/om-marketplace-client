@@ -4,7 +4,7 @@ import path from 'node:path';
 import { isCanonicalUuid, isSha256Hex } from './ids.js';
 import { enqueueUrgent } from './reconcile.js';
 import { readMarker } from './shard-emitter.js';
-import { readSlots, writeSlots } from './shards.js';
+import { declarationsInPlace, declarationsReady, readSlots, writeSlots } from './shards.js';
 
 // Template content reaches the Agent only through the session-start shards, so a written template takes effect when a
 // session next starts. The client asks for a new session itself once the Agent is idle, confirms from the shard
@@ -34,6 +34,14 @@ export const UPDATE_REQUEST_WINDOW_MS = 60 * 60 * 1000;
 // ... and this many per UTC day. Past these the change waits for the automatic rules (IDLE_MIN_SECONDS,
 // REQUEST_COOLDOWN_MS, DAILY_REQUESTS).
 export const DAILY_UPDATE_REQUESTS = 12;
+// A template write held because the Codex slot hooks are missing (Codex loads them only when a session starts) is
+// asked for the same way, on a budget of its own: at least this long between two (writes held together share one
+// request), ...
+export const HOOKS_REQUEST_INTERVAL_MS = 2 * 60 * 1000;
+// ... and at most this many per UTC day (loop protection).
+export const DAILY_HOOKS_REQUESTS = 12;
+// The hooks are taken as still missing only once a session started at least this long ago (its launch adds them).
+export const HOOKS_SETTLE_MS = 60 * 1000;
 // Most requests given back per UTC day after a model API problem (refundApiError); past it they count as before.
 export const DAILY_API_ERROR_REFUNDS = 12;
 // How long a delivered request is given to show up as a new session before it is made again.
@@ -50,6 +58,8 @@ export const STUCK_ALERT = 'template_activation_stuck';
 export const PENDING_ALERT = 'template_activation_pending_24h';
 export const NEW_SESSION_TEXT = 'Agent Market templates were updated and the market client has verified, from the injected template hashes, '
   + 'that the current session does not match them. Start a new session now with the new-session skill. Do not check whether one is needed.';
+export const HOOKS_SESSION_TEXT = 'An Agent Market template is waiting for its session-start hooks, which Codex loads only when a session starts. '
+  + 'Start a new session now with the new-session skill. Do not check whether one is needed.';
 export const CONTROL_TIMEOUT_MS = 15_000;
 // The control queue gives up a request not delivered (or left running) after this; passed as its ack deadline. With
 // --no-ack-suffix the runtime marks a submitted request done itself, so the deadline only ends one that is stuck.
@@ -62,8 +72,8 @@ const HISTORY_KEEP_MS = 2 * 24 * 60 * 60 * 1000;
 const OUTSTANDING = new Set(['pending', 'running']);
 const EPOCH = new Date(0).toISOString();
 const EMPTY = Object.freeze({
-  pending: null, passive: null, requests: [], welcome_requests: [], update_requests: [], retry_requests: [], api_error_refunds: [],
-  backfilled: false,
+  pending: null, passive: null, hooks: null, requests: [], welcome_requests: [], update_requests: [], hooks_requests: [], retry_requests: [],
+  api_error_refunds: [], backfilled: false,
 });
 
 export const defaultStatusFile = (zylosDir) => path.join(zylosDir, 'activity-monitor', 'agent-status.json');
@@ -79,10 +89,10 @@ export class ControlError extends Error {
   }
 }
 
-// The zylos control queue through comm-bridge's c4-control.js. enqueue() queues the new-session request (delivered
-// once the Agent is idle, no ack expected, the runtime state honoured) and resolves to its control id; get(id) answers
-// its status (pending, running, done, failed, timeout, superseded, or not_found); ack(id) marks it done, so a request
-// still pending is never delivered.
+// The zylos control queue through comm-bridge's c4-control.js. enqueue(content) queues the new-session request
+// (delivered once the Agent is idle, no ack expected, the runtime state honoured) and resolves to its control id; get(id)
+// answers its status (pending, running, done, failed, timeout, superseded, or not_found); ack(id) marks it done, so a
+// request still pending is never delivered.
 export function createControl(zylosDir, { run = execFile, timeoutMs = CONTROL_TIMEOUT_MS } = {}) {
   const script = controlScript(zylosDir);
   const call = (args) => new Promise((resolve, reject) => {
@@ -92,11 +102,11 @@ export function createControl(zylosDir, { run = execFile, timeoutMs = CONTROL_TI
     });
   });
   return {
-    async enqueue() {
+    async enqueue(content = NEW_SESSION_TEXT) {
       let out;
       try {
         out = await call([
-          'enqueue', '--content', NEW_SESSION_TEXT, '--block-queue-until-idle', '--no-ack-suffix', '--ack-deadline', String(CONTROL_ACK_DEADLINE_S),
+          'enqueue', '--content', content, '--block-queue-until-idle', '--no-ack-suffix', '--ack-deadline', String(CONTROL_ACK_DEADLINE_S),
         ]);
       } catch (err) {
         if (err.killed || err.signal) throw new ControlError('control enqueue timed out', { unknown: true });
@@ -139,7 +149,8 @@ const utcDay = (t) => new Date(t).toISOString().slice(0, 10);
 const validTarget = (x) => x && isCanonicalUuid(x.adoption_id) && isSha256Hex(x.rendered_sha256);
 const isList = Array.isArray;
 
-// State document `activation`: {pending, passive, requests, welcome_requests, update_requests, retry_requests, backfilled}.
+// State document `activation`: {pending, passive, hooks, requests, welcome_requests, update_requests, hooks_requests,
+// retry_requests, backfilled}.
 // pending is the one record of this Agent, {pending_since, written_at, targets: [{adoption_id, rendered_sha256}],
 // removed: [adoption_id], requested_at, request_count, control_id, delivered_at, seen_at, welcome: [adoption_id], user,
 // stuck_at} or null. written_at is the last change merged in; control_id the control queue item of the last request
@@ -154,6 +165,10 @@ const isList = Array.isArray;
 // those made for starter messages, update_requests those made for user-ordered writes, retry_requests automatic ones
 // made while no session followed the last request; each has its own budget and none counts against another.
 // api_error_refunds lists the times a request was given back after a model API problem (DAILY_API_ERROR_REFUNDS).
+// hooks is the one record of template writes held for the Codex slot hooks, {since, until, requested_at, request_count,
+// control_id, delivered_at, given_up_at, missing_at} or null: one request at most (counted in hooks_requests), given_up_at
+// when it could not be enqueued, missing_at when a session started after it and the hooks were still missing. It ends
+// once the hooks are present or at until.
 // im: the openmax IM (available(), openTurn()); flush(): sends the urgent reconcile queue; control: the control queue.
 export function createActivation({
   state, dataDir, zylosDir, logger, im = null, flush = async () => null, now = Date.now,
@@ -165,12 +180,15 @@ export function createActivation({
     const p = d?.pending;
     const pending = p && typeof p === 'object' && isList(p.targets) && isList(p.removed) && Number.isFinite(Date.parse(p.written_at)) ? p : null;
     const q = d?.passive;
+    const h = d?.hooks;
     return {
       pending,
       passive: q && typeof q === 'object' && isList(q.targets) && q.targets.length ? q : null,
+      hooks: h && typeof h === 'object' && Number.isFinite(Date.parse(h.since)) && Number.isFinite(Date.parse(h.until)) ? h : null,
       requests: times(d?.requests),
       welcome_requests: times(d?.welcome_requests),
       update_requests: times(d?.update_requests),
+      hooks_requests: times(d?.hooks_requests),
       retry_requests: times(d?.retry_requests),
       api_error_refunds: times(d?.api_error_refunds),
       backfilled: d?.backfilled === true,
@@ -292,6 +310,7 @@ export function createActivation({
     requests: [REQUEST_COOLDOWN_MS, DAILY_REQUESTS],
     welcome_requests: [WELCOME_REQUEST_INTERVAL_MS, DAILY_WELCOME_REQUESTS],
     update_requests: [UPDATE_REQUEST_INTERVAL_MS, DAILY_UPDATE_REQUESTS, HOURLY_UPDATE_REQUESTS],
+    hooks_requests: [HOOKS_REQUEST_INTERVAL_MS, DAILY_HOOKS_REQUESTS],
     retry_requests: [0, DAILY_RETRY_REQUESTS],
   };
   function allowed(d, list) {
@@ -327,17 +346,21 @@ export function createActivation({
   // True while a starter message is held until the record is confirmed.
   const welcomeWaits = (p) => isList(p?.welcome) && p.welcome.some((id) => p.targets.some((x) => x.adoption_id === id));
 
-  // The budgets of the quick requests: a held starter message, or a write the user ordered.
-  const QUICK = { welcome: 'welcome_requests', update: 'update_requests' };
+  // The budgets of the quick requests: a held starter message, a write the user ordered, or a write held for the Codex
+  // slot hooks.
+  const QUICK = { welcome: 'welcome_requests', update: 'update_requests', hooks: 'hooks_requests' };
+  // The record a request of the kind is made for.
+  const recordOf = (kind) => (kind === 'hooks' ? 'hooks' : 'pending');
 
-  // Follows the last request in the control queue: 'outstanding' while it may still be delivered (also when its state
-  // cannot be read), otherwise its id is dropped (the first time it is seen delivered is kept as delivered_at).
-  async function followControl(p) {
+  // Follows the last request of the record (key) in the control queue: 'outstanding' while it may still be delivered
+  // (also when its state cannot be read), otherwise its id is dropped (the first time it is seen delivered is kept as
+  // delivered_at).
+  async function followControl(p, key = 'pending') {
     if (!Number.isSafeInteger(p?.control_id)) return 'none';
     if (now() - Date.parse(p.requested_at) >= CONTROL_MAX_AGE_MS || !Number.isFinite(Date.parse(p.requested_at))) {
       logger.warn(`activation: new-session request ${p.control_id} still not settled after a day; no longer waited for`);
       await cancel(p.control_id, true);
-      save((d) => { if (d.pending?.control_id === p.control_id) d.pending.control_id = null; });
+      save((d) => { if (d[key]?.control_id === p.control_id) d[key].control_id = null; });
       return 'gone';
     }
     let st;
@@ -349,9 +372,9 @@ export function createActivation({
     }
     if (OUTSTANDING.has(st)) return 'outstanding';
     save((d) => {
-      if (d.pending?.control_id !== p.control_id) return;
-      d.pending.control_id = null;
-      if (st === 'done') d.pending.delivered_at = iso();
+      if (d[key]?.control_id !== p.control_id) return;
+      d[key].control_id = null;
+      if (st === 'done') d[key].delivered_at = iso();
     });
     return 'gone';
   }
@@ -359,8 +382,14 @@ export function createActivation({
   // True when a request may be made now; checked again inside the update that counts it. A quick request (kind
   // 'welcome' for a starter message, 'update' for a write the user ordered) is checked on its own budget and is not made
   // while the last one is still in flight; it does not wait CONFIRM_WAIT_MS after a request whose session already
-  // started.
+  // started. A request for the Codex slot hooks is made once per hooks record, and not while a request of the pending
+  // record may still bring a session.
   function mayRequest(d, kind = null) {
+    if (kind === 'hooks') {
+      const h = d.hooks;
+      return Boolean(h) && !h.requested_at && !h.given_up_at && !h.missing_at && !Number.isSafeInteger(h.control_id)
+        && allowed(d, QUICK.hooks) && !inFlight(d.pending);
+    }
     const p = d.pending;
     if (!p || Number.isSafeInteger(p.control_id) || p.request_count >= MAX_REQUESTS) return false;
     if (kind === 'update' && p.user !== true) return false;
@@ -373,43 +402,47 @@ export function createActivation({
   // that checks it may be made, so a request that lost to another one is skipped. It is counted before it is enqueued
   // (a crash in between loses it rather than enqueueing it twice). A refused enqueue is taken back unless a newer
   // change reset the count meanwhile; one whose outcome is unknown (timeout) stays counted and is waited for.
-  // kind: 'welcome' counts the request in welcome_requests, 'update' in update_requests; otherwise it is counted in
-  // requests, or in retry_requests when no session followed the last request.
+  // kind: 'welcome' counts the request in welcome_requests, 'update' in update_requests, 'hooks' (made for the hooks
+  // record) in hooks_requests; otherwise it is counted in requests, or in retry_requests when no session followed the
+  // last request.
   let chain = Promise.resolve();
   function request(why, kind = null) {
+    const key = recordOf(kind);
     let list = null;
     const run = async () => {
-      if ((await followControl(read().pending)) === 'outstanding') return 'waiting';
+      if ((await followControl(read()[key], key)) === 'outstanding') return 'waiting';
       const at = iso();
       let taken = null;
       save((d) => {
         if (!mayRequest(d, kind)) return;
-        list = kind ? QUICK[kind] : autoList(d.pending);
-        taken = { requested_at: d.pending.requested_at, delivered_at: d.pending.delivered_at ?? null, count: d.pending.request_count + 1 };
-        Object.assign(d.pending, { requested_at: at, request_count: taken.count, control_id: null, delivered_at: null });
+        const r = d[key];
+        list = kind ? QUICK[kind] : autoList(r);
+        taken = { requested_at: r.requested_at, delivered_at: r.delivered_at ?? null, count: r.request_count + 1 };
+        Object.assign(r, { requested_at: at, request_count: taken.count, control_id: null, delivered_at: null });
         d[list] = [...d[list].filter((x) => now() - Date.parse(x) < HISTORY_KEEP_MS), at];
       });
       if (!taken) return 'skipped';
       sampledAt = null;
       let id = null;
       try {
-        ({ id } = await control.enqueue());
+        ({ id } = await control.enqueue(kind === 'hooks' ? HOOKS_SESSION_TEXT : NEW_SESSION_TEXT));
       } catch (err) {
         if (err.unknown) {
           logger.warn(`activation: new session requested, outcome unknown (${err.message}); waiting for it`);
           return 'requested';
         }
         save((d) => {
-          if (d.pending?.requested_at !== at) return;
-          d.pending.requested_at = taken.requested_at;
-          d.pending.delivered_at = taken.delivered_at;
-          if (d.pending.request_count === taken.count) d.pending.request_count = taken.count - 1;
+          const r = d[key];
+          if (r?.requested_at !== at) return;
+          r.requested_at = taken.requested_at;
+          r.delivered_at = taken.delivered_at;
+          if (r.request_count === taken.count) r.request_count = taken.count - 1;
           d[list] = d[list].filter((x) => x !== at);
         });
         logger.warn(`activation: new session not requested: ${err.message}`);
         return 'enqueue_failed';
       }
-      if (Number.isSafeInteger(id)) save((d) => { if (d.pending?.requested_at === at) d.pending.control_id = id; });
+      if (Number.isSafeInteger(id)) save((d) => { if (d[key]?.requested_at === at) d[key].control_id = id; });
       logger.info(`activation: new session requested (${why}${id ? `, control ${id}` : ''})`);
       return 'requested';
     };
@@ -545,7 +578,68 @@ export function createActivation({
     if (given) logger.info(`activation: a new-session request the runtime could not serve (model API problem) does not count toward ${MAX_REQUESTS}`);
   }
 
-  async function tick() {
+  // When a session started after time t, from the marker or the runtime's launch time; null when none is known.
+  function sessionAfter(t) {
+    const m = readMarker(dataDir);
+    if (m && m.at > t) return m.at;
+    const launched = Number(readRuntimeStatus(statusFile, now())?.runtime_launch_at);
+    return launched > t ? launched : null;
+  }
+
+  // Drops the hooks record named by since (any when null) and withdraws its request.
+  async function dropHooks(since = null) {
+    let id = null;
+    let dropped = false;
+    save((d) => {
+      if (!d.hooks || (since !== null && d.hooks.since !== since)) return;
+      id = d.hooks.control_id ?? null;
+      d.hooks = null;
+      dropped = true;
+    });
+    await cancel(id);
+    return dropped;
+  }
+
+  // One step of the hooks record: 'ready' once the hooks are present (onReady is called), 'missing' once a session
+  // started after its request and they are still missing, 'requested' when a new session was asked for now, otherwise
+  // 'waiting' ('none' without a record). The request waits for a healthy Agent idle QUICK_IDLE_SECONDS with no open
+  // turn, and is made only while the declarations are in place, so a session start adds the hooks.
+  async function hooksStep(onReady = () => {}) {
+    const h = read().hooks;
+    if (!h) return 'none';
+    if (declarationsReady(zylosDir)) {
+      if (await dropHooks(h.since)) {
+        logger.info('activation: the Codex slot hooks are present; the held template write runs');
+        onReady();
+      }
+      return 'ready';
+    }
+    if (Date.parse(h.until) <= now()) {
+      await dropHooks(h.since);
+      return 'none';
+    }
+    if (h.missing_at) return 'missing';
+    if (h.requested_at) {
+      if ((await followControl(h, 'hooks')) === 'outstanding') return 'waiting';
+      const at = sessionAfter(Date.parse(h.requested_at));
+      if (at === null || now() - at < HOOKS_SETTLE_MS) return 'waiting';
+      save((d) => { if (d.hooks?.requested_at === h.requested_at) d.hooks.missing_at = iso(); });
+      logger.warn('activation: a new session started and the Codex slot hooks are still missing; no further session is requested for them');
+      return 'missing';
+    }
+    if (!declarationsInPlace(zylosDir) || !mayRequest(read(), 'hooks') || !(await idle(QUICK_IDLE_SECONDS))) return 'waiting';
+    const r = await request('template write held for the Codex slot hooks', 'hooks');
+    if (r === 'enqueue_failed') save((d) => { if (d.hooks?.since === h.since) d.hooks.given_up_at = iso(); });
+    return r === 'requested' ? 'requested' : 'waiting';
+  }
+
+  // onHooksReady: called once the Codex slot hooks a template write was held for are present.
+  async function tick({ onHooksReady = () => {} } = {}) {
+    try {
+      await hooksStep(onHooksReady);
+    } catch (err) {
+      logger.warn(`activation: Codex slot hooks check failed: ${err.message}`);
+    }
     const marker = readMarker(dataDir);
     await confirmPassive(marker);
     const p = await prune();
@@ -702,6 +796,27 @@ export function createActivation({
           ? `activation: the Agent is busy; the starter message of adoption ${adoptionId} waits until the template is in a session`
           : `activation: no new session may be requested now for the starter message of adoption ${adoptionId}; it waits until the template is in a session`);
       return now() + WELCOME_MAX_HOLD_MS;
+    },
+    // A template write held because the Codex slot hooks are missing, until the time until: writes held together share
+    // one record and one request (see hooksStep). Resolves to 'missing' when a session started after the request and the
+    // hooks are still missing; the write then stops waiting.
+    async hooksSession({ until }) {
+      const end = Date.parse(until);
+      if (!Number.isFinite(end)) return 'waiting';
+      const at = new Date(end).toISOString();
+      save((d) => {
+        const h = d.hooks;
+        if (!h || Date.parse(h.until) <= now()) {
+          d.hooks = { since: iso(), until: at, requested_at: null, request_count: 0, control_id: null, delivered_at: null };
+        } else if (!h.missing_at && end > Date.parse(h.until)) {
+          h.until = at;
+        }
+      });
+      return hooksStep();
+    },
+    // The Codex slot hooks are present: the hooks record ends and its request is withdrawn.
+    async hooksDone() {
+      if (read().hooks) await dropHooks();
     },
     // Runs every ACTIVATION_CHECK_MS: confirms from the marker, or asks for a new session once the Agent is idle.
     tick,

@@ -88,14 +88,19 @@ export function hooksPresent(zylosDir) {
   return SLOTS.every((n) => commands.some((c) => c.includes('session-start-orchestrator.js') && c.trim().endsWith(` --shard ${shardName(n)}`)));
 }
 
-// True when every declaration is in place, its emitter resolves to this client's entry file, and its hook exists.
-export function declarationsReady(zylosDir) {
-  return hooksPresent(zylosDir) && SLOTS.every((n) => {
+// True when every declaration is in place and its emitter resolves to this client's entry file.
+export function declarationsInPlace(zylosDir) {
+  return SLOTS.every((n) => {
     let raw;
     try { raw = readJson(path.join(shardsDir(zylosDir), `${shardName(n)}.json`), null); } catch { return false; }
     const real = realOrNull(path.join(zylosDir, '.claude', emitterRel(n)));
     return JSON.stringify(raw) === JSON.stringify(declaration(n)) && real !== null && real === realOrNull(path.join(ENTRY_DIR, `${shardName(n)}.js`));
   });
+}
+
+// True when every declaration is in place and its hook exists.
+export function declarationsReady(zylosDir) {
+  return hooksPresent(zylosDir) && declarationsInPlace(zylosDir);
 }
 
 // Writes the four static declarations; returns the names written. Existing identical files are left alone and no

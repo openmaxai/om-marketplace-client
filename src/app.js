@@ -62,8 +62,10 @@ export function pollRound(logger, { revocations, intents, skills, templates, sta
 export function buildTasks(logger, runtime = {}, commands = null, { pollNow = () => {} } = {}) {
   const round = pollRound(logger, runtime);
   const starterTask = runtime.starter ? [{ name: 'starter', baseMs: STARTER_CHECK_MS, run: () => runtime.starter.runWaiting() }] : [];
-  // Independent of the poll round: confirms template activation, or asks the idle Agent for a new session.
-  const activationTask = runtime.activation ? [{ name: 'activation', baseMs: ACTIVATION_CHECK_MS, run: () => runtime.activation.tick() }] : [];
+  // Independent of the poll round: confirms template activation, or asks the idle Agent for a new session. A template
+  // write held for the Codex slot hooks runs at once when they appear.
+  const activationTask = runtime.activation
+    ? [{ name: 'activation', baseMs: ACTIVATION_CHECK_MS, run: () => runtime.activation.tick({ onHooksReady: pollNow }) }] : [];
   const proposalTask = runtime.proposals ? [{ name: 'proposals', baseMs: WATCH_INTERVAL_MS, run: () => runtime.proposals.tick({ onConfirmed: pollNow }) }] : [];
   return [
     ...activationTask,

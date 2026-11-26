@@ -278,8 +278,9 @@ export function createTemplates({
   // Codex adds the slot hooks only when its session next starts, so a write waits for them while its intent has more
   // than HOOKS_REPORT_MARGIN_MS left (with no known expiry: for one round), for at most HOOKS_MAX_DEFERRAL_MS in total,
   // and only while no later template intent of any org is queued (a deferral ends the round); later intents of its org
-  // wait too. Then it is reported as inject_unavailable, before the market times it out.
-  function hooksPending(it, body, queue) {
+  // wait too. Then it is reported as inject_unavailable, before the market times it out. While it waits, a new session
+  // is asked for (activation.hooksSession); once one started and the hooks are still missing, it is reported at once.
+  async function hooksPending(it, body, queue) {
     const rec = state.read('template_hooks', null) ?? {};
     const since = Number.isFinite(Date.parse(rec.pending_since)) ? rec.pending_since : iso();
     const live = new Set(queue.map((q) => q.id));
@@ -292,8 +293,16 @@ export function createTemplates({
     const first = Date.parse(waited[it.id]);
     const elapsed = Number.isFinite(first) ? now() - first : 0;
     const behind = queue.some((q) => isTemplateIntent(q) && q.seq > it.seq && LIVE.has(q.status));
-    const wait = !behind && elapsed + MAX_ROUND_GAP_MS <= HOOKS_MAX_DEFERRAL_MS
+    let wait = !behind && elapsed + MAX_ROUND_GAP_MS <= HOOKS_MAX_DEFERRAL_MS
       && (Number.isFinite(exp) ? exp - now() > HOOKS_REPORT_MARGIN_MS : !(it.id in waited));
+    if (wait && activation) {
+      const end = Math.min((Number.isFinite(first) ? first : now()) + HOOKS_MAX_DEFERRAL_MS, Number.isFinite(exp) ? exp : Infinity);
+      try {
+        if ((await activation.hooksSession({ until: new Date(end).toISOString() })) === 'missing') wait = false;
+      } catch (err) {
+        logger.warn(`new session for the slot hooks not requested: ${err.message}`);
+      }
+    }
     const deferred = { ...waited };
     if (!wait) delete deferred[it.id];
     else if (!Number.isFinite(first)) deferred[it.id] = iso();
@@ -309,6 +318,7 @@ export function createTemplates({
   function hooksReady() {
     if (state.read('template_hooks', null) !== null) state.write('template_hooks', null);
     state.clearAlert('template_hooks_pending');
+    activation?.hooksDone().catch(() => {});
   }
 
   async function write(it, body, queue) {
