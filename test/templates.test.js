@@ -10,6 +10,8 @@ import { fakeZylos } from './fake/zylos.js';
 import { createIntentPuller } from '../src/intents.js';
 import { EMPTY_REVOKED, createRevocationPuller } from '../src/revocations.js';
 import { createTemplates } from '../src/templates.js';
+import { DAILY_HOOKS_REQUESTS, HOOKS_SESSION_TEXT, HOOKS_SETTLE_MS, QUICK_IDLE_SECONDS, createActivation } from '../src/activation.js';
+import { tmpHome } from './helpers.js';
 import { ensureDeclarations, readSlots, shardsDir, writeSlots } from '../src/shards.js';
 import { HOOKS_MAX_DEFERRAL_MS, HOOKS_REPORT_MARGIN_MS } from '../src/templates.js';
 import { writeSlotHooks } from './fake/zylos.js';
@@ -32,13 +34,16 @@ const intent = (over = {}) => ({
 const page = (items) => ({ status: 200, json: { items, has_more: false, next_after_seq: items.at(-1).seq, policy_sha256: POLICY_SHA256 } });
 
 // Fake market and storage serving one template bundle through C-01, C-04 and C-15, and a zylos dir with declarations.
-async function harness(t, { bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller, starter = null } = {}) {
+async function harness(t, {
+  bundle = templateBundle(), served, c04, c15 = [applied, applied], items, setup, orgs = {}, dataDir, revocations: puller, starter = null, activation = null,
+} = {}) {
   const h = await pullHarness(t, { orgs });
   if (dataDir) h.dataDir = dataDir(h.dataDir);
   const storage = await startFakeStorage();
   t.after(storage.close);
   const zylosDir = fakeZylos({ hooks: true });
   ensureDeclarations(zylosDir);
+  const act = activation ? activationFor(h, zylosDir) : null;
   h.fake.script('POST', C01, page(items ?? [intent({ bundle_sha256: bundle.sha })]));
   h.fake.script('GET', C04, ...(c04 ?? [{ status: 200, json: {
     download_url: storage.serve('/t', { status: 200, body: served ?? bundle.zip }), expires_at: '2026-10-16T00:05:00Z', sha256: bundle.sha, size: bundle.size,
@@ -48,7 +53,7 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const revocations = puller ?? createRevocationPuller({ api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, now: h.now });
   const make = () => createTemplates({
     api: h.api, state: h.state, orgs: h.orgs, logger: h.logger, dataDir: h.dataDir, zylosDir, revocations, emulatorOrigin: storage.origin,
-    now: h.now, sleep: async () => {}, starter,
+    now: h.now, sleep: async () => {}, starter, activation: act?.activation ?? null,
   });
   const templates = make();
   setup?.(h.dataDir, h.state);
@@ -57,7 +62,26 @@ async function harness(t, { bundle = templateBundle(), served, c04, c15 = [appli
   const serveAgain = (b = bundle, expiresAt = '2026-10-16T00:05:00Z') => h.fake.script('GET', C04, { status: 200, json: {
     download_url: storage.serve(`/t${h.fake.requests.length}`, { status: 200, body: b.zip }), expires_at: expiresAt, sha256: b.sha, size: b.size,
   } });
-  return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, dir: path.join(h.dataDir, 'templates', ADOPTION) };
+  return { ...h, bundle, zylosDir, make, templates, sent, serveAgain, act, dir: path.join(h.dataDir, 'templates', ADOPTION) };
+}
+
+// A real activation with a fake runtime status file and control queue; controls lists the content of each request.
+function activationFor(h, zylosDir) {
+  const statusFile = path.join(tmpHome(), 'agent-status.json');
+  const controls = [];
+  const control = {
+    async enqueue(content) { controls.push(content); return { id: controls.length }; },
+    async get() { return 'done'; },
+    async ack() {},
+  };
+  const activation = createActivation({ state: h.state, dataDir: h.dataDir, zylosDir, logger: h.logger, now: h.now, statusFile, control });
+  // A fresh status file of an idle, healthy Agent.
+  const status = (over = {}) => {
+    fs.writeFileSync(statusFile, JSON.stringify({ state: 'idle', active_tools: 0, idle_seconds: QUICK_IDLE_SECONDS, ...over }));
+    const at = (h.clock.t - 1000) / 1000;
+    fs.utimesSync(statusFile, at, at);
+  };
+  return { activation, controls, status };
 }
 
 test('a render version 2 bundle records role.json in the slot and is emitted with its duty and boundary', async (t) => {
@@ -724,6 +748,107 @@ test('on Claude missing slot hooks still fail the write at once', async (t) => {
   assert.deepEqual([f.sent()[0].error_code, f.sent()[0].error_message], ['CLIENT_INTERNAL', 'inject_unavailable']);
   assert.equal(f.state.read('template_hooks', null), null);
   assert.equal(alertsOf(f).template_hooks_pending, undefined);
+});
+
+test('on Codex a held write asks for one new session; it runs once the hooks appear', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, activation: true, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-20T00:00:00Z' })] });
+  codex(f);
+  f.act.status();
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.deepEqual(f.act.controls, [HOOKS_SESSION_TEXT]);
+  f.clock.t += 5 * MIN;
+  f.act.status();
+  assert.equal(await f.templates.runNext(), 'deferred');
+  await f.act.activation.tick();
+  assert.equal(f.act.controls.length, 1);
+
+  writeSlotHooks(f.zylosDir, { runtime: 'codex' });
+  let ready = 0;
+  await f.act.activation.tick({ onHooksReady: () => { ready += 1; } });
+  assert.equal(ready, 1);
+  f.serveAgain(bundle, '2026-10-18T00:00:00Z');
+  assert.equal(await f.templates.runNext(), 'succeeded');
+  assert.equal(f.sent()[0].status, 'succeeded');
+  assert.equal(alertsOf(f).template_hooks_pending, undefined);
+  assert.equal(f.state.read('activation', null).hooks, null);
+  assert.equal(f.act.controls.length, 1);
+});
+
+test('on Codex writes held together share one new-session request', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, activation: true, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-20T00:00:00Z' })] });
+  codex(f);
+  f.act.status();
+  assert.equal(await f.templates.runNext(), 'deferred');
+  f.state.update('intents', null, (d) => { d.queue.push({ ...d.queue[0], id: U(14), seq: 2, status: 'queued', request_id: undefined }); });
+  f.clock.t += MIN;
+  f.act.status();
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.equal(await f.templates.runNext(), 'deferred');
+  assert.deepEqual(Object.keys(f.state.read('template_hooks', null).deferred), [U(14)]);
+  assert.equal(f.act.controls.length, 1);
+});
+
+test('on Codex hooks still missing after a session that followed the request give one failure report and no loop', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, activation: true, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-20T00:00:00Z' })] });
+  codex(f);
+  f.act.status();
+  assert.equal(await f.templates.runNext(), 'deferred');
+  const launched = f.clock.t + MIN;
+  f.clock.t += MIN + HOOKS_SETTLE_MS;
+  f.act.status({ runtime_launch_at: launched });
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.deepEqual(f.sent().map((b) => [b.status, b.error_code, b.error_message]), [['failed', 'CLIENT_INTERNAL', 'inject_unavailable']]);
+  assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session/);
+  for (let i = 0; i < 5; i++) {
+    f.clock.t += MIN;
+    f.act.status({ runtime_launch_at: launched });
+    assert.equal(await f.templates.runNext(), null);
+    await f.act.activation.tick();
+  }
+  assert.equal(f.sent().length, 1);
+  assert.equal(f.act.controls.length, 1);
+  assert.match(alertsOf(f).template_hooks_pending.message, /restart the Codex session/);
+});
+
+test('on Codex with the new-session budget used up a held write is reported as before', async (t) => {
+  const bundle = templateBundle();
+  const f = await harness(t, { bundle, activation: true, items: [intent({ bundle_sha256: bundle.sha, expires_at: '2026-10-17T00:00:00Z' })] });
+  codex(f);
+  f.clock.t += 60 * MIN;
+  f.state.update('activation', {}, (d) => {
+    d.hooks_requests = Array.from({ length: DAILY_HOOKS_REQUESTS }, (_, i) => new Date(f.clock.t - (i + 3) * MIN).toISOString());
+  });
+  const start = f.clock.t;
+  let r;
+  while ((r = await f.templates.runNext()) === 'deferred') {
+    f.clock.t += MIN;
+    f.act.status();
+    await f.act.activation.tick();
+  }
+  assert.equal(r, 'failed');
+  assert.ok(f.clock.t - start <= HOOKS_MAX_DEFERRAL_MS);
+  assert.deepEqual(f.sent().map((b) => [b.status, b.error_message]), [['failed', 'inject_unavailable']]);
+  assert.equal(f.act.controls.length, 0);
+});
+
+test('on Claude no new session is asked for the slot hooks, missing or present', async (t) => {
+  const f = await harness(t, { activation: true });
+  f.act.status();
+  fs.rmSync(path.join(f.zylosDir, '.claude', 'settings.json'));
+  assert.equal(await f.templates.runNext(), 'failed');
+  assert.equal(f.sent()[0].error_message, 'inject_unavailable');
+  assert.equal(f.state.read('activation', null)?.hooks ?? null, null);
+
+  const g = await harness(t, { activation: true });
+  g.act.status();
+  assert.equal(await g.templates.runNext(), 'succeeded');
+  await g.act.activation.tick();
+  assert.equal(g.state.read('activation', null).hooks, null);
+  assert.deepEqual(f.act.controls, []);
+  assert.ok(!g.act.controls.includes(HOOKS_SESSION_TEXT));
 });
 
 const stale = (status) => ({ status: 200, json: { adoption_id: ADOPTION, status, outcome: 'stale' } });

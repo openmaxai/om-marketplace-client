@@ -8,11 +8,14 @@ import { tmpHome } from './helpers.js';
 import { Crash, crashingState } from './fake/skills.js';
 import {
   ACTIVATION_CHECK_MS, CONFIRM_WAIT_MS, DAILY_REQUESTS, DAILY_WELCOME_REQUESTS, IDLE_MIN_SECONDS, WELCOME_MAX_HOLD_MS, WELCOME_REQUEST_INTERVAL_MS, MAX_REQUESTS, NEW_SESSION_TEXT, REQUEST_COOLDOWN_MS,
+  DAILY_HOOKS_REQUESTS, HOOKS_REQUEST_INTERVAL_MS, HOOKS_SESSION_TEXT, HOOKS_SETTLE_MS, QUICK_IDLE_SECONDS,
   DAILY_RETRY_REQUESTS, DAILY_UPDATE_REQUESTS, DAILY_API_ERROR_REFUNDS, HOURLY_UPDATE_REQUESTS, UPDATE_REQUEST_INTERVAL_MS, CONTROL_ACK_DEADLINE_S, CONTROL_MAX_AGE_MS, PENDING_ALERT, PENDING_ALERT_MS, STATUS_MAX_AGE_MS, STUCK_ALERT, CONTROL_TIMEOUT_MS, ControlError, createControl, createActivation, readRuntimeStatus,
 } from '../src/activation.js';
 import { createReconciler } from '../src/reconcile.js';
 import { createStarter } from '../src/starter.js';
 import { MARKER_FILE, readMarker } from '../src/shard-emitter.js';
+import { ensureDeclarations, shardsDir } from '../src/shards.js';
+import { fakeZylos, writeSlotHooks } from './fake/zylos.js';
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const A1 = U(41);
@@ -2000,4 +2003,158 @@ test('api error: a problem kept after the confirm wait (a clock jump) does not g
   f.status({ idle_seconds: 30, health: 'rate_limited' });
   assert.equal(await a.tick(), 'busy');
   assert.equal(f.pending().request_count, 1);
+});
+
+// A zylos dir on Codex with the declarations in place and the slot hooks missing.
+const codexZylos = () => {
+  const z = fakeZylos();
+  ensureDeclarations(z);
+  fs.mkdirSync(path.join(z, '.zylos'), { recursive: true });
+  fs.writeFileSync(path.join(z, '.zylos', 'config.json'), '{"runtime":"codex"}');
+  return z;
+};
+// The activation on a Codex zylos dir; texts lists the content of each enqueued request.
+const hooksActivation = (f, { zylosDir = codexZylos(), enqueue = null } = {}) => {
+  const texts = [];
+  const control = f.withEnqueue(async (content) => { texts.push(content); return (enqueue ?? f.control.enqueue)(); });
+  return { a: f.make(f.state, { zylosDir, control }), zylosDir, texts };
+};
+const until = (f, ms = 15 * 60 * 1000) => new Date(f.clock.t + ms).toISOString();
+const hooksDoc = (f) => f.state.read('activation', null);
+
+test('hooks: a write held for the Codex slot hooks asks for one new session on its own budget', async (t) => {
+  const f = await harness(t);
+  const { a, texts } = hooksActivation(f);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'requested');
+  assert.deepEqual(texts, [HOOKS_SESSION_TEXT]);
+  const doc = hooksDoc(f);
+  assert.deepEqual([doc.hooks_requests.length, doc.requests.length, doc.update_requests.length, doc.welcome_requests.length], [1, 0, 0, 0]);
+  assert.equal(doc.hooks.control_id, 1);
+  for (let i = 0; i < 4; i++) {
+    f.advance(HOOKS_REQUEST_INTERVAL_MS);
+    f.status();
+    assert.equal(await a.hooksSession({ until: until(f) }), 'waiting');
+    await a.tick();
+  }
+  assert.equal(f.controls.length, 1);
+});
+
+test('hooks: the request waits for a healthy Agent idle QUICK_IDLE_SECONDS with no open turn, and for the declarations', async (t) => {
+  let open = true;
+  const f = await harness(t, { turn: () => open });
+  const { a, zylosDir } = hooksActivation(f);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'waiting');
+  open = false;
+  for (const over of [{ idle_seconds: QUICK_IDLE_SECONDS - 1 }, { health: 'rate_limited' }, { active_tools: 1 }]) {
+    f.status(over);
+    await a.tick();
+  }
+  fs.rmSync(path.join(shardsDir(zylosDir), 'market-template-1.json'));
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  await a.tick();
+  assert.equal(f.controls.length, 0);
+  ensureDeclarations(zylosDir);
+  await a.tick();
+  assert.equal(f.controls.length, 1);
+});
+
+test('hooks: writes held together share one request, and a new record waits HOOKS_REQUEST_INTERVAL_MS', async (t) => {
+  const f = await harness(t);
+  const { a, zylosDir } = hooksActivation(f);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'requested');
+  assert.equal(await a.hooksSession({ until: until(f, 20 * 60 * 1000) }), 'waiting');
+  assert.equal(hooksDoc(f).hooks.until, until(f, 20 * 60 * 1000));
+  assert.equal(f.controls.length, 1);
+
+  // The record ends at until; the next one is asked for only after the interval.
+  const b = hooksActivation(f, { zylosDir }).a;
+  f.state.update('activation', {}, (d) => { d.hooks = null; });
+  f.advance(HOOKS_REQUEST_INTERVAL_MS - 1000);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await b.hooksSession({ until: until(f) }), 'waiting');
+  assert.equal(f.controls.length, 1);
+  f.advance(1000);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await b.tick(), 'none');
+  assert.equal(f.controls.length, 2);
+});
+
+test('hooks: no request past DAILY_HOOKS_REQUESTS or when the enqueue is refused, and none from the automatic budget', async (t) => {
+  const f = await harness(t);
+  const { a } = hooksActivation(f);
+  f.advance(60 * 60 * 1000);
+  f.state.update('activation', {}, (d) => {
+    d.hooks_requests = Array.from({ length: DAILY_HOOKS_REQUESTS }, (_, i) => new Date(f.clock.t - (i + 1) * 60 * 1000).toISOString());
+  });
+  f.advance(HOOKS_REQUEST_INTERVAL_MS);
+  for (let i = 0; i < 3; i++) {
+    f.status({ idle_seconds: 600 });
+    assert.equal(await a.hooksSession({ until: until(f) }), 'waiting');
+    await a.tick();
+    f.advance(ACTIVATION_CHECK_MS);
+  }
+  assert.deepEqual([f.controls.length, hooksDoc(f).requests.length], [0, 0]);
+
+  const g = await harness(t);
+  const { a: b } = hooksActivation(g, { enqueue: async () => { throw new ControlError('control enqueue failed (exit 1)'); } });
+  g.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await b.hooksSession({ until: until(g) }), 'waiting');
+  assert.ok(hooksDoc(g).hooks.given_up_at);
+  assert.deepEqual(hooksDoc(g).hooks_requests, []);
+  g.advance(HOOKS_REQUEST_INTERVAL_MS);
+  g.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await b.hooksSession({ until: until(g) }), 'waiting');
+  await b.tick();
+  assert.ok(g.lines.filter((l) => /new session not requested/.test(l)).length === 1);
+});
+
+test('hooks: once they appear the record ends, the request is withdrawn and onHooksReady is called once', async (t) => {
+  const f = await harness(t, { deliver: false });
+  const { a, zylosDir } = hooksActivation(f);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'requested');
+  writeSlotHooks(zylosDir, { runtime: 'codex' });
+  let ready = 0;
+  await a.tick({ onHooksReady: () => { ready += 1; } });
+  await a.tick({ onHooksReady: () => { ready += 1; } });
+  assert.equal(ready, 1);
+  assert.equal(hooksDoc(f).hooks, null);
+  assert.deepEqual(f.acks, [1]);
+  assert.equal(f.controls.length, 1);
+});
+
+test('hooks: still missing after a session that followed the request: missing, and no further request', async (t) => {
+  const f = await harness(t);
+  const { a } = hooksActivation(f);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'requested');
+  const launched = f.clock.t + 30 * 1000;
+  f.advance(60 * 1000);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS, runtime_launch_at: launched });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'waiting');
+  f.advance(HOOKS_SETTLE_MS);
+  f.status({ idle_seconds: QUICK_IDLE_SECONDS, runtime_launch_at: launched });
+  assert.equal(await a.hooksSession({ until: until(f) }), 'missing');
+  for (let i = 0; i < 4; i++) {
+    f.advance(HOOKS_REQUEST_INTERVAL_MS);
+    f.status({ idle_seconds: 600 });
+    assert.equal(await a.hooksSession({ until: until(f) }), 'missing');
+    await a.tick();
+  }
+  assert.equal(f.controls.length, 1);
+  assert.equal(f.lines.filter((l) => /Codex slot hooks are still missing/.test(l)).length, 1);
+});
+
+test('hooks: no record without a held write; the Claude runtime is never asked for one', async (t) => {
+  const f = await harness(t);
+  const z = fakeZylos({ hooks: true });
+  ensureDeclarations(z);
+  const { a } = hooksActivation(f, { zylosDir: z });
+  f.status({ idle_seconds: 600 });
+  assert.equal(await a.tick(), 'none');
+  assert.equal(f.controls.length, 0);
+  assert.equal(hooksDoc(f)?.hooks ?? null, null);
 });

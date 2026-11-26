@@ -51,11 +51,15 @@ manually with `zylos add openmaxai/om-marketplace-client`.
    Claude the agent restarts once when idle; memory and context are kept. On
    Codex the templates take effect when the Codex session next starts. Until
    then a template write raises an alert (restart the Codex session, then adopt
-   the template again) and waits, holding back later orders of its org. It is
-   reported as failed (`inject_unavailable`) before its order expires, after at
-   most 15 minutes of waiting (`HOOKS_MAX_DEFERRAL_MS`), or at once when another
-   template order of any org is queued behind it. The alert clears once the
-   hooks are present. Upgrades do the same.
+   the template again) and waits, holding back later orders of its org. While
+   it waits the client asks the idle Agent for one new session (writes held
+   together share it; at least 2 minutes apart, at most 12 a day), and the
+   write runs as soon as the hooks are present. It is reported as failed
+   (`inject_unavailable`) before its order expires, after at most 15 minutes of
+   waiting (`HOOKS_MAX_DEFERRAL_MS`), at once when a new session started and
+   the hooks are still missing, or at once when another template order of any
+   org is queued behind it. The alert clears once the hooks are present.
+   Upgrades do the same.
 4. If you set `COCO_*` variables, unset them in that shell
    (`unset COCO_BFF_URL COCO_API_KEY COCO_ORG_ID COCO_MEMBER_ID COCO_IDENTITY_ID`).
    The PM2 app filters them out and the service removes any it still inherits,

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Codex: a template write held because the slot hooks are missing now asks the
+  idle Agent for one new session through the control queue, on its own budget
+  (2 minutes apart, 12 a day; writes held together share one request), and
+  runs as soon as the hooks are present. When a session started and the hooks
+  are still missing, the write is reported as `inject_unavailable` at once and
+  no further session is requested. Claude is unchanged.
+
 ## [0.12.2] - 2026-11-20
 
 ### Changed
