@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `submit-skill --i18n <file>`: display text per language
   (`{"zh"|"en": {name?, description?, examples?}}`), sent as `i18n` in the
-  finalize request. The file's shape is checked locally; empty blocks,
-  lengths and matching examples are checked by the market. A market without
+  finalize request. The file's shape and the example count (one per
+  `--examples` entry; no `examples` without `--examples`) are checked
+  locally (`i18n_invalid`); empty blocks and lengths are checked by the
+  market. A market without
   it refuses the field with nothing submitted: the command reports
   `I18N_UNSUPPORTED` with the owner reply 「市场尚不支持语言块，这次没有提交。」
   and does not retry without the block.

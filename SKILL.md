@@ -311,7 +311,8 @@ the market, do it directly; no confirmation card is needed.
   adds display text in the other language: JSON
   `{"en": {"name": "...", "description": "...", "examples": [{"title": "...", "prompt": "..."}]}}`
   (keys `zh` and/or `en`; each field optional; `examples` one per
-  `--examples` entry, same order). If the market answers that it does not
+  `--examples` entry, same order, and left out when there is no
+  `--examples`; a different count is refused locally). If the market answers that it does not
   support language blocks (「市场尚不支持语言块」), nothing was submitted: do
   not drop `--i18n` on your own; tell the owner and submit without it only
   if the owner says so.

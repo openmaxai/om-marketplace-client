@@ -82,9 +82,10 @@ function readExamples(file) {
 const I18N_LANGUAGES = new Set(['zh', 'en']);
 const I18N_FIELDS = new Set(['name', 'description', 'examples']);
 
-// Display text per language: {zh|en: {name?, description?, examples?}}. Only the shape is checked locally; empty
-// blocks, lengths and examples matching the submitted ones are checked by the market.
-function readI18n(file) {
+// Display text per language: {zh|en: {name?, description?, examples?}}. Checked locally: the shape, and that each
+// language's examples has as many entries as the submitted ones (baseExamples; with none submitted a language may
+// not carry examples at all). Empty blocks, lengths and scans are checked by the market.
+function readI18n(file, baseExamples) {
   const v = readJsonFile(file, 'i18n', 'i18n_invalid');
   const bad = (msg) => new SubmitError('i18n_invalid', `i18n ${msg}`);
   if (!isObject(v)) throw bad('must be a JSON object {zh|en: {name?, description?, examples?}}');
@@ -95,6 +96,11 @@ function readI18n(file) {
       if (!I18N_FIELDS.has(k)) throw bad(`${lang}: ${JSON.stringify(k)} is not name, description or examples`);
       if (k === 'examples' ? !examplesShape(x) : typeof x !== 'string') {
         throw bad(`${lang}.${k} must be ${k === 'examples' ? 'a JSON array of at most 3 {title, prompt}' : 'a string'}`);
+      }
+      if (k === 'examples' && (baseExamples === 0 || x.length !== baseExamples)) {
+        throw bad(baseExamples === 0
+          ? `${lang}.examples is not allowed when no examples are submitted (--examples)`
+          : `${lang}.examples has ${x.length} entries, --examples has ${baseExamples}; give one per example, in the same order`);
       }
     }
   }
@@ -171,7 +177,7 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
       if (opts.name != null) local.name = opts.name;
       if (opts.description != null) local.description = opts.description;
       if (opts.examples != null) local.examples = readExamples(opts.examples);
-      if (opts.i18n != null) local.i18n = readI18n(opts.i18n);
+      if (opts.i18n != null) local.i18n = readI18n(opts.i18n, local.examples?.length ?? 0);
     } else {
       const icon = opts.iconPreset != null ? presetIcon(opts.iconPreset) : null;
       const m = readManifest(path.resolve(arg));

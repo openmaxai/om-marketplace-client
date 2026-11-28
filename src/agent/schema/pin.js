@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 
 export const SCHEMA_SOURCE = 'cws-marketplace:docs/schemas/expert-template-manifest.schema.json';
-export const SCHEMA_SOURCE_COMMIT = '63923cfb9a8abd25c53d1028171ce37f91254451';
+export const SCHEMA_SOURCE_COMMIT = '6f45f51217e2fa8198474cb1c8be30132c53bb85';
 export const SCHEMA_SHA256 = 'b0096846dbab1b3bdc6280a983847bb96ac23032d436a81c8f99c490e2bf45dd';
 export const SCHEMA_FILE = new URL('./expert-template-manifest.schema.json', import.meta.url);
 

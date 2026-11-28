@@ -444,6 +444,8 @@ const I18N = {
   en: { name: 'Weekday helper', description: 'Tells the weekday of a date.', examples: [{ title: 'Which day', prompt: 'What day is 2026-11-20?' }] },
   zh: { name: '星期助手' },
 };
+// The same display text without examples, for submissions with no --examples.
+const I18N_TEXT = { en: { name: I18N.en.name, description: I18N.en.description }, zh: I18N.zh };
 
 test('submit-skill --name, --description and --i18n go in the finalize body only, with no display language asked', async (t) => {
   const s = await setup(t);
@@ -495,10 +497,10 @@ test('submit-skill --i18n file errors are refused locally before any call', asyn
   assert.equal(s.fake.requests.length, 0);
 });
 
-test('submit-skill --i18n leaves empty blocks and example counts to the market', async (t) => {
+test('submit-skill --i18n leaves empty blocks to the market', async (t) => {
   const s = await setup(t);
   const f = path.join(s.home, 'i18n.json');
-  for (const block of [{}, { en: {} }, { en: { examples: [] } }]) {
+  for (const block of [{}, { en: {} }]) {
     fs.writeFileSync(f, JSON.stringify(block));
     s.out.length = 0;
     assert.equal(await s.run('submit-skill', s.skill, { i18n: f, dryRun: true, json: true }), 0);
@@ -507,10 +509,55 @@ test('submit-skill --i18n leaves empty blocks and example counts to the market',
   assert.equal(s.fake.requests.length, 0);
 });
 
+test('submit-skill --i18n examples: one per --examples entry, none without --examples, refused locally before any call', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  const ex = (n) => Array.from({ length: n }, (_, i) => ({ title: `t${i}`, prompt: `p${i}` }));
+  const examplesFile = (n) => {
+    const p = path.join(s.home, `examples-${n}.json`);
+    fs.writeFileSync(p, JSON.stringify(ex(n)));
+    return p;
+  };
+  const refused = [
+    // [--examples count or null for none, block, message]
+    [null, { en: { examples: ex(1) } }, /en\.examples is not allowed when no examples are submitted/],
+    [null, { zh: { name: 'x', examples: [] } }, /zh\.examples is not allowed when no examples are submitted/],
+    [0, { en: { examples: [] } }, /en\.examples is not allowed when no examples are submitted/],
+    [2, { en: { examples: ex(1) } }, /en\.examples has 1 entries, --examples has 2/],
+    [1, { en: { examples: ex(2) } }, /en\.examples has 2 entries, --examples has 1/],
+    [2, { en: { examples: [] } }, /en\.examples has 0 entries, --examples has 2/],
+    [2, { en: { examples: ex(2) }, zh: { examples: ex(3) } }, /zh\.examples has 3 entries, --examples has 2/],
+  ];
+  for (const [n, block, re] of refused) {
+    fs.writeFileSync(f, JSON.stringify(block));
+    s.out.length = 0;
+    const opts = { i18n: f, json: true, ...(n == null ? {} : { examples: examplesFile(n) }) };
+    assert.equal(await s.run('submit-skill', s.skill, opts), 3, JSON.stringify([n, block]));
+    const j = JSON.parse(s.out.join('\n'));
+    assert.equal(j.error, 'i18n_invalid', JSON.stringify([n, block]));
+    assert.match(j.message, re, JSON.stringify([n, block]));
+  }
+  assert.equal(s.fake.requests.length, 0);
+  const accepted = [
+    [null, I18N_TEXT],
+    [0, I18N_TEXT],
+    [1, { en: { examples: ex(1) } }],
+    [3, { en: { examples: ex(3) }, zh: { name: 'x', examples: ex(3) } }],
+  ];
+  for (const [n, block] of accepted) {
+    fs.writeFileSync(f, JSON.stringify(block));
+    s.out.length = 0;
+    const opts = { i18n: f, dryRun: true, json: true, ...(n == null ? {} : { examples: examplesFile(n) }) };
+    assert.equal(await s.run('submit-skill', s.skill, opts), 0, JSON.stringify([n, block]));
+    assert.deepEqual(JSON.parse(s.out.join('\n')).i18n, block);
+  }
+  assert.equal(s.fake.requests.length, 0);
+});
+
 test('a market without i18n: the unknown-field refusal at finalize says so and is not retried without the block', async (t) => {
   const s = await setup(t);
   const f = path.join(s.home, 'i18n.json');
-  fs.writeFileSync(f, JSON.stringify(I18N));
+  fs.writeFileSync(f, JSON.stringify(I18N_TEXT));
   s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
   s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
   s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, VALIDATION_BODY);
@@ -521,7 +568,7 @@ test('a market without i18n: the unknown-field refusal at finalize says so and i
   assert.match(j.owner_reply, /^市场尚不支持语言块/);
   const fins = s.fake.market().filter((r) => r.path.endsWith(':finalize'));
   assert.equal(fins.length, 1);
-  assert.deepEqual(fins[0].json.i18n, I18N);
+  assert.deepEqual(fins[0].json.i18n, I18N_TEXT);
   assert.deepEqual(readSubmissions(s.dataDir), []);
   s.out.length = 0;
   s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
@@ -534,7 +581,7 @@ test('a market without i18n: the unknown-field refusal at finalize says so and i
 test('with --i18n, other finalize refusals stay ordinary ones', async (t) => {
   const s = await setup(t);
   const f = path.join(s.home, 'i18n.json');
-  fs.writeFileSync(f, JSON.stringify(I18N));
+  fs.writeFileSync(f, JSON.stringify(I18N_TEXT));
   const v400 = (errors) => ({ status: 400, problem: { status: 400, code: 'VALIDATION_FAILED', errors } });
   const answers = [
     v400([{ field: 'i18n.en.examples', message: 'must have as many entries as examples' }]),
@@ -556,7 +603,7 @@ test('with --i18n, other finalize refusals stay ordinary ones', async (t) => {
 test('--personal on a market without scope is reported as such even with --i18n', async (t) => {
   const s = await setup(t);
   const f = path.join(s.home, 'i18n.json');
-  fs.writeFileSync(f, JSON.stringify(I18N));
+  fs.writeFileSync(f, JSON.stringify(I18N_TEXT));
   s.fake.script('POST', `${B}/skill-uploads`, VALIDATION_BODY);
   assert.equal(await s.run('submit-skill', s.skill, { i18n: f, personal: true, json: true }), 3);
   assert.equal(JSON.parse(s.out.join('\n')).error, 'PERSONAL_UNSUPPORTED');
@@ -572,7 +619,7 @@ test('CLI: --name, --description and --i18n are submit-skill options taking one 
   const manifest = path.join(home, 'm.json');
   fs.writeFileSync(manifest, JSON.stringify(MANIFEST));
   const i18n = path.join(home, 'i18n.json');
-  fs.writeFileSync(i18n, JSON.stringify(I18N));
+  fs.writeFileSync(i18n, JSON.stringify(I18N_TEXT));
   const cli = (args) => new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), ...args], { env: baseEnv(dataDir) });
     let stdout = '';
@@ -592,5 +639,5 @@ test('CLI: --name, --description and --i18n are submit-skill options taking one 
   const j = JSON.parse(r.stdout);
   assert.equal(j.name, 'Weekday');
   assert.equal(j.description, 'Weekdays.');
-  assert.deepEqual(j.i18n, I18N);
+  assert.deepEqual(j.i18n, I18N_TEXT);
 });
