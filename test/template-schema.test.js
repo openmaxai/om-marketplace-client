@@ -100,3 +100,47 @@ test('the manifest examples in SKILL.md and README.md are the shared cases "mini
     assert.deepEqual(JSON.parse(examples[1]), byName['every field'], `${doc} every field`);
   }
 });
+
+const BASE = {
+  schema_version: 1, kind: 'expert_template', id: 'inbox-helper',
+  role: { name: 'Inbox Helper', instructions: 'Triage the inbox every morning.', duty: 'Inbox triage.' },
+  skills: [], first_guide: 'Tell me which mailbox to start with.',
+  starter_tasks: [{ title: 'Triage today', prompt: "Triage today's inbox." }],
+  card: { summary: 'Keeps your inbox under control.', capabilities: ['Triage mail'], tags: ['office'] },
+};
+const at = (m) => manifestProblems(m).map((p) => `${p.pointer} ${p.reason}`).sort();
+
+test('the manifest i18n block: zh and en with every display field are accepted', () => {
+  const text = {
+    role: { name: '收件箱助手', duty: '处理收件箱。' },
+    card: { summary: '帮你管好收件箱。', capabilities: ['处理邮件'], limitations: ['不打电话'], guardrails: ['只起草'], tags: ['办公'] },
+    first_guide: '告诉我先处理哪个邮箱。',
+    starter_tasks: [{ title: '处理今天的邮件', prompt: '处理今天收件箱里的邮件。' }],
+  };
+  assert.deepEqual(at({ ...BASE, i18n: { zh: text, en: { role: { name: 'Inbox Helper (EN)' } } } }), []);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { card: { tags: ['office'] } } } }), []);
+});
+
+test('the manifest i18n block: only zh and en, only the display fields, each with its base rules', () => {
+  assert.deepEqual(at({ ...BASE, i18n: { fr: { role: { name: 'Assistant' } } } }), ['/i18n/fr unknown_field']);
+  assert.deepEqual(at({ ...BASE, i18n: { 'zh-CN': { role: { name: '助手' } } } }), ['/i18n/zh-CN unknown_field']);
+  assert.deepEqual(at({ ...BASE, i18n: [] }), ['/i18n bad_value']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: 'x' } }), ['/i18n/en bad_value']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { id: 'x' } } }), ['/i18n/en/id unknown_field']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { role: { instructions: 'x' } } } }), ['/i18n/en/role/instructions unknown_field']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { card: { icon: 'x' } } } }), ['/i18n/en/card/icon unknown_field']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { starter_tasks: [{ title: 'T' }] } } }), ['/i18n/en/starter_tasks/0/prompt missing_field']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { role: { name: 'x'.repeat(101) } } } }), ['/i18n/en/role/name bad_value']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { card: { tags: ['a', 'b', 'c', 'd', 'e'] } } } }), ['/i18n/en/card/tags bad_value']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { starter_tasks: [{ title: 'x'.repeat(41), prompt: 'P' }] } } }), ['/i18n/en/starter_tasks/0/title bad_value']);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { first_guide: 'Hi {{name}}' } } }), ['/i18n/en/first_guide slot_render_phase1']);
+});
+
+test('the manifest i18n block: empty blocks and array lengths are left to the market', () => {
+  const schema = JSON.stringify(readPinnedSchema());
+  assert.doesNotMatch(schema, /"minProperties"|"propertyNames"/);
+  assert.deepEqual(at({ ...BASE, i18n: {} }), []);
+  assert.deepEqual(at({ ...BASE, i18n: { en: {} } }), []);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { starter_tasks: [] } } }), []);
+  assert.deepEqual(at({ ...BASE, i18n: { en: { card: { capabilities: ['a', 'b'] } } } }), []);
+});
