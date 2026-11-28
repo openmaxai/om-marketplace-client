@@ -439,3 +439,158 @@ test('submit-template --icon-preset takes a preset id only', async (t) => {
   assert.match(s.out.join('\n'), /--icon-preset takes a preset id such as expert-service/);
   assert.equal(s.fake.requests.length, 0);
 });
+
+const I18N = {
+  en: { name: 'Weekday helper', description: 'Tells the weekday of a date.', examples: [{ title: 'Which day', prompt: 'What day is 2026-11-20?' }] },
+  zh: { name: '星期助手' },
+};
+
+test('submit-skill --name, --description and --i18n go in the finalize body only, with no display language asked', async (t) => {
+  const s = await setup(t);
+  const i18n = path.join(s.home, 'i18n.json');
+  fs.writeFileSync(i18n, JSON.stringify(I18N));
+  const examples = path.join(s.home, 'examples.json');
+  fs.writeFileSync(examples, JSON.stringify([{ title: '哪天', prompt: '2026-11-20 是星期几？' }]));
+  s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
+  s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
+  s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, finalized());
+  assert.equal(await s.run('submit-skill', s.skill, { name: '星期助手', description: '告诉你某天是星期几。', examples, i18n }), 0);
+  const [prep, fin] = s.fake.market();
+  assert.deepEqual(Object.keys(prep.json).sort(), ['request_id', 'sha256', 'size_bytes']);
+  assert.deepEqual(fin.json, {
+    name: '星期助手', description: '告诉你某天是星期几。', examples: [{ title: '哪天', prompt: '2026-11-20 是星期几？' }], i18n: I18N,
+  });
+  // fetch's default "*" names no language.
+  for (const r of s.fake.market()) assert.ok([undefined, '*'].includes(r.headers['accept-language']), r.headers['accept-language']);
+});
+
+test('submit-skill --i18n file errors are refused locally before any call', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  const cases = [
+    [null, /i18n file cannot be read as JSON/],
+    ['{not json', /i18n file cannot be read as JSON/],
+    ['[]', /i18n must be a JSON object \{zh\|en/],
+    ['"en"', /i18n must be a JSON object/],
+    ['{"fr":{"name":"x"}}', /language "fr" is not zh or en/],
+    ['{"zh-CN":{"name":"x"}}', /language "zh-CN" is not zh or en/],
+    ['{"en":"x"}', /en must be an object/],
+    ['{"en":null}', /en must be an object/],
+    ['{"en":{"title":"x"}}', /en: "title" is not name, description or examples/],
+    ['{"en":{"name":1}}', /en\.name must be a string/],
+    ['{"zh":{"description":["x"]}}', /zh\.description must be a string/],
+    ['{"en":{"examples":{"title":"t","prompt":"p"}}}', /en\.examples must be a JSON array of at most 3/],
+    ['{"en":{"examples":[{"title":"t"}]}}', /en\.examples must be a JSON array of at most 3/],
+    [JSON.stringify({ en: { examples: Array(4).fill({ title: 't', prompt: 'p' }) } }), /en\.examples must be a JSON array of at most 3/],
+  ];
+  for (const [content, re] of cases) {
+    fs.rmSync(f, { force: true });
+    if (content !== null) fs.writeFileSync(f, content);
+    s.out.length = 0;
+    assert.equal(await s.run('submit-skill', s.skill, { i18n: f, json: true }), 3, String(content));
+    const j = JSON.parse(s.out.join('\n'));
+    assert.equal(j.error, 'i18n_invalid', String(content));
+    assert.match(j.message, re, String(content));
+  }
+  assert.equal(s.fake.requests.length, 0);
+});
+
+test('submit-skill --i18n leaves empty blocks and example counts to the market', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  for (const block of [{}, { en: {} }, { en: { examples: [] } }]) {
+    fs.writeFileSync(f, JSON.stringify(block));
+    s.out.length = 0;
+    assert.equal(await s.run('submit-skill', s.skill, { i18n: f, dryRun: true, json: true }), 0);
+    assert.deepEqual(JSON.parse(s.out.join('\n')).i18n, block);
+  }
+  assert.equal(s.fake.requests.length, 0);
+});
+
+test('a market without i18n: the unknown-field refusal at finalize says so and is not retried without the block', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  fs.writeFileSync(f, JSON.stringify(I18N));
+  s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
+  s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
+  s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, VALIDATION_BODY);
+  assert.equal(await s.run('submit-skill', s.skill, { i18n: f, json: true }), 3);
+  const j = JSON.parse(s.out.join('\n'));
+  assert.equal(j.error, 'I18N_UNSUPPORTED');
+  assert.match(j.message, /does not support display text per language \(--i18n\) yet; nothing was submitted[\s\S]*do not drop --i18n/);
+  assert.match(j.owner_reply, /^市场尚不支持语言块/);
+  const fins = s.fake.market().filter((r) => r.path.endsWith(':finalize'));
+  assert.equal(fins.length, 1);
+  assert.deepEqual(fins[0].json.i18n, I18N);
+  assert.deepEqual(readSubmissions(s.dataDir), []);
+  s.out.length = 0;
+  s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
+  s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
+  s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, VALIDATION_BODY);
+  assert.equal(await s.run('submit-skill', s.skill, { i18n: f }), 3);
+  assert.match(s.out.join('\n'), /Tell the owner, for example: 「市场尚不支持语言块，这次没有提交。/);
+});
+
+test('with --i18n, other finalize refusals stay ordinary ones', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  fs.writeFileSync(f, JSON.stringify(I18N));
+  const v400 = (errors) => ({ status: 400, problem: { status: 400, code: 'VALIDATION_FAILED', errors } });
+  const answers = [
+    v400([{ field: 'i18n.en.examples', message: 'must have as many entries as examples' }]),
+    v400([{ field: 'body', message: 'request body unreadable or too large' }]),
+  ];
+  for (const a of answers) {
+    s.out.length = 0;
+    s.fake.script('POST', `${B}/skill-uploads`, uploadSession(s.fake));
+    s.fake.script('PUT', '/upload/obj?sig=1', { status: 200 });
+    s.fake.script('POST', `${B}/skill-uploads/${U(3)}:finalize`, a);
+    assert.equal(await s.run('submit-skill', s.skill, { i18n: f, json: true }), 3);
+    const j = JSON.parse(s.out.join('\n'));
+    assert.equal(j.error, 'VALIDATION_FAILED');
+    assert.equal(j.owner_reply, undefined);
+    assert.doesNotMatch(j.message, /does not support/);
+  }
+});
+
+test('--personal on a market without scope is reported as such even with --i18n', async (t) => {
+  const s = await setup(t);
+  const f = path.join(s.home, 'i18n.json');
+  fs.writeFileSync(f, JSON.stringify(I18N));
+  s.fake.script('POST', `${B}/skill-uploads`, VALIDATION_BODY);
+  assert.equal(await s.run('submit-skill', s.skill, { i18n: f, personal: true, json: true }), 3);
+  assert.equal(JSON.parse(s.out.join('\n')).error, 'PERSONAL_UNSUPPORTED');
+});
+
+test('CLI: --name, --description and --i18n are submit-skill options taking one value each', async () => {
+  const home = tmpHome();
+  const dataDir = path.join(home, 'd');
+  writeConfig(VALID_ENV, dataDir);
+  const skill = path.join(home, 's');
+  fs.mkdirSync(skill);
+  fs.writeFileSync(path.join(skill, 'SKILL.md'), SKILL_MD);
+  const manifest = path.join(home, 'm.json');
+  fs.writeFileSync(manifest, JSON.stringify(MANIFEST));
+  const i18n = path.join(home, 'i18n.json');
+  fs.writeFileSync(i18n, JSON.stringify(I18N));
+  const cli = (args) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(ROOT, 'src/cli.js'), ...args], { env: baseEnv(dataDir) });
+    let stdout = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.on('exit', (code) => resolve({ code, stdout }));
+  });
+  for (const opt of ['--name', '--description', '--i18n']) {
+    const v = opt === '--i18n' ? i18n : 'x';
+    assert.equal((await cli(['submit-skill', skill, opt])).code, 2, opt);
+    assert.equal((await cli(['submit-skill', skill, opt, v, opt, v])).code, 2, opt);
+    assert.equal((await cli(['submit-template', manifest, opt, v, '--dry-run'])).code, 2, opt);
+    assert.equal((await cli(['search', opt, v])).code, 2, opt);
+  }
+  assert.match((await cli(['help'])).stdout, /--i18n <file> \(submit-skill: display text per language/);
+  const r = await cli(['submit-skill', skill, '--dry-run', '--json', '--name', 'Weekday', '--description', 'Weekdays.', '--i18n', i18n]);
+  assert.equal(r.code, 0);
+  const j = JSON.parse(r.stdout);
+  assert.equal(j.name, 'Weekday');
+  assert.equal(j.description, 'Weekdays.');
+  assert.deepEqual(j.i18n, I18N);
+});

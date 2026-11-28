@@ -35,7 +35,9 @@ const USAGE = `usage: market-client <command>
 submit options: --dry-run (check only, submit nothing; submit-template: checks locally, then with the market),
   --personal (owner's personal shelf only, no review), --changelog <text>, --category-id <id>,
   --icon-preset <id> (submit-template: a preset icon such as expert-service),
-  --examples <file> (submit-skill: JSON array of up to 3 {title, prompt})
+  --examples <file> (submit-skill: JSON array of up to 3 {title, prompt}),
+  --name <text>, --description <text> (submit-skill: display name and description; default: SKILL.md name and description),
+  --i18n <file> (submit-skill: display text per language, JSON {"zh"|"en": {name?, description?, examples?}})
 agent market commands take --json and --org <org_id> (default: the primary org)
 start, sync, rollback, enable, disable and uninstall wait up to --wait <seconds> (default 900; start: 300) for a running service to answer`;
 const SKILL_COMMANDS = new Set(['rollback', 'enable', 'disable', 'uninstall']);
@@ -323,7 +325,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
   const [cmd, ...rest] = argv;
   const opts = { json: false, wait: cmd === 'start' ? START_WAIT_S : DEFAULT_WAIT_S, dryRun: false };
   const VALUE_OPTS = {
-    '--changelog': 'changelog', '--category-id': 'categoryId', '--icon-preset': 'iconPreset', '--examples': 'examples', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
+    '--changelog': 'changelog', '--category-id': 'categoryId', '--icon-preset': 'iconPreset', '--examples': 'examples', '--name': 'name', '--description': 'description', '--i18n': 'i18n', '--org': 'org', '--reason': 'reason', '--limit': 'limit', '--state': 'state',
     '--channel': 'channel', '--channel-detail': 'channelDetail', '--owner-message-id': 'ownerMessageId', '--owner-message-text': 'ownerMessageText',
     '--owner-message-file': 'ownerMessageFile',
   };
@@ -358,6 +360,7 @@ export async function main(argv = process.argv.slice(2), { env = process.env, pr
       : SKILL_COMMANDS.has(cmd) || submit ? 1 : -1;
   if ([textFromStdin, opts.ownerMessageText != null, opts.ownerMessageFile != null].filter(Boolean).length > 1) badOpt = true;
   if (opts.iconPreset != null && cmd !== 'submit-template') badOpt = true;
+  if ([opts.name, opts.description, opts.i18n].some((v) => v != null) && cmd !== 'submit-skill') badOpt = true;
   if (badOpt || arity !== pos.length || !(opts.wait >= 0)) {
     print(USAGE);
     return cmd === 'help' || cmd === '--help' ? EXIT.OK : EXIT.USAGE;

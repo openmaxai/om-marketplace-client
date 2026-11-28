@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `submit-skill --i18n <file>`: display text per language
+  (`{"zh"|"en": {name?, description?, examples?}}`), sent as `i18n` in the
+  finalize request. The file's shape is checked locally; empty blocks,
+  lengths and matching examples are checked by the market. A market without
+  it refuses the field with nothing submitted: the command reports
+  `I18N_UNSUPPORTED` with the owner reply 「市场尚不支持语言块，这次没有提交。」
+  and does not retry without the block.
+- `submit-skill --name <text>` / `--description <text>`: the display name and
+  description sent in finalize (default: SKILL.md `name` and `description`).
+- Expert template manifest: optional top-level `i18n` block (`zh` / `en`
+  display text for `role.name`, `role.duty`, `card`, `first_guide`,
+  `starter_tasks`). The vendored schema and shared cases are synced from the
+  market and re-pinned.
+
 ## [0.12.2] - 2026-11-20
 
 ### Changed
