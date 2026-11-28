@@ -38,12 +38,13 @@ export const SCOPE_PERSONAL = 'personal';
 export const SCOPE_ORG = 'org';
 export const PERSONAL_UNSUPPORTED = 'PERSONAL_UNSUPPORTED';
 export const PERSONAL_NOT_CONFIRMED = 'PERSONAL_NOT_CONFIRMED';
-// The message a market without scope gives for a body with an unknown field.
+export const I18N_UNSUPPORTED = 'I18N_UNSUPPORTED';
+// The message a market without scope or i18n gives for a body with an unknown field.
 const UNKNOWN_FIELD = 'only the documented fields';
 
-// A market without scope refuses the unknown field as a whole body: 400 VALIDATION_FAILED, errors [{field: "body",
-// message: "... only the documented fields"}]. Any other 400 is an ordinary refusal.
-function personalUnsupported(err) {
+// A market without scope or i18n refuses the unknown field as a whole body: 400 VALIDATION_FAILED, errors
+// [{field: "body", message: "... only the documented fields"}]. Any other 400 is an ordinary refusal.
+function unknownFieldRefusal(err) {
   return err instanceof MarketError && err.status === 400 && err.code === 'VALIDATION_FAILED'
     && Array.isArray(err.errors) && err.errors.some((e) => e?.field === 'body' && typeof e.message === 'string' && e.message.includes(UNKNOWN_FIELD));
 }
@@ -54,8 +55,20 @@ async function scoped(scope, fn) {
   try {
     return await fn();
   } catch (err) {
-    if (scope === SCOPE_PERSONAL && personalUnsupported(err)) {
+    if (scope === SCOPE_PERSONAL && unknownFieldRefusal(err)) {
       throw new MarketError('the market does not support personal-only submissions', { status: 400, code: PERSONAL_UNSUPPORTED, transient: false });
+    }
+    throw err;
+  }
+}
+
+// i18n is first sent at finalize; a market without it refuses it as an unknown field. Not retried without the block.
+async function withI18n(sent, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (sent && unknownFieldRefusal(err)) {
+      throw new MarketError('the market does not support display text per language (i18n)', { status: 400, code: I18N_UNSUPPORTED, transient: false });
     }
     throw err;
   }
@@ -106,9 +119,10 @@ export async function submitSkill({
   }
   await retrying(() => putPackage({ fetchImpl, url: prep.upload_url, headers: prep.upload_headers, body: zip, emulatorOrigin }), sleep);
   const body = {};
-  for (const k of ['name', 'description', 'changelog', 'category_id', 'examples']) if (finalize[k] != null) body[k] = finalize[k];
+  for (const k of ['name', 'description', 'changelog', 'category_id', 'examples', 'i18n']) if (finalize[k] != null) body[k] = finalize[k];
   if (scope != null) body.scope = scope;
-  const d = (await retrying(() => http.request('POST', orgId, `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`, body), sleep)).data;
+  const finalizePath = `/skill-uploads/${encodeURIComponent(prep.upload_id)}:finalize`;
+  const d = (await withI18n(body.i18n != null, () => retrying(() => http.request('POST', orgId, finalizePath, body), sleep))).data;
   if (!isObject(d) || !isCanonicalUuid(d.skill_id) || !isCanonicalUuid(d.skill_version_id)) {
     throw shape('market POST /skill-uploads:finalize', 'has no skill version');
   }
@@ -250,6 +264,9 @@ export function explainSubmitError(err) {
     case PERSONAL_UNSUPPORTED:
       return 'refused: this market is too old for --personal (personal-shelf-only submissions); nothing was submitted. Do not retry. '
         + 'Tell the owner it can only be submitted to the organization (pending review) for now, or that they can upload it in the workbench and keep it personal';
+    case I18N_UNSUPPORTED:
+      return 'refused: this market does not support display text per language (--i18n) yet; nothing was submitted. '
+        + 'Do not retry, and do not drop --i18n on your own. Tell the owner, and submit without it only if the owner then says so';
     case PERSONAL_NOT_CONFIRMED:
       return 'the market did not confirm a personal-only submission: something may already have been submitted, possibly to the organization for review. '
         + 'Do not retry; ask the owner to check 「我的 › 我创建的」';

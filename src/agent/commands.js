@@ -9,8 +9,8 @@ import { EXIT } from '../commands.js';
 import { SubmitError, packSkill } from './pack.js';
 import { presetIcon, readManifest } from './template.js';
 import {
-  PERSONAL_NOT_CONFIRMED, PERSONAL_UNSUPPORTED, SCOPE_PERSONAL, explainSubmitError, failureLine, isRefusal, publishFailures, submitSkill,
-  submitTemplate, validateTemplate, validateUnavailable,
+  I18N_UNSUPPORTED, PERSONAL_NOT_CONFIRMED, PERSONAL_UNSUPPORTED, SCOPE_PERSONAL, explainSubmitError, failureLine, isRefusal, publishFailures,
+  submitSkill, submitTemplate, validateTemplate, validateUnavailable,
 } from './submit-api.js';
 import {
   AttestationError, MAX_CANDIDATES, MAX_LIMIT, MAX_QUERY_CHARS, MAX_REASON_CHARS, PROPOSAL_STATES, attestationBody,
@@ -64,13 +64,45 @@ function recordSubmission(dataDir, entry) {
   writeJsonAtomic(submissionsFile(dataDir), list);
 }
 
-function readExamples(file) {
-  let v;
-  try { v = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) {
-    throw new SubmitError('examples_invalid', `examples file cannot be read as JSON: ${err.message}`);
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const examplesShape = (v) => Array.isArray(v) && v.length <= 3 && v.every((e) => e && typeof e.title === 'string' && typeof e.prompt === 'string');
+
+function readJsonFile(file, what, code) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) {
+    throw new SubmitError(code, `${what} file cannot be read as JSON: ${err.message}`);
   }
-  if (!Array.isArray(v) || v.length > 3 || !v.every((e) => e && typeof e.title === 'string' && typeof e.prompt === 'string')) {
-    throw new SubmitError('examples_invalid', 'examples must be a JSON array of at most 3 {title, prompt}');
+}
+
+function readExamples(file) {
+  const v = readJsonFile(file, 'examples', 'examples_invalid');
+  if (!examplesShape(v)) throw new SubmitError('examples_invalid', 'examples must be a JSON array of at most 3 {title, prompt}');
+  return v;
+}
+
+const I18N_LANGUAGES = new Set(['zh', 'en']);
+const I18N_FIELDS = new Set(['name', 'description', 'examples']);
+
+// Display text per language: {zh|en: {name?, description?, examples?}}. Checked locally: the shape, and that each
+// language's examples has as many entries as the submitted ones (baseExamples; with none submitted a language may
+// not carry examples at all). Empty blocks, lengths and scans are checked by the market.
+function readI18n(file, baseExamples) {
+  const v = readJsonFile(file, 'i18n', 'i18n_invalid');
+  const bad = (msg) => new SubmitError('i18n_invalid', `i18n ${msg}`);
+  if (!isObject(v)) throw bad('must be a JSON object {zh|en: {name?, description?, examples?}}');
+  for (const [lang, block] of Object.entries(v)) {
+    if (!I18N_LANGUAGES.has(lang)) throw bad(`language ${JSON.stringify(lang)} is not zh or en`);
+    if (!isObject(block)) throw bad(`${lang} must be an object {name?, description?, examples?}`);
+    for (const [k, x] of Object.entries(block)) {
+      if (!I18N_FIELDS.has(k)) throw bad(`${lang}: ${JSON.stringify(k)} is not name, description or examples`);
+      if (k === 'examples' ? !examplesShape(x) : typeof x !== 'string') {
+        throw bad(`${lang}.${k} must be ${k === 'examples' ? 'a JSON array of at most 3 {title, prompt}' : 'a string'}`);
+      }
+      if (k === 'examples' && (baseExamples === 0 || x.length !== baseExamples)) {
+        throw bad(baseExamples === 0
+          ? `${lang}.examples is not allowed when no examples are submitted (--examples)`
+          : `${lang}.examples has ${x.length} entries, --examples has ${baseExamples}; give one per example, in the same order`);
+      }
+    }
   }
   return v;
 }
@@ -81,8 +113,9 @@ function pickOrg(config, org) {
   return org;
 }
 
-// What the Agent tells its owner after a failed --personal submission.
+// What the Agent tells its owner after a --personal or --i18n submission the market did not take or confirm.
 const FAILURE_REPLY = {
+  [I18N_UNSUPPORTED]: '市场尚不支持语言块，这次没有提交。要不带语言块提交吗？',
   [PERSONAL_UNSUPPORTED]: '市场版本还不支持只放个人货架，这次没有提交。要提交到组织（需要管理员审核）吗？',
   [PERSONAL_NOT_CONFIRMED]: '市场没有确认只放进了你的个人货架，可能已经提交了（也可能进了组织审核）。请在「我的 › 我创建的」看一下，我先不重试。',
 };
@@ -122,7 +155,7 @@ function renderList(list) {
   return out.join('\n');
 }
 
-// opts: {json, dryRun, personal, changelog, categoryId, iconPreset, examples, org}. deps lets tests inject fetch, clock and sleep.
+// opts: {json, dryRun, personal, changelog, categoryId, iconPreset, examples, name, description, i18n, org}. deps lets tests inject fetch, clock and sleep.
 export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print, fetchImpl = globalThis.fetch, now = () => new Date(), sleep, logger }) {
   if (cmd === 'submissions') {
     const list = readSubmissions(dataDir);
@@ -141,7 +174,10 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
     if (cmd === 'submit-skill') {
       const p = packSkill(path.resolve(arg));
       local = { kind: 'skill', slug: p.meta.name, version: p.meta.version || null, files: p.files, bytes: p.zip.length, zip: p.zip };
+      if (opts.name != null) local.name = opts.name;
+      if (opts.description != null) local.description = opts.description;
       if (opts.examples != null) local.examples = readExamples(opts.examples);
+      if (opts.i18n != null) local.i18n = readI18n(opts.i18n, local.examples?.length ?? 0);
     } else {
       const icon = opts.iconPreset != null ? presetIcon(opts.iconPreset) : null;
       const m = readManifest(path.resolve(arg));
@@ -167,7 +203,9 @@ export async function runSubmitCommand(cmd, arg, opts, { config, dataDir, print,
     r = local.kind === 'skill'
       ? await submitSkill({
         http, orgId, zip: local.zip, fetchImpl, emulatorOrigin: config.storage_emulator_origin ?? null, sleep, scope,
-        finalize: { changelog: opts.changelog, category_id: opts.categoryId, examples: local.examples },
+        finalize: {
+          name: local.name, description: local.description, changelog: opts.changelog, category_id: opts.categoryId, examples: local.examples, i18n: local.i18n,
+        },
       })
       : await submitTemplate({ http, orgId, manifest: local.manifest, changelog: opts.changelog, categoryId: opts.categoryId, icon: local.icon, scope, sleep });
   } catch (err) {

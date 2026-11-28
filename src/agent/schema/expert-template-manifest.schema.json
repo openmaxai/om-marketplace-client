@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://market.openmax.com/schemas/expert-template-manifest.schema.json",
   "title": "Expert template manifest",
-  "description": "Expert template manifest (schema_version 1). Structural rules only: types, required and allowed keys, enums, item counts, lengths (in Unicode code points) and value patterns. The server additionally checks, and this schema cannot express (server-only): the JSON is strict (no duplicate keys, integers only, nesting depth <= 6, <= 256 KiB); every string is NFC, has no forbidden characters (control, format, private-use and other invisible characters) and no credential (secret scan); role.name, first_guide and starter_tasks hold no request for a credential; first_guide and starter_tasks hold no unsafe instruction; no string imitates text the client writes around the template (reserved_client_text); keys are unique within each array (skills by skill_id, connectors by app, options by value); an enum default is one of its options; a text default fits max_len and passes the secret scan; role lines plus the inject segment fit 8000 estimated tokens; and, against stored data: referenced skills and knowledge files, the version order, and the name on the shelf.",
+  "description": "Expert template manifest (schema_version 1). Structural rules only: types, required and allowed keys, enums, item counts, lengths (in Unicode code points) and value patterns. The server additionally checks, and this schema cannot express (server-only): the JSON is strict (no duplicate keys, integers only, nesting depth <= 6, <= 256 KiB); every string is NFC, has no forbidden characters (control, format, private-use and other invisible characters) and no credential (secret scan); role.name, first_guide and starter_tasks (also in i18n) hold no request for a credential; first_guide and starter_tasks hold no unsafe instruction; no string imitates text the client writes around the template (reserved_client_text); keys are unique within each array (skills by skill_id, connectors by app, options by value); an enum default is one of its options; a text default fits max_len and passes the secret scan; role lines plus the inject segment fit 8000 estimated tokens; and, against stored data: referenced skills and knowledge files, the version order, and the name on the shelf.",
   "type": "object",
   "required": [
     "schema_version",
@@ -733,6 +733,20 @@
           }
         }
       }
+    },
+    "i18n": {
+      "description": "Display text per language (zh, en); display only: not in role.json, the inject segment or the write package. Not empty (server-only).",
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {
+        "zh": {
+          "$ref": "#/$defs/i18n_text"
+        },
+        "en": {
+          "$ref": "#/$defs/i18n_text"
+        }
+      }
     }
   },
   "$defs": {
@@ -755,6 +769,147 @@
       "description": "UTC or an IANA zone name such as Asia/Singapore.",
       "type": "string",
       "pattern": "^(UTC|[A-Z][A-Za-z_]+(/[A-Z][A-Za-z0-9_+\\-]+){1,2})$"
+    },
+    "i18n_text": {
+      "description": "Display text in one language. Each field replaces the base field of the same name for readers of this language and follows its rules; give a field only when the base field is given, and an array with as many entries as the base one (server-only). Not empty (server-only).",
+      "type": "object",
+      "required": [],
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "pattern": "\\S"
+            },
+            "duty": {
+              "description": "Instruction text, up to 20 lines separated by \\n: no blank first or last line, no two blank lines in a row, no {{ placeholders.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000,
+              "allOf": [
+                {
+                  "pattern": "^[^\\S\\n]*\\S"
+                },
+                {
+                  "pattern": "\\S[^\\S\\n]*$"
+                },
+                {
+                  "pattern": "^[^\\n]*(\\n[^\\n]*){0,19}$"
+                }
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "\\{\\{"
+                  },
+                  {
+                    "pattern": "\\n[^\\S\\n]*\\n[^\\S\\n]*\\n"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "card": {
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "capabilities": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "\\S"
+              }
+            },
+            "limitations": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "\\S"
+              }
+            },
+            "guardrails": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "\\S"
+              }
+            },
+            "tags": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32,
+                "pattern": "\\S"
+              }
+            }
+          }
+        },
+        "first_guide": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000,
+          "pattern": "\\S",
+          "not": {
+            "description": "Instruction field: no {{ placeholders.",
+            "pattern": "\\{\\{"
+          }
+        },
+        "starter_tasks": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "required": [
+              "title",
+              "prompt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40,
+                "pattern": "\\S"
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "pattern": "\\S",
+                "not": {
+                  "description": "Instruction field: no {{ placeholders.",
+                  "pattern": "\\{\\{"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

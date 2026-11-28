@@ -306,6 +306,16 @@ the market, do it directly; no confirmation card is needed.
   their interpreter (`bash scripts/run.sh`, `node scripts/run.js`).
   Run `market-client submit-skill <dir> --dry-run`, fix what it reports, then
   `market-client submit-skill <dir> [--personal] [--changelog <text>] [--examples <file>]`.
+  `--name <text>` / `--description <text>` set the display name and
+  description (default: SKILL.md `name` and `description`). `--i18n <file>`
+  adds display text in the other language: JSON
+  `{"en": {"name": "...", "description": "...", "examples": [{"title": "...", "prompt": "..."}]}}`
+  (keys `zh` and/or `en`; each field optional; `examples` one per
+  `--examples` entry, same order, and left out when there is no
+  `--examples`; a different count is refused locally). If the market answers that it does not
+  support language blocks (「市场尚不支持语言块」), nothing was submitted: do
+  not drop `--i18n` on your own; tell the owner and submit without it only
+  if the owner says so.
 - Expert template: write a manifest JSON (see "Expert template manifest"
   below). Always run `market-client submit-template <file> --dry-run` first:
   it checks the manifest locally against the market's schema, then asks the
@@ -382,6 +392,12 @@ unique within its list.
   credentials, no commands to read secrets or send data out.
 - `card`: `{summary <= 500, capabilities?, limitations?, guardrails?
   (each <= 20 texts <= 200), tags? (<= 4 texts <= 32)}`.
+- `i18n` (optional): display text per language, `{"zh"|"en": {role?: {name?,
+  duty?}, card?: {summary?, capabilities?, limitations?, guardrails?, tags?},
+  first_guide?, starter_tasks?}}`; each field follows its base field's rules,
+  give it only when the base field is given, and a list has as many entries
+  as the base list, in the same order. Not empty. Write only the other
+  language than the base text.
 - The icon is not in the manifest: pass `--icon-preset <id>` (`expert-service`,
   `expert-growth`, `expert-report`, `expert-creative`, `expert-listing`,
   `expert-select`, `expert-global`, `expert-compliance`). Uploaded icons are
